@@ -15,5 +15,5 @@ const ctx={document,console};vm.createContext(ctx);vm.runInContext(src.slice(sta
 const row=new Node('div');
 ctx.renderMarkdown(row,'## Heading\n\n**bold** and `code`\n\n- one\n- two');
 const flat=JSON.stringify(row);
-if(!flat.includes('md-heading')||!flat.includes('md-gap')||!flat.includes('"STRONG"')||!flat.includes('**bold**')||!flat.includes('"CODE"')||!flat.includes('"UL"'))throw new Error('Markdown smoke render incomplete');
+if(!flat.includes('md-heading')||!flat.includes('## Heading')||!flat.includes('md-gap')||!flat.includes('"STRONG"')||!flat.includes('**bold**')||!flat.includes('"CODE"')||!flat.includes('"UL"'))throw new Error('Markdown smoke render incomplete');
 console.log('markdown render smoke: ok');

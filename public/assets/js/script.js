@@ -92,7 +92,7 @@ function renderMarkdown(row,text){
     }
     if(fence){fence.textContent+=(fence.textContent?'\n':'')+line;continue}
     const hm=line.match(/^(#{1,4})\s+(.+)$/);
-    if(hm){flushList();flushQuote();const h=document.createElement('div');h.className='md-heading md-h'+hm[1].length;appendMarkdownInline(h,hm[2]);row.append(h);continue}
+    if(hm){flushList();flushQuote();const h=document.createElement('div');h.className='md-heading md-h'+hm[1].length;appendMarkdownInline(h,hm[1]+' '+hm[2]);row.append(h);continue}
     const lm=line.match(/^\s*([-*+])\s+(.+)$/);
     if(lm){flushQuote();if(!list||list.tagName!=='UL'){list=document.createElement('ul');row.append(list)}const li=document.createElement('li');appendMarkdownInline(li,lm[2]);list.append(li);continue}
     const om=line.match(/^\s*(\d+)\.\s+(.+)$/);
