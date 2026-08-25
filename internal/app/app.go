@@ -1,6 +1,7 @@
 package app
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 type Options struct{ Listen, Root, DataDir string }
 type App struct {
 	listen, root, dataDir string
+	db                    *sql.DB
 	mux                   *http.ServeMux
 	mu                    sync.RWMutex
 	authMu                sync.Mutex
@@ -64,7 +66,11 @@ func New(o Options) (*App, error) {
 	if err := os.MkdirAll(o.DataDir, 0700); err != nil {
 		return nil, err
 	}
-	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, oauthStates: map[string]time.Time{}}
+	db, err := openDatabase(o.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, oauthStates: map[string]time.Time{}}
 	_ = a.loadSettings()
 	if a.settings.Keys == nil {
 		a.settings.Keys = map[string]string{}
@@ -75,6 +81,7 @@ func New(o Options) (*App, error) {
 	a.routes()
 	return a, nil
 }
+func (a *App) Close() error { return a.db.Close() }
 func (a *App) Root() string { return a.root }
 func (a *App) ListenAndServe() error {
 	return http.ListenAndServe(a.listen, a.security(a.authMiddleware(a.mux)))

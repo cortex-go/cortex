@@ -37,6 +37,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer srv.Close()
 	fmt.Printf("Cortex · http://%s\nWorkspace root · %s\n", *listen, srv.Root())
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
