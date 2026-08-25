@@ -67,9 +67,9 @@ function appendMarkdownInline(parent,text){
   while((m=re.exec(text))){
     if(m.index>at)parent.append(document.createTextNode(text.slice(at,m.index)));
     const token=m[0];
-    if(token.startsWith('`')){const el=document.createElement('code');el.textContent=token.slice(1,-1);parent.append(el)}
-    else if(token.startsWith('**')||token.startsWith('__')){const el=document.createElement('strong');el.textContent=token.slice(2,-2);parent.append(el)}
-    else if(token.startsWith('*')||token.startsWith('_')){const el=document.createElement('em');el.textContent=token.slice(1,-1);parent.append(el)}
+    if(token.startsWith('`')){const el=document.createElement('code');el.textContent=token;parent.append(el)}
+    else if(token.startsWith('**')||token.startsWith('__')){const el=document.createElement('strong');el.textContent=token;parent.append(el)}
+    else if(token.startsWith('*')||token.startsWith('_')){const el=document.createElement('em');el.textContent=token;parent.append(el)}
     else{
       const lm=token.match(/^\[([^\]]+)\]\((https?:\/\/[^)]+)\)$/),a=document.createElement('a');
       a.textContent=lm[1];a.href=lm[2];a.target='_blank';a.rel='noopener noreferrer';parent.append(a)
@@ -194,13 +194,13 @@ async function loadAuthState(){
   if(!authState.configured){
     gate.hidden=false;$('#setupForm').hidden=false;$('#loginForm').hidden=true;
     $('#loginTOTPLabel').hidden=true;$('#googleLogin').hidden=true;
-    $('#authTitle').textContent='Secure Cortex';$('#authIntro').textContent='Set a password before using this Cortex instance.';return false
+    $('#authTitle').textContent='Secure Cortex';$('#authIntro').textContent='Set a password before using this Cortex instance.';requestAnimationFrame(()=>$('#setupPassword').focus());return false
   }
   if(!authState.authenticated){
     gate.hidden=false;$('#setupForm').hidden=true;$('#loginForm').hidden=false;
     $('#authTitle').textContent='Sign in to Cortex';$('#authIntro').textContent='Unlock this Cortex instance to continue.';
     $('#loginTOTPLabel').hidden=!authState.totpEnabled;
-    $('#googleLogin').hidden=!(authState.googleEnabled&&authState.googleConfigured);return false
+    $('#googleLogin').hidden=!(authState.googleEnabled&&authState.googleConfigured);requestAnimationFrame(()=>$('#loginPassword').focus());return false
   }
   gate.hidden=true;return true
 }

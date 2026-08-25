@@ -97,3 +97,22 @@ main{display:block;min-height:0;overflow:hidden;background:#151716;padding:22px}
 .event.assistant blockquote{margin:.55em 0;padding:.1em 0 .1em .85em;border-left:2px solid #4c6656;color:#aebbb4}
 .event.assistant a{color:#8fd0a6;text-decoration:none;border-bottom:1px solid #486653}
 .event.assistant a:hover{color:#b6e3c5;border-bottom-color:#7fc89b}
+
+/* Markdown is highlighting, not typography: headings stay transcript-sized. */
+.event.assistant .md-heading,
+.event.assistant .md-h1,
+.event.assistant .md-h2,
+.event.assistant .md-h3,
+.event.assistant .md-h4{
+  font:inherit;
+  font-weight:750;
+  color:#9fc7ba;
+  line-height:1.58;
+  margin:.35em 0 .1em;
+}
+.event.assistant strong,
+.event.assistant em{
+  color:#e7b889;
+}
+.event.assistant strong{font-weight:700}
+.event.assistant em{font-style:normal}
