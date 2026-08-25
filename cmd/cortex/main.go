@@ -1,0 +1,40 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+
+	"github.com/cortex-go/cortex/internal/app"
+)
+
+func main() {
+	listen := flag.String("listen", "127.0.0.1:7331", "HTTP listen address")
+	root := flag.String("root", "", "workspace root (default: current directory)")
+	data := flag.String("data", "", "Cortex data directory")
+	flag.Parse()
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *root == "" {
+		*root = cwd
+	}
+	if *data == "" {
+		if d, err := os.UserConfigDir(); err == nil {
+			*data = filepath.Join(d, "cortex")
+		} else {
+			*data = filepath.Join(cwd, ".cortex")
+		}
+	}
+	srv, err := app.New(app.Options{Listen: *listen, Root: *root, DataDir: *data})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Cortex · http://%s\nWorkspace root · %s\n", *listen, srv.Root())
+	if err := srv.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
+}
