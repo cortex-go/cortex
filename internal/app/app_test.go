@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestResolveConfinesRoot(t *testing.T) {
@@ -99,5 +100,26 @@ func TestSubscriptionProviderDoesNotEmbedAPIKeyConfig(t *testing.T) {
 	}
 	if bytes.Contains(b, []byte("CORTEX_PROVIDER_API_KEY")) {
 		t.Fatal("OAuth-backed provider unexpectedly embeds API-key config")
+	}
+}
+
+func TestPasswordHashAndVerify(t *testing.T) {
+	h := passwordHash("correct horse battery staple")
+	if !verifyPassword(h, "correct horse battery staple") {
+		t.Fatal("password did not verify")
+	}
+	if verifyPassword(h, "wrong password") {
+		t.Fatal("wrong password verified")
+	}
+}
+
+func TestTOTPVerification(t *testing.T) {
+	secret := "JBSWY3DPEHPK3PXP"
+	code := totpCode(secret, time.Now())
+	if !verifyTOTP(secret, code) {
+		t.Fatal("current TOTP did not verify")
+	}
+	if verifyTOTP(secret, "000000") && code != "000000" {
+		t.Fatal("invalid TOTP verified")
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 //go:embed web/*
@@ -23,6 +24,10 @@ type App struct {
 	listen, root, dataDir string
 	mux                   *http.ServeMux
 	mu                    sync.RWMutex
+	authMu                sync.Mutex
+	sessions              map[string]sessionInfo
+	oauthStates           map[string]time.Time
+	pendingTOTP           string
 	settings              Settings
 }
 type Provider struct {
@@ -32,6 +37,7 @@ type Settings struct {
 	ActiveProvider string            `json:"activeProvider"`
 	Keys           map[string]string `json:"keys"`
 	Models         map[string]string `json:"models"`
+	Auth           AuthSettings      `json:"auth"`
 }
 
 type publicSettings struct {
@@ -62,7 +68,7 @@ func New(o Options) (*App, error) {
 	if err := os.MkdirAll(o.DataDir, 0700); err != nil {
 		return nil, err
 	}
-	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}}
+	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, oauthStates: map[string]time.Time{}}
 	_ = a.loadSettings()
 	if a.settings.Keys == nil {
 		a.settings.Keys = map[string]string{}
@@ -73,8 +79,10 @@ func New(o Options) (*App, error) {
 	a.routes()
 	return a, nil
 }
-func (a *App) Root() string          { return a.root }
-func (a *App) ListenAndServe() error { return http.ListenAndServe(a.listen, a.security(a.mux)) }
+func (a *App) Root() string { return a.root }
+func (a *App) ListenAndServe() error {
+	return http.ListenAndServe(a.listen, a.security(a.authMiddleware(a.mux)))
+}
 func (a *App) security(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -85,6 +93,17 @@ func (a *App) security(next http.Handler) http.Handler {
 	})
 }
 func (a *App) routes() {
+	a.mux.HandleFunc("/api/auth/state", a.authState)
+	a.mux.HandleFunc("/api/auth/setup", a.authSetup)
+	a.mux.HandleFunc("/api/auth/login", a.authLogin)
+	a.mux.HandleFunc("/api/auth/logout", a.authLogout)
+	a.mux.HandleFunc("/api/auth/password", a.authPassword)
+	a.mux.HandleFunc("/api/auth/totp/begin", a.authTOTPBegin)
+	a.mux.HandleFunc("/api/auth/totp/enable", a.authTOTPEnable)
+	a.mux.HandleFunc("/api/auth/totp/disable", a.authTOTPDisable)
+	a.mux.HandleFunc("/api/auth/google", a.authGoogleConfig)
+	a.mux.HandleFunc("/api/auth/google/start", a.googleStart)
+	a.mux.HandleFunc("/api/auth/google/callback", a.googleCallback)
 	a.mux.HandleFunc("/api/status", a.status)
 	a.mux.HandleFunc("/api/settings", a.settingsAPI)
 	a.mux.HandleFunc("/api/files", a.filesAPI)

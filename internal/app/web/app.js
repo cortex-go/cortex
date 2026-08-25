@@ -140,4 +140,27 @@ $('#newSession').onclick=e=>{e.stopPropagation();toggleSessionMenu()};$('#newSam
 $('#composerResize').onpointerdown=startComposerResize;$('#composerResize').ondblclick=()=>{applyComposerHeight(150);localStorage.setItem(COMPOSER_STORE,'150')};document.addEventListener('click',e=>{if(!e.target.closest('.new-session-wrap'))hideSessionMenu()});window.addEventListener('resize',()=>applyComposerHeight($('#agentForm').getBoundingClientRect().height));
 $('#agentForm').onsubmit=e=>{e.preventDefault();const p=$('#prompt').value.trim();if(!p)return;$('#prompt').value='';runAgent(p)};$('#prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('#agentForm').requestSubmit()}};$('#stop').onclick=()=>active()?.abort?.abort();$('#copy').onclick=copySession;
 $('#settingsBtn').onclick=()=>{$('#settingsModal').hidden=false;loadSettings()};$('#closeSettings').onclick=()=>$('#settingsModal').hidden=true;$('#settingsModal').onclick=e=>{if(e.target===$('#settingsModal'))$('#settingsModal').hidden=true};$('#workspaceModal').onclick=e=>{if(e.target===$('#workspaceModal'))$('#workspaceModal').hidden=true};$('#provider').onchange=updateProviderUI;$('#saveKey').onclick=()=>saveKey(false);$('#deleteKey').onclick=()=>saveKey(true);
-boot().catch(e=>toast(e.message));
+async function bootAuthenticated(){if(!await loadAuthState())return;await boot()}
+// Authentication and self-hosted security settings.
+let authState={};
+async function loadAuthState(){
+  authState=await api('/api/auth/state');
+  const gate=$('#authGate');
+  if(!authState.configured){gate.hidden=false;$('#setupForm').hidden=false;$('#loginForm').hidden=true;$('#authTitle').textContent='Secure Cortex';$('#authIntro').textContent='Set a password before using this Cortex instance.';return false}
+  if(!authState.authenticated){gate.hidden=false;$('#setupForm').hidden=true;$('#loginForm').hidden=false;$('#authTitle').textContent='Sign in to Cortex';$('#authIntro').textContent='Unlock this Cortex instance to continue.';$('#loginTOTPLabel').hidden=!authState.totpEnabled;$('#googleLogin').hidden=!(authState.googleEnabled&&authState.googleConfigured);return false}
+  gate.hidden=true;return true
+}
+function authError(e){$('#authError').textContent=e?.message||String(e)}
+$('#setupForm').onsubmit=async e=>{e.preventDefault();$('#authError').textContent='';try{await api('/api/auth/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:$('#setupPassword').value,confirm:$('#setupConfirm').value})});await bootAuthenticated()}catch(x){authError(x)}};
+$('#loginForm').onsubmit=async e=>{e.preventDefault();$('#authError').textContent='';try{await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:$('#loginPassword').value,TOTP:$('#loginTOTP').value})});await bootAuthenticated()}catch(x){authError(x)}};
+function showSettingsTab(name){const security=name==='security';$('#providerSettings').hidden=security;$('#securitySettings').hidden=!security;$('#providerTab').classList.toggle('active',!security);$('#securityTab').classList.toggle('active',security);if(security)loadSecuritySettings()}
+$('#providerTab').onclick=()=>showSettingsTab('providers');$('#securityTab').onclick=()=>showSettingsTab('security');
+async function loadSecuritySettings(){authState=await api('/api/auth/state');$('#totpState').textContent=authState.totpEnabled?'Two-factor authentication is enabled.':'Two-factor authentication is off.';$('#startTOTP').hidden=authState.totpEnabled;$('#disableTOTP').hidden=!authState.totpEnabled;$('#totpSetup').hidden=true;$('#googleEnabled').checked=!!authState.googleEnabled;$('#googleClientID').value=authState.googleClientID||'';$('#googleEmail').value=authState.googleEmail||'';$('#googleRedirect').value=location.origin+'/api/auth/google/callback'}
+$('#changePassword').onclick=async()=>{try{await api('/api/auth/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Current:$('#currentPassword').value,Password:$('#newPassword').value,Confirm:$('#confirmPassword').value})});$('#currentPassword').value=$('#newPassword').value=$('#confirmPassword').value='';toast('Password changed')}catch(e){toast(e.message)}};
+$('#startTOTP').onclick=async()=>{try{const x=await api('/api/auth/totp/begin',{method:'POST'});$('#totpSecret').value=x.secret;$('#totpSetup').hidden=false}catch(e){toast(e.message)}};
+$('#enableTOTP').onclick=async()=>{try{await api('/api/auth/totp/enable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:$('#totpCode').value})});$('#totpCode').value='';await loadSecuritySettings();toast('Two-factor authentication enabled')}catch(e){toast(e.message)}};
+$('#disableTOTP').onclick=async()=>{const password=prompt('Enter your Cortex password to disable two-factor authentication');if(!password)return;try{await api('/api/auth/totp/disable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});await loadSecuritySettings();toast('Two-factor authentication disabled')}catch(e){toast(e.message)}};
+$('#saveGoogle').onclick=async()=>{try{await api('/api/auth/google',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:$('#googleEnabled').checked,ClientID:$('#googleClientID').value,ClientSecret:$('#googleClientSecret').value,Email:$('#googleEmail').value})});$('#googleClientSecret').value='';await loadSecuritySettings();toast('Google auth saved')}catch(e){toast(e.message)}};
+$('#logout').onclick=async()=>{await api('/api/auth/logout',{method:'POST'});location.reload()};
+
+loadAuthState().then(ok=>{if(ok)return boot()}).catch(e=>toast(e.message));
