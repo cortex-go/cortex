@@ -72,3 +72,8 @@ main{display:block;min-height:0;overflow:hidden;background:#151716;padding:22px}
 .agent-card form{display:grid;grid-template-rows:minmax(0,1fr) auto;padding:7px 16px 11px;border-top:0}
 .composer-resize{height:5px;min-height:5px;margin:0;background:#181a19;border-top:1px solid var(--line);cursor:ns-resize;touch-action:none}
 .composer-resize::after{display:none}.composer-resize:hover,.resizing-composer .composer-resize{border-top-color:var(--green)}
+
+/* Authentication state visibility must win over form/label display rules. */
+.auth-card form[hidden],
+.auth-card label[hidden],
+.auth-card .google-login[hidden]{display:none!important}

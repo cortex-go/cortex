@@ -146,8 +146,17 @@ let authState={};
 async function loadAuthState(){
   authState=await api('/api/auth/state');
   const gate=$('#authGate');
-  if(!authState.configured){gate.hidden=false;$('#setupForm').hidden=false;$('#loginForm').hidden=true;$('#authTitle').textContent='Secure Cortex';$('#authIntro').textContent='Set a password before using this Cortex instance.';return false}
-  if(!authState.authenticated){gate.hidden=false;$('#setupForm').hidden=true;$('#loginForm').hidden=false;$('#authTitle').textContent='Sign in to Cortex';$('#authIntro').textContent='Unlock this Cortex instance to continue.';$('#loginTOTPLabel').hidden=!authState.totpEnabled;$('#googleLogin').hidden=!(authState.googleEnabled&&authState.googleConfigured);return false}
+  if(!authState.configured){
+    gate.hidden=false;$('#setupForm').hidden=false;$('#loginForm').hidden=true;
+    $('#loginTOTPLabel').hidden=true;$('#googleLogin').hidden=true;
+    $('#authTitle').textContent='Secure Cortex';$('#authIntro').textContent='Set a password before using this Cortex instance.';return false
+  }
+  if(!authState.authenticated){
+    gate.hidden=false;$('#setupForm').hidden=true;$('#loginForm').hidden=false;
+    $('#authTitle').textContent='Sign in to Cortex';$('#authIntro').textContent='Unlock this Cortex instance to continue.';
+    $('#loginTOTPLabel').hidden=!authState.totpEnabled;
+    $('#googleLogin').hidden=!(authState.googleEnabled&&authState.googleConfigured);return false
+  }
   gate.hidden=true;return true
 }
 function authError(e){$('#authError').textContent=e?.message||String(e)}
