@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +21,22 @@ import (
 	"strings"
 	"time"
 )
+
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		ip := net.ParseIP(host)
+		if ip != nil && ip.IsLoopback() {
+			if proto := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0])); proto == "https" || proto == "http" {
+				return proto
+			}
+		}
+	}
+	return "http"
+}
 
 type AuthSettings struct {
 	PasswordHash       string `json:"passwordHash,omitempty"`
@@ -141,7 +158,7 @@ func (a *App) newSessionCookie(w http.ResponseWriter, r *http.Request) {
 	a.authMu.Lock()
 	a.sessions[token] = sessionInfo{Expires: time.Now().Add(7 * 24 * time.Hour)}
 	a.authMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "cortex_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil, MaxAge: 7 * 24 * 3600})
+	http.SetCookie(w, &http.Cookie{Name: "cortex_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: requestScheme(r) == "https", MaxAge: 7 * 24 * 3600})
 }
 func (a *App) clearSession(w http.ResponseWriter, r *http.Request) {
 	if c, e := r.Cookie("cortex_session"); e == nil {
@@ -149,7 +166,7 @@ func (a *App) clearSession(w http.ResponseWriter, r *http.Request) {
 		delete(a.sessions, c.Value)
 		a.authMu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "cortex_session", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil})
+	http.SetCookie(w, &http.Cookie{Name: "cortex_session", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: requestScheme(r) == "https"})
 }
 
 func (a *App) authMiddleware(next http.Handler) http.Handler {
@@ -387,10 +404,7 @@ func (a *App) googleStart(w http.ResponseWriter, r *http.Request) {
 	a.authMu.Lock()
 	a.oauthStates[state] = time.Now().Add(10 * time.Minute)
 	a.authMu.Unlock()
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
+	scheme := requestScheme(r)
 	redirect := scheme + "://" + r.Host + "/api/auth/google/callback"
 	q := url.Values{"client_id": {x.GoogleClientID}, "redirect_uri": {redirect}, "response_type": {"code"}, "scope": {"openid email"}, "state": {state}, "prompt": {"select_account"}}
 	http.Redirect(w, r, "https://accounts.google.com/o/oauth2/v2/auth?"+q.Encode(), 302)
@@ -409,10 +423,7 @@ func (a *App) googleCallback(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
 	x := a.settings.Auth
 	a.mu.RUnlock()
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
+	scheme := requestScheme(r)
 	redirect := scheme + "://" + r.Host + "/api/auth/google/callback"
 	resp, err := http.PostForm("https://oauth2.googleapis.com/token", url.Values{"code": {code}, "client_id": {x.GoogleClientID}, "client_secret": {x.GoogleClientSecret}, "redirect_uri": {redirect}, "grant_type": {"authorization_code"}})
 	if err != nil {
