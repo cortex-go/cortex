@@ -29,3 +29,11 @@ main{display:block;min-height:0;overflow:hidden;background:#151716;padding:22px}
 
 .modal-card label[hidden],.modal-actions button[hidden]{display:none}
 #providerNote{white-space:pre-wrap}
+
+/* Dark scrollbars that stay visible without becoming the brightest UI element. */
+*{scrollbar-width:thin;scrollbar-color:#46514b #151817}
+*::-webkit-scrollbar{width:10px;height:10px}
+*::-webkit-scrollbar-track{background:#151817}
+*::-webkit-scrollbar-thumb{background:#46514b;border:2px solid #151817;border-radius:999px}
+*::-webkit-scrollbar-thumb:hover{background:#59665f}
+*::-webkit-scrollbar-corner{background:#151817}
