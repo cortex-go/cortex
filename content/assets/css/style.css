@@ -77,3 +77,23 @@ main{display:block;min-height:0;overflow:hidden;background:#151716;padding:22px}
 .auth-card form[hidden],
 .auth-card label[hidden],
 .auth-card .google-login[hidden]{display:none!important}
+
+/* Conservative Markdown presentation for assistant output. Tool traces stay verbatim. */
+.event.assistant{white-space:normal}
+.event.assistant .md-line{min-height:1.58em}
+.event.assistant .md-gap{height:.72em}
+.event.assistant .md-heading{color:#dce8e1;font-family:var(--sans);font-weight:750;line-height:1.25;margin:.65em 0 .3em}
+.event.assistant .md-heading:first-child{margin-top:0}
+.event.assistant .md-h1{font-size:1.3em}.event.assistant .md-h2{font-size:1.2em}.event.assistant .md-h3{font-size:1.1em}.event.assistant .md-h4{font-size:1.02em}
+.event.assistant strong{color:#edf4ef;font-weight:750}
+.event.assistant em{color:#cbd6d0}
+.event.assistant code{padding:.08em .35em;border:1px solid #303a35;border-radius:4px;background:#0e1110;color:#a9d9b9;font:12.5px/1.45 var(--mono)}
+.event.assistant pre{overflow:auto;margin:.65em 0;padding:10px 12px;border:1px solid #303833;border-radius:6px;background:#0c0f0e;white-space:pre}
+.event.assistant pre code{padding:0;border:0;background:transparent;color:#cbd5cf}
+.event.assistant pre code[data-language]::before{content:attr(data-language);display:block;margin-bottom:7px;color:#65716b;font-size:9px;text-transform:uppercase;letter-spacing:.08em}
+.event.assistant ul,.event.assistant ol{margin:.35em 0 .55em;padding-left:1.7em}
+.event.assistant li{margin:.14em 0;padding-left:.15em}
+.event.assistant li::marker{color:#759783}
+.event.assistant blockquote{margin:.55em 0;padding:.1em 0 .1em .85em;border-left:2px solid #4c6656;color:#aebbb4}
+.event.assistant a{color:#8fd0a6;text-decoration:none;border-bottom:1px solid #486653}
+.event.assistant a:hover{color:#b6e3c5;border-bottom-color:#7fc89b}

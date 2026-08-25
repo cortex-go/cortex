@@ -59,7 +59,52 @@ function toggleSessionMenu(){
 }
 function hideSessionMenu(){$('#newSessionMenu').hidden=true}
 function renderTool(row,text){const lines=text.split('\n'),m=lines[0].match(/^↳ ([\w.:-]+) · (completed|error|running|pending)$/);if(!m){row.textContent=text;return}const h=document.createElement('div');h.className='tool-head';h.innerHTML='<span class="tool-arrow">↳ </span><span class="tool-name"></span><span> · </span><span class="tool-status"></span>';h.querySelector('.tool-name').textContent=m[1];const st=h.querySelector('.tool-status');st.textContent=m[2];st.classList.add(m[2]);row.append(h);if(lines.length>1){const body=document.createElement('div');body.className='tool-body';body.textContent=lines.slice(1).join('\n');row.append(body)}}
-function eventNode(ev){const row=document.createElement('div');row.className='event '+ev.kind;row.dataset.kind=ev.kind;if(ev.kind==='tool')renderTool(row,ev.text);else row.textContent=ev.text;return row}
+function appendMarkdownInline(parent,text){
+  // Deliberately small renderer: text is always emitted with textContent, so agent output
+  // cannot inject HTML. Support only the Markdown that improves transcript scanning.
+  const re=/(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g;
+  let at=0,m;
+  while((m=re.exec(text))){
+    if(m.index>at)parent.append(document.createTextNode(text.slice(at,m.index)));
+    const token=m[0];
+    if(token.startsWith('`')){const el=document.createElement('code');el.textContent=token.slice(1,-1);parent.append(el)}
+    else if(token.startsWith('**')||token.startsWith('__')){const el=document.createElement('strong');el.textContent=token.slice(2,-2);parent.append(el)}
+    else if(token.startsWith('*')||token.startsWith('_')){const el=document.createElement('em');el.textContent=token.slice(1,-1);parent.append(el)}
+    else{
+      const lm=token.match(/^\[([^\]]+)\]\((https?:\/\/[^)]+)\)$/),a=document.createElement('a');
+      a.textContent=lm[1];a.href=lm[2];a.target='_blank';a.rel='noopener noreferrer';parent.append(a)
+    }
+    at=m.index+token.length
+  }
+  if(at<text.length)parent.append(document.createTextNode(text.slice(at)))
+}
+function renderMarkdown(row,text){
+  const lines=String(text).replace(/\r\n?/g,'\n').split('\n');
+  let fence=null,list=null,quote=null;
+  const flushList=()=>{list=null},flushQuote=()=>{quote=null};
+  for(const line of lines){
+    const fm=line.match(/^```([\w.+-]*)\s*$/);
+    if(fm){
+      flushList();flushQuote();
+      if(fence){fence=null}
+      else{const pre=document.createElement('pre'),code=document.createElement('code');if(fm[1])code.dataset.language=fm[1];pre.append(code);row.append(pre);fence=code}
+      continue
+    }
+    if(fence){fence.textContent+=(fence.textContent?'\n':'')+line;continue}
+    const hm=line.match(/^(#{1,4})\s+(.+)$/);
+    if(hm){flushList();flushQuote();const h=document.createElement('div');h.className='md-heading md-h'+hm[1].length;appendMarkdownInline(h,hm[2]);row.append(h);continue}
+    const lm=line.match(/^\s*([-*+])\s+(.+)$/);
+    if(lm){flushQuote();if(!list||list.tagName!=='UL'){list=document.createElement('ul');row.append(list)}const li=document.createElement('li');appendMarkdownInline(li,lm[2]);list.append(li);continue}
+    const om=line.match(/^\s*(\d+)\.\s+(.+)$/);
+    if(om){flushQuote();if(!list||list.tagName!=='OL'){list=document.createElement('ol');row.append(list)}const li=document.createElement('li');li.value=Number(om[1]);appendMarkdownInline(li,om[2]);list.append(li);continue}
+    const qm=line.match(/^>\s?(.*)$/);
+    if(qm){flushList();if(!quote){quote=document.createElement('blockquote');row.append(quote)}const p=document.createElement('div');appendMarkdownInline(p,qm[1]);quote.append(p);continue}
+    flushList();flushQuote();
+    if(!line.trim()){row.append(document.createElement('div')).className='md-gap';continue}
+    const p=document.createElement('div');p.className='md-line';appendMarkdownInline(p,line);row.append(p)
+  }
+}
+function eventNode(ev){const row=document.createElement('div');row.className='event '+ev.kind;row.dataset.kind=ev.kind;if(ev.kind==='tool')renderTool(row,ev.text);else if(ev.kind==='assistant')renderMarkdown(row,ev.text);else row.textContent=ev.text;return row}
 function renderFeed(){const s=active(),box=$('#feed');box.innerHTML='';if(!s.events.length){box.innerHTML='<div class="empty"><span class="orb">C</span><strong>What do you want to build?</strong><span>Choose a workspace, then give Cortex a development task.</span></div>';return}for(const ev of s.events)box.append(eventNode(ev));box.scrollTop=box.scrollHeight}
 function renderSession(){const s=active();$('#workspaceLabel').textContent=s.workspace||'Choose workspace';$('#run').disabled=s.busy||!s.workspace;$('#prompt').disabled=s.busy;$('#stop').hidden=!s.busy;$('#activity').hidden=!s.busy;renderFeed()}
 function renderAll(){renderTabs();renderSession()}
