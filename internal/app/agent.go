@@ -16,9 +16,10 @@ import (
 const defaultModel = "opencode/deepseek-v4-flash"
 
 type agentRunRequest struct {
-	Workspace string `json:"workspace"`
-	Prompt    string `json:"prompt"`
-	Session   string `json:"session,omitempty"`
+	Workspace     string `json:"workspace"`
+	Prompt        string `json:"prompt"`
+	Session       string `json:"session,omitempty"`
+	ClientSession string `json:"clientSession,omitempty"`
 }
 
 func (a *App) agentStatus(w http.ResponseWriter, r *http.Request) {
@@ -75,16 +76,32 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "OpenCode is not installed or not in Cortex's PATH", 503)
 		return
 	}
-	runDir, err := os.MkdirTemp("", "cortex-opencode-")
+	clientSession := strings.TrimSpace(q.ClientSession)
+	if clientSession == "" {
+		clientSession = "default"
+	}
+	for _, r := range clientSession {
+		if !(r == '-' || r == '_' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			http.Error(w, "invalid client session", 400)
+			return
+		}
+	}
+	runDir, err := os.MkdirTemp("", "cortex-opencode-config-")
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	defer os.RemoveAll(runDir)
 	configDir := filepath.Join(runDir, "config")
-	dataDir := filepath.Join(runDir, "data")
-	os.MkdirAll(configDir, 0700)
-	os.MkdirAll(dataDir, 0700)
+	dataDir := filepath.Join(a.dataDir, "sessions", clientSession, "data")
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	cfg := []byte(`{"$schema":"https://opencode.ai/config.json","model":"opencode/deepseek-v4-flash","permission":"allow","provider":{"opencode":{"npm":"@ai-sdk/openai-compatible","name":"OpenCode Zen","options":{"baseURL":"https://opencode.ai/zen/v1","apiKey":"{env:OPENCODE_API_KEY}"},"models":{"deepseek-v4-flash":{"name":"DeepSeek V4 Flash"}}}}}`)
 	configPath := filepath.Join(configDir, "opencode.json")
 	if err := os.WriteFile(configPath, cfg, 0600); err != nil {
