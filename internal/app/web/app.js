@@ -27,7 +27,23 @@ function summarize(ev){const raw=ev?.data?.data||ev?.data||{},type=String(raw.ty
 async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace)return;const id=s.id;s.busy=true;s.abort=new AbortController();if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');addEvent(id,'user',prompt);renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line),text=summarize(ev),raw=ev?.data?.data||ev?.data||{},t=String(raw.type||'');if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;if(text)addEvent(id,ev.type==='error'?'error':ev.type==='done'?'done':t.includes('tool')?'tool':'assistant',text)}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].busy=false;sessions[id].abort=null;saveSessions()}if(activeId===id)renderAll();agentStatus()}}
 function joinPath(base,name){return (base.replace(/\/+$/,'')+'/'+name).replace(/\/+/g,'/')}
 function parentPath(p){if(p===root)return root;const x=p.replace(/\/+$/,'');const i=x.lastIndexOf('/');const out=i<=0?'/':x.slice(0,i);return out.length<root.length?root:out}
-async function browse(path){browserPath=path||root;$('#browserPath').textContent=browserPath;$('#browserUp').disabled=browserPath===root;const list=await api('/api/files?path='+encodeURIComponent(browserPath));const box=$('#browserDirs');box.innerHTML='';const dirs=list.filter(x=>x.dir);if(!dirs.length){box.innerHTML='<div class="empty" style="min-height:180px">No subdirectories</div>';return}for(const d of dirs){const b=document.createElement('button');b.className='browser-dir';b.innerHTML='<span>▸</span><span></span>';b.lastChild.textContent=d.name;b.ondblclick=()=>browse(joinPath(browserPath,d.name));b.onclick=()=>{for(const x of box.children)x.classList.remove('selected');b.classList.add('selected')};box.append(b)}}
+async function browse(path){
+  browserPath=path||root;
+  $('#browserPath').textContent=browserPath;
+  $('#browserUp').disabled=browserPath===root;
+  const list=await api('/api/files?path='+encodeURIComponent(browserPath));
+  const box=$('#browserDirs');box.innerHTML='';
+  const dirs=list.filter(x=>x.dir);
+  if(!dirs.length){box.innerHTML='<div class="browser-empty">No subdirectories</div>';return}
+  for(const d of dirs){
+    const b=document.createElement('button');b.className='browser-dir';b.type='button';
+    b.innerHTML='<span class="browser-dir-chevron">›</span><span class="browser-dir-name"></span>';
+    b.querySelector('.browser-dir-name').textContent=d.name;
+    b.title='Open '+d.name;
+    b.onclick=()=>browse(joinPath(browserPath,d.name));
+    box.append(b)
+  }
+}
 async function openWorkspacePicker(){const s=active();$('#workspaceModal').hidden=false;try{await browse(s.workspace||root)}catch(e){toast(e.message)}}
 function chooseWorkspace(){const s=active();s.workspace=browserPath;s.openCodeSession='';s.title='';s.events=[];saveSessions();$('#workspaceModal').hidden=true;renderAll();toast('Workspace selected')}
 async function copySession(){const s=active(),labels={user:'You',assistant:'Agent',tool:'Tool',error:'Error',done:'Status'},text=s.events.map(x=>`${labels[x.kind]||'Agent'}:\n${x.text}`).join('\n\n');if(!text)return toast('Nothing to copy');await navigator.clipboard.writeText(text);toast('Session copied')}

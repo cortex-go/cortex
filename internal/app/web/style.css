@@ -20,3 +20,9 @@ main{display:block;min-height:0;overflow:hidden;background:#151716;padding:22px}
 .agent-card .empty .orb{display:none}
 .agent-card .empty strong{font-size:13px}
 @media(max-width:700px){main{padding:8px}.agent-card{border-radius:7px}.agent-head{padding:12px}.workspace-strip{padding:0 12px}.agent-card .feed{padding:12px}.agent-card form{padding:9px}}
+
+.browser-dir{transition:background .12s,border-color .12s}
+.browser-dir-chevron{display:inline-grid;place-items:center;width:14px;color:#77857d;font-size:17px;line-height:1;transition:transform .12s,color .12s}
+.browser-dir:hover .browser-dir-chevron{transform:translateX(2px);color:var(--green)}
+.browser-dir-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.browser-empty{display:grid;place-items:center;min-height:180px;color:var(--muted);font-size:11px}
