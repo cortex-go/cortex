@@ -1,6 +1,6 @@
 # Cortex
 
-Cortex is a self-hosted, agent-first coding agent with a small Go backend and browser UI. It can run locally on a development machine or be hosted remotely, while OpenCode provides the underlying coding-agent execution loop.
+Cortex is a self-hosted, agent-first coding agent with a small Go backend and a Nift-built browser UI. It can run locally on a development machine or be hosted remotely, while OpenCode provides the underlying coding-agent execution loop.
 
 ## First version
 
@@ -30,15 +30,20 @@ Cortex currently expects `opencode` to be installed separately and available in 
 
 ## Build and run
 
+Cortex dogfoods [Nift](https://nift.dev) for its application frontend. `content/` and `templates/` are the source of truth; `public/` is generated and embedded into the Go binary. Build the frontend before compiling Go after changing frontend source:
+
 ```sh
+nift build
 go test ./...
 go build -o cortex ./cmd/cortex
 ./cortex
 ```
 
+`nift status` should report the three tracked frontend outputs as current before committing. Do not edit `public/` directly.
+
 Cortex listens on `127.0.0.1:7331` and uses your home directory as the default workspace root. Use `--root ~/Repositories` when you want a tighter browser-visible boundary.
 
-> Remote binding is intentionally not the default. This first version does not yet provide browser authentication, so do not expose it directly to an untrusted network. Put it behind an authenticated private network/reverse proxy until Cortex gains its own remote-auth mode.
+> Remote binding is intentionally not the default. Cortex now requires browser authentication after first-run password setup, with optional TOTP and Google sign-in. For an Internet-facing deployment, TLS and normal host/reverse-proxy hardening are still recommended.
 
 Open **Settings**, choose a provider and model, then save the provider credential. API-key providers are injected only into the isolated OpenCode process.
 

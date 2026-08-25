@@ -1,12 +1,11 @@
 package app
 
 import (
-	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	cortex "github.com/cortex-go/cortex"
 	"io"
-	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,9 +14,6 @@ import (
 	"sync"
 	"time"
 )
-
-//go:embed web/*
-var webFS embed.FS
 
 type Options struct{ Listen, Root, DataDir string }
 type App struct {
@@ -110,8 +106,7 @@ func (a *App) routes() {
 	a.mux.HandleFunc("/api/file", a.fileAPI)
 	a.mux.HandleFunc("/api/agent/status", a.agentStatus)
 	a.mux.HandleFunc("/api/agent/run", a.agentRun)
-	sub, _ := fs.Sub(webFS, "web")
-	a.mux.Handle("/", http.FileServer(http.FS(sub)))
+	a.mux.Handle("/", http.FileServer(http.FS(cortex.PublicFS())))
 }
 func jsonOut(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")

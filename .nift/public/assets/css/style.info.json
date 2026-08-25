@@ -1,0 +1,18 @@
+{
+  "name": "assets/css/style",
+  "title": "style",
+  "template": "",
+  "content": "content/assets/css/style.css",
+  "output": "public/assets/css/style.css",
+  "minify": false,
+  "minify-version": 0,
+  "pagination": false,
+  "pagination-items-per-page": 0,
+  "pagination-template": "",
+  "pagination-separator": "",
+  "pagination-pages": 0,
+  "dependencies": [
+    "content/assets/css/style.css"
+  ],
+  "reqs": []
+}

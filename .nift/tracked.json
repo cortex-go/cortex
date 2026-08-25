@@ -1,0 +1,21 @@
+{
+  "tracked": [
+    {
+      "name": "/",
+      "title": "index",
+      "template": "templates/template.html"
+    },
+    {
+      "name": "assets/css/style",
+      "title": "style",
+      "content-ext": ".css",
+      "output-ext": ".css"
+    },
+    {
+      "name": "assets/js/script",
+      "title": "script",
+      "content-ext": ".js",
+      "output-ext": ".js"
+    }
+  ]
+}

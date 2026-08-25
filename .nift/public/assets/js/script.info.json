@@ -1,0 +1,18 @@
+{
+  "name": "assets/js/script",
+  "title": "script",
+  "template": "",
+  "content": "content/assets/js/script.js",
+  "output": "public/assets/js/script.js",
+  "minify": false,
+  "minify-version": 0,
+  "pagination": false,
+  "pagination-items-per-page": 0,
+  "pagination-template": "",
+  "pagination-separator": "",
+  "pagination-pages": 0,
+  "dependencies": [
+    "content/assets/js/script.js"
+  ],
+  "reqs": []
+}
