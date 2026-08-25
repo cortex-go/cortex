@@ -18,9 +18,30 @@ function renderSession(){const s=active();$('#workspaceLabel').textContent=s.wor
 function renderAll(){renderTabs();renderSession()}
 function addEvent(id,kind,text){const clean=String(text??'').trim();if(!clean)return;const s=sessions[id];if(!s)return;s.events.push({kind,text:clean});if(s.events.length>500)s.events=s.events.slice(-500);saveSessions();if(activeId===id){$('#feed .empty')?.remove();$('#feed').append(eventNode({kind,text:clean}));$('#feed').scrollTop=$('#feed').scrollHeight}}
 async function loadSettings(){settings=await api('/api/settings');providers=settings.providers||[];const sel=$('#provider');sel.innerHTML='';for(const p of providers){const o=document.createElement('option');o.value=p.id;o.textContent=p.label+(p.configured?' · configured':'');sel.append(o)}sel.value=settings.activeProvider||providers[0]?.id||'';updateProviderUI()}
-function updateProviderUI(){const p=providers.find(x=>x.id===$('#provider').value);$('#apiKey').value='';$('#apiKey').placeholder=p?.configured?'Key stored · enter a new key to replace':'Paste API key';$('#providerNote').textContent=p?.id==='opencode'?'Used by the current DeepSeek V4 Flash agent. Keys stay on the Cortex server.':'Credential storage is ready; this first agent build currently executes through OpenCode Zen.'}
-async function saveKey(remove=false){const provider=$('#provider').value,key=remove?'':$('#apiKey').value.trim();if(!remove&&!key&&providers.find(x=>x.id===provider)?.configured){toast('Existing key kept');return}await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider,key})});await loadSettings();await agentStatus();toast(remove?'Key removed':'Provider saved')}
-async function agentStatus(){try{const s=await api('/api/agent/status');$('#dot').classList.toggle('ready',s.available);$('#agentState').textContent=!s.opencodeInstalled?'OpenCode not installed':!s.credentialAvailable?'API key required':s.provider!=='opencode'?'Select OpenCode Zen':'Ready'}catch(e){$('#agentState').textContent=e.message}}
+function updateProviderUI(){
+  const p=providers.find(x=>x.id===$('#provider').value);if(!p)return;
+  $('#model').value=p.model||p.defaultModel||'';
+  $('#apiKey').value='';
+  const auth=p.authMode==='opencode-auth';
+  $('#keyLabel').hidden=auth;$('#deleteKey').hidden=auth;
+  $('#apiKey').placeholder=p.configured?'Key stored · enter a new key to replace':'Paste API key';
+  $('#providerNote').textContent=auth
+    ? (p.configured
+        ? `Connected through OpenCode on this host. Cortex copies that ${p.label} OAuth credential into the isolated session.`
+        : `Not connected yet. Run: opencode auth login --provider ${p.openCodeID} on the Cortex host, then reopen Settings.`)
+    : `Cortex passes this key only to the isolated OpenCode process. Model IDs use OpenCode's ${p.openCodeID}/… catalog.`;
+}
+async function saveKey(remove=false){
+  const provider=$('#provider').value,p=providers.find(x=>x.id===provider),key=$('#apiKey').value.trim(),model=$('#model').value.trim();
+  if(!model)return toast('Enter a model ID');
+  await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider,key,model,removeKey:remove})});
+  await loadSettings();await agentStatus();toast(remove?'Key removed':'Provider saved')
+}
+async function agentStatus(){try{
+  const s=await api('/api/agent/status');$('#dot').classList.toggle('ready',s.available);
+  $('#agentModel').textContent=`${s.providerLabel||s.provider} · ${s.model||''} · through OpenCode`;
+  $('#agentState').textContent=!s.opencodeInstalled?'OpenCode not installed':!s.credentialAvailable?(s.authMode==='opencode-auth'?'OpenCode login required':'API key required'):'Ready'
+}catch(e){$('#agentState').textContent=e.message}}
 function clipped(v,n=2600){const s=String(v??'').trim();return s.length>n?s.slice(0,n)+'\n…':s}
 function toolText(raw){const p=raw.part||raw,st=p.state||{},tool=p.tool||raw.tool||raw.name||'tool',status=st.status||'';const input=st.input||p.input||{},lines=[`↳ ${tool}${status?' · '+status:''}`];if(tool==='bash'&&input.command)lines.push('$ '+input.command);else if(input.filePath||input.path)lines.push(input.filePath||input.path);if(st.error)lines.push('ERROR: '+clipped(typeof st.error==='string'?st.error:JSON.stringify(st.error)));else if(st.output)lines.push(clipped(st.output));return lines.join('\n')}
 function summarize(ev){const raw=ev?.data?.data||ev?.data||{},type=String(raw.type||'');if(ev.type==='error')return raw.message||'Agent failed';if(ev.type==='recovered')return raw.text||'';if(ev.type==='done'){const i=raw.inputTokens||0,o=raw.outputTokens||0;return i||o?`Done · ${i} input · ${o} output tokens`:'Done'};if(ev.type==='output')return raw.text||'';if(type.includes('tool'))return toolText(raw);return raw.part?.text||raw.text||''}

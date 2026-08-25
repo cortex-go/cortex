@@ -25,10 +25,13 @@ type App struct {
 	mu                    sync.RWMutex
 	settings              Settings
 }
-type Provider struct{ ID, Label, Hint string }
+type Provider struct {
+	ID, Label, Hint, OpenCodeID, DefaultModel, AuthMode string
+}
 type Settings struct {
 	ActiveProvider string            `json:"activeProvider"`
 	Keys           map[string]string `json:"keys"`
+	Models         map[string]string `json:"models"`
 }
 
 type publicSettings struct {
@@ -37,12 +40,14 @@ type publicSettings struct {
 }
 
 var providers = []Provider{
-	{"opencode", "OpenCode Zen", "OpenCode Zen API key"},
-	{"openrouter", "OpenRouter", "OpenRouter API key"},
-	{"openai", "OpenAI", "OpenAI API key"},
-	{"anthropic", "Anthropic", "Anthropic API key"},
-	{"google", "Google AI", "Google AI API key"},
-	{"deepseek", "DeepSeek", "DeepSeek API key"},
+	{"opencode", "OpenCode Zen", "OpenCode Zen API key", "opencode", "deepseek-v4-flash", "key"},
+	{"openrouter", "OpenRouter", "OpenRouter API key", "openrouter", "anthropic/claude-sonnet-4.5", "key"},
+	{"openai", "OpenAI API", "OpenAI API key", "openai", "gpt-5.2", "key"},
+	{"anthropic", "Anthropic API", "Anthropic API key", "anthropic", "claude-sonnet-4-20250514", "key"},
+	{"google", "Google AI", "Google AI API key", "google", "gemini-2.5-pro", "key"},
+	{"deepseek", "DeepSeek API", "DeepSeek API key", "deepseek", "deepseek-v4-pro", "key"},
+	{"openai-chatgpt", "ChatGPT Plus / Pro", "Uses an existing OpenCode ChatGPT login", "openai", "gpt-5.2", "opencode-auth"},
+	{"github-copilot", "GitHub Copilot", "Uses an existing OpenCode GitHub Copilot login", "github-copilot", "gpt-5", "opencode-auth"},
 }
 
 func New(o Options) (*App, error) {
@@ -57,8 +62,14 @@ func New(o Options) (*App, error) {
 	if err := os.MkdirAll(o.DataDir, 0700); err != nil {
 		return nil, err
 	}
-	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}}}
+	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}}
 	_ = a.loadSettings()
+	if a.settings.Keys == nil {
+		a.settings.Keys = map[string]string{}
+	}
+	if a.settings.Models == nil {
+		a.settings.Models = map[string]string{}
+	}
 	a.routes()
 	return a, nil
 }
@@ -120,20 +131,48 @@ func (a *App) saveSettings() error {
 }
 func (a *App) publicSettings() publicSettings {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	out := publicSettings{ActiveProvider: a.settings.ActiveProvider}
+	active := a.settings.ActiveProvider
+	keys := make(map[string]string, len(a.settings.Keys))
+	models := make(map[string]string, len(a.settings.Models))
+	for k, v := range a.settings.Keys {
+		keys[k] = v
+	}
+	for k, v := range a.settings.Models {
+		models[k] = v
+	}
+	a.mu.RUnlock()
+	out := publicSettings{ActiveProvider: active}
 	for _, p := range providers {
-		_, set := a.settings.Keys[p.ID]
-		out.Providers = append(out.Providers, map[string]any{"id": p.ID, "label": p.Label, "hint": p.Hint, "configured": set})
+		model := strings.TrimSpace(models[p.ID])
+		if model == "" {
+			model = p.DefaultModel
+		}
+		configured := false
+		if p.AuthMode == "key" {
+			configured = strings.TrimSpace(keys[p.ID]) != ""
+		} else {
+			configured = a.hostOpenCodeAuthConfigured(p.OpenCodeID)
+		}
+		out.Providers = append(out.Providers, map[string]any{
+			"id": p.ID, "label": p.Label, "hint": p.Hint, "configured": configured,
+			"authMode": p.AuthMode, "model": model, "defaultModel": p.DefaultModel,
+			"openCodeID": p.OpenCodeID,
+		})
 	}
 	return out
 }
+
 func (a *App) settingsAPI(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
 		jsonOut(w, a.publicSettings())
 	case "POST":
-		var q struct{ Provider, Key string }
+		var q struct {
+			Provider  string `json:"provider"`
+			Key       string `json:"key"`
+			Model     string `json:"model"`
+			RemoveKey bool   `json:"removeKey"`
+		}
 		if !decode(w, r, &q) {
 			return
 		}
@@ -147,15 +186,30 @@ func (a *App) settingsAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unknown provider", 400)
 			return
 		}
+		p, _ := providerByID(q.Provider)
+		model := strings.TrimSpace(q.Model)
+		if model == "" {
+			model = p.DefaultModel
+		}
+		if strings.Contains(model, "#") {
+			http.Error(w, "model variants are not supported in Settings yet", 400)
+			return
+		}
 		a.mu.Lock()
 		if a.settings.Keys == nil {
 			a.settings.Keys = map[string]string{}
 		}
-		if strings.TrimSpace(q.Key) == "" {
-			delete(a.settings.Keys, q.Provider)
-		} else {
-			a.settings.Keys[q.Provider] = strings.TrimSpace(q.Key)
+		if a.settings.Models == nil {
+			a.settings.Models = map[string]string{}
 		}
+		if p.AuthMode == "key" {
+			if q.RemoveKey {
+				delete(a.settings.Keys, q.Provider)
+			} else if strings.TrimSpace(q.Key) != "" {
+				a.settings.Keys[q.Provider] = strings.TrimSpace(q.Key)
+			}
+		}
+		a.settings.Models[q.Provider] = model
 		a.settings.ActiveProvider = q.Provider
 		a.mu.Unlock()
 		if err := a.saveSettings(); err != nil {
@@ -166,6 +220,45 @@ func (a *App) settingsAPI(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method", 405)
 	}
+}
+func hostOpenCodeAuthPath() string {
+	if xdg := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); xdg != "" {
+		return filepath.Join(xdg, "opencode", "auth.json")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "share", "opencode", "auth.json")
+}
+func (a *App) hostOpenCodeAuthConfigured(providerID string) bool {
+	path := hostOpenCodeAuthPath()
+	if path == "" {
+		return false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var auth map[string]any
+	if json.Unmarshal(b, &auth) != nil {
+		return false
+	}
+	_, ok := auth[providerID]
+	return ok
+}
+func (a *App) configuredModel(providerID string) string {
+	p, ok := providerByID(providerID)
+	if !ok {
+		return ""
+	}
+	a.mu.RLock()
+	model := strings.TrimSpace(a.settings.Models[providerID])
+	a.mu.RUnlock()
+	if model == "" {
+		model = p.DefaultModel
+	}
+	return model
 }
 func (a *App) status(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, map[string]any{"root": a.root, "settings": a.publicSettings()})

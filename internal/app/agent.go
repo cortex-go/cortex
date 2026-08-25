@@ -13,8 +13,6 @@ import (
 	"strings"
 )
 
-const defaultModel = "opencode/deepseek-v4-flash"
-
 type agentRunRequest struct {
 	Workspace     string `json:"workspace"`
 	Prompt        string `json:"prompt"`
@@ -28,11 +26,35 @@ func (a *App) agentStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.mu.RLock()
-	provider := a.settings.ActiveProvider
+	providerID := a.settings.ActiveProvider
 	a.mu.RUnlock()
-	_, configured := a.credential(provider)
+	p, ok := providerByID(providerID)
+	if !ok {
+		http.Error(w, "unknown provider", 500)
+		return
+	}
+	configured := false
+	if p.AuthMode == "key" {
+		_, configured = a.credential(providerID)
+	} else {
+		configured = a.hostOpenCodeAuthConfigured(p.OpenCodeID)
+	}
+	model := a.configuredModel(providerID)
 	_, err := exec.LookPath("opencode")
-	jsonOut(w, map[string]any{"available": err == nil && configured && provider == "opencode", "opencodeInstalled": err == nil, "credentialAvailable": configured, "provider": provider, "model": defaultModel, "note": "Cortex v0.1 agent execution uses OpenCode Zen; additional stored providers are reserved for upcoming model/provider selection."})
+	note := ""
+	if p.AuthMode == "opencode-auth" {
+		note = "Uses OpenCode's existing OAuth credential on the Cortex host. Run `opencode auth login --provider " + p.OpenCodeID + "` once if it is not configured."
+	}
+	jsonOut(w, map[string]any{
+		"available":           err == nil && configured && model != "",
+		"opencodeInstalled":   err == nil,
+		"credentialAvailable": configured,
+		"provider":            providerID,
+		"providerLabel":       p.Label,
+		"model":               p.OpenCodeID + "/" + model,
+		"authMode":            p.AuthMode,
+		"note":                note,
+	})
 }
 
 func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
@@ -60,17 +82,31 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.mu.RLock()
-	provider := a.settings.ActiveProvider
+	providerID := a.settings.ActiveProvider
 	a.mu.RUnlock()
-	if provider != "opencode" {
-		http.Error(w, "Cortex v0.1 agent execution currently uses OpenCode Zen; select OpenCode Zen in Settings", 400)
-		return
-	}
-	key, ok := a.credential("opencode")
+	provider, ok := providerByID(providerID)
 	if !ok {
-		http.Error(w, "OpenCode Zen credential is not configured", 400)
+		http.Error(w, "unknown provider", 400)
 		return
 	}
+	modelID := a.configuredModel(providerID)
+	if modelID == "" {
+		http.Error(w, "model is not configured for "+provider.Label, 400)
+		return
+	}
+	key := ""
+	if provider.AuthMode == "key" {
+		var configured bool
+		key, configured = a.credential(providerID)
+		if !configured {
+			http.Error(w, provider.Label+" credential is not configured", 400)
+			return
+		}
+	} else if !a.hostOpenCodeAuthConfigured(provider.OpenCodeID) {
+		http.Error(w, provider.Label+" is not connected in OpenCode; run `opencode auth login --provider "+provider.OpenCodeID+"` on the Cortex host", 400)
+		return
+	}
+	modelRef := provider.OpenCodeID + "/" + modelID
 	binary, err := exec.LookPath("opencode")
 	if err != nil {
 		http.Error(w, "OpenCode is not installed or not in Cortex's PATH", 503)
@@ -102,7 +138,17 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	cfg := []byte(`{"$schema":"https://opencode.ai/config.json","model":"opencode/deepseek-v4-flash","permission":"allow","provider":{"opencode":{"npm":"@ai-sdk/openai-compatible","name":"OpenCode Zen","options":{"baseURL":"https://opencode.ai/zen/v1","apiKey":"{env:OPENCODE_API_KEY}"},"models":{"deepseek-v4-flash":{"name":"DeepSeek V4 Flash"}}}}}`)
+	if provider.AuthMode == "opencode-auth" {
+		if err := copyOpenCodeAuth(dataDir); err != nil {
+			http.Error(w, "copy OpenCode auth: "+err.Error(), 500)
+			return
+		}
+	}
+	cfg, err := cortexOpenCodeConfig(provider, modelID)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	configPath := filepath.Join(configDir, "opencode.json")
 	if err := os.WriteFile(configPath, cfg, 0600); err != nil {
 		http.Error(w, err.Error(), 500)
@@ -110,7 +156,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	args := []string{"--print-logs", "--log-level", "INFO", "run", "--format", "json", "--auto", "--dir", workspace, "--model", defaultModel}
+	args := []string{"--print-logs", "--log-level", "INFO", "run", "--format", "json", "--auto", "--dir", workspace, "--model", modelRef}
 	if strings.TrimSpace(q.Session) != "" {
 		args = append(args, "--session", strings.TrimSpace(q.Session))
 	}
@@ -118,7 +164,9 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = workspace
 	env := append([]string{}, os.Environ()...)
-	env = setEnv(env, "OPENCODE_API_KEY", key)
+	if provider.AuthMode == "key" {
+		env = setEnv(env, "CORTEX_PROVIDER_API_KEY", key)
+	}
 	env = setEnv(env, "OPENCODE_CONFIG", configPath)
 	env = setEnv(env, "OPENCODE_CONFIG_DIR", configDir)
 	env = setEnv(env, "XDG_CONFIG_HOME", configDir)
@@ -201,6 +249,42 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	}
 	writeEvent(w, flusher, "done", map[string]any{"inputTokens": input, "outputTokens": output, "estimatedCostUsd": cost, "sessionID": sessionID})
 }
+func cortexOpenCodeConfig(provider Provider, modelID string) ([]byte, error) {
+	modelRef := provider.OpenCodeID + "/" + modelID
+	cfg := map[string]any{
+		"$schema":    "https://opencode.ai/config.json",
+		"model":      modelRef,
+		"permission": "allow",
+	}
+	if provider.AuthMode == "key" {
+		options := map[string]any{"apiKey": "{env:CORTEX_PROVIDER_API_KEY}"}
+		entry := map[string]any{"options": options}
+		if provider.ID == "opencode" {
+			entry["npm"] = "@ai-sdk/openai-compatible"
+			entry["name"] = "OpenCode Zen"
+			options["baseURL"] = "https://opencode.ai/zen/v1"
+			entry["models"] = map[string]any{modelID: map[string]any{"name": modelID}}
+		}
+		cfg["provider"] = map[string]any{provider.OpenCodeID: entry}
+	}
+	return json.Marshal(cfg)
+}
+func copyOpenCodeAuth(dataDir string) error {
+	src := hostOpenCodeAuthPath()
+	if src == "" {
+		return errors.New("OpenCode auth path unavailable")
+	}
+	b, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	dstDir := filepath.Join(dataDir, "opencode")
+	if err := os.MkdirAll(dstDir, 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dstDir, "auth.json"), b, 0600)
+}
+
 func eventText(raw map[string]any) string {
 	if raw["type"] != "text" {
 		return ""

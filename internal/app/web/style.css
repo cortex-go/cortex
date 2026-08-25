@@ -26,3 +26,6 @@ main{display:block;min-height:0;overflow:hidden;background:#151716;padding:22px}
 .browser-dir:hover .browser-dir-chevron{transform:translateX(2px);color:var(--green)}
 .browser-dir-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .browser-empty{display:grid;place-items:center;min-height:180px;color:var(--muted);font-size:11px}
+
+.modal-card label[hidden],.modal-actions button[hidden]{display:none}
+#providerNote{white-space:pre-wrap}

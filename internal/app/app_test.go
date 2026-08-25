@@ -1,6 +1,8 @@
 package app
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -59,5 +61,43 @@ func TestCollectUsageFromOpenCodeSessionTokens(t *testing.T) {
 	}
 	if cost != 0.0123 {
 		t.Fatalf("cost = %v", cost)
+	}
+}
+
+func TestProviderRuntimeConfigUsesSelectedModel(t *testing.T) {
+	p, ok := providerByID("openai")
+	if !ok {
+		t.Fatal("openai provider missing")
+	}
+	b, err := cortexOpenCodeConfig(p, "gpt-5.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg["model"] != "openai/gpt-5.2" {
+		t.Fatalf("model = %#v", cfg["model"])
+	}
+	providers, _ := cfg["provider"].(map[string]any)
+	openai, _ := providers["openai"].(map[string]any)
+	options, _ := openai["options"].(map[string]any)
+	if options["apiKey"] != "{env:CORTEX_PROVIDER_API_KEY}" {
+		t.Fatalf("api key config = %#v", options["apiKey"])
+	}
+}
+
+func TestSubscriptionProviderDoesNotEmbedAPIKeyConfig(t *testing.T) {
+	p, ok := providerByID("github-copilot")
+	if !ok {
+		t.Fatal("github copilot provider missing")
+	}
+	b, err := cortexOpenCodeConfig(p, "gpt-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b, []byte("CORTEX_PROVIDER_API_KEY")) {
+		t.Fatal("OAuth-backed provider unexpectedly embeds API-key config")
 	}
 }
