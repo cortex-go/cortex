@@ -3,11 +3,12 @@
 <body><div class="app">
 <header><div class="brand"><span class="mark">C</span><strong>Cortex</strong></div><div id="sessionTabs" class="session-tabs"></div><button id="newSession" class="new-session">＋</button><button id="settingsBtn" class="icon" title="Settings">⚙</button></header>
 <main>
-<section class="agent">
-<div class="agent-head"><button id="workspaceBtn" class="workspace-button"><span class="workspace-icon">⌂</span><span><small>WORKSPACE</small><strong id="workspaceLabel">Choose workspace</strong></span><span class="chev">⌄</span></button><div class="state"><span id="dot"></span><span id="agentState">Checking OpenCode…</span></div></div>
+<section class="agent-shell"><div class="agent-card">
+<div class="agent-head"><div><span class="eyebrow">CODING AGENT</span><strong>Cortex Agent</strong><small>DeepSeek V4 Flash through OpenCode · runs inside the selected workspace.</small></div><div class="state"><span id="dot"></span><span id="agentState">Checking OpenCode…</span></div></div>
+<button id="workspaceBtn" class="workspace-strip"><span>Workspace · </span><strong id="workspaceLabel">Choose workspace</strong><span class="chev">⌄</span></button>
 <div id="feed" class="feed"><div class="empty"><span class="orb">C</span><strong>What do you want to build?</strong><span>Choose a workspace, then give Cortex a development task.</span></div></div>
-<form id="agentForm"><textarea id="prompt" placeholder="Ask Cortex to implement, investigate, fix, test…"></textarea><div class="compose-row"><button type="button" id="copy" class="secondary">Copy session</button><span id="activity" class="activity" hidden><i></i></span><button type="button" id="stop" class="secondary" hidden>Stop</button><button id="run">Run</button></div><small>Enter to run · Shift+Enter for newline</small></form>
-</section></main></div>
+<form id="agentForm"><textarea id="prompt" placeholder="Implement, investigate, fix, test…"></textarea><div class="compose-row"><button type="button" id="copy" class="secondary">Copy session</button><span id="activity" class="activity" hidden><i></i></span><button type="button" id="stop" class="secondary" hidden>Stop</button><button id="run">Run agent</button></div><small>Enter to run · Shift+Enter for newline</small></form>
+</div></section></main></div>
 
 <div id="workspaceModal" class="modal" hidden><div class="modal-card workspace-card"><div class="modal-head"><div><span class="eyebrow">WORKSPACE</span><h2>Choose a directory</h2></div><button id="closeWorkspace" class="icon">×</button></div><div class="browser-path"><button id="browserUp">↑</button><span id="browserPath"></span></div><div id="browserDirs" class="browser-dirs"></div><div class="modal-actions"><button id="cancelWorkspace" class="secondary">Cancel</button><button id="chooseWorkspace">Use this directory</button></div></div></div>
 

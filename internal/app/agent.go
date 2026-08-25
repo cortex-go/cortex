@@ -175,9 +175,11 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	if scan.Err() != nil && waitErr == nil {
 		waitErr = scan.Err()
 	}
-	if waitErr == nil && !sawText && sessionID != "" {
-		if recovered, ri, ro, rc, e := recoverSession(ctx, binary, sessionID, workspace, env); e == nil && strings.TrimSpace(recovered) != "" {
-			writeEvent(w, flusher, "recovered", map[string]any{"text": recovered, "sessionID": sessionID})
+	if waitErr == nil && sessionID != "" {
+		if recovered, ri, ro, rc, e := recoverSession(ctx, binary, sessionID, workspace, env); e == nil {
+			if !sawText && strings.TrimSpace(recovered) != "" {
+				writeEvent(w, flusher, "recovered", map[string]any{"text": recovered, "sessionID": sessionID})
+			}
 			if ri > input {
 				input = ri
 			}
@@ -277,6 +279,16 @@ func collectUsage(v any, input, output *uint64, cost *float64) {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return
+	}
+	// OpenCode session exports record step-finish usage as:
+	// "tokens": {"input": ..., "output": ..., ...}, with cost beside it.
+	if tokens, ok := m["tokens"].(map[string]any); ok {
+		if n, ok := number(tokens["input"]); ok {
+			*input += uint64(n)
+		}
+		if n, ok := number(tokens["output"]); ok {
+			*output += uint64(n)
+		}
 	}
 	for k, x := range m {
 		lk := strings.ToLower(k)

@@ -44,3 +44,20 @@ func TestAssistantTexts(t *testing.T) {
 		t.Fatalf("%#v", got)
 	}
 }
+
+func TestCollectUsageFromOpenCodeSessionTokens(t *testing.T) {
+	v := map[string]any{
+		"type":   "step-finish",
+		"tokens": map[string]any{"input": float64(1234), "output": float64(321), "reasoning": float64(42)},
+		"cost":   float64(0.0123),
+	}
+	var input, output uint64
+	var cost float64
+	collectUsage(v, &input, &output, &cost)
+	if input != 1234 || output != 321 {
+		t.Fatalf("usage = %d/%d", input, output)
+	}
+	if cost != 0.0123 {
+		t.Fatalf("cost = %v", cost)
+	}
+}

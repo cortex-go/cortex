@@ -12,7 +12,7 @@ import (
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:7331", "HTTP listen address")
-	root := flag.String("root", "", "workspace root (default: current directory)")
+	root := flag.String("root", "", "workspace root (default: home directory)")
 	data := flag.String("data", "", "Cortex data directory")
 	flag.Parse()
 	cwd, err := os.Getwd()
@@ -20,7 +20,11 @@ func main() {
 		log.Fatal(err)
 	}
 	if *root == "" {
-		*root = cwd
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			*root = home
+		} else {
+			*root = cwd
+		}
 	}
 	if *data == "" {
 		if d, err := os.UserConfigDir(); err == nil {
