@@ -14,11 +14,19 @@ Cortex is a self-hosted, agent-first coding agent with a small Go backend and a 
 
 ## Install
 
-GitHub Releases publish prebuilt Linux, macOS and Windows binaries. On Linux or macOS, the website installer can install the latest release to `~/.local/bin`:
+GitHub Releases publish prebuilt Linux, macOS and Windows binaries. On Linux or macOS, the website installer installs to `~/.local/bin` by default without requiring `sudo`:
 
 ```sh
 curl -fsSL https://cortex-go.github.io/install.sh | sh
 ```
+
+For a deliberate system-wide installation to `/usr/local/bin`:
+
+```sh
+curl -fsSL https://cortex-go.github.io/install.sh | sudo sh -s -- --system
+```
+
+If `~/.local/bin` is not currently in `PATH`, the per-user installer prints the shell-profile line needed to add it. You can also set `CORTEX_INSTALL_DIR` for a custom per-user destination.
 
 Go users can also install directly from the public module:
 
