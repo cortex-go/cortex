@@ -116,3 +116,11 @@ main{display:block;min-height:0;overflow:hidden;background:#151716;padding:22px}
 }
 .event.assistant strong{font-weight:700}
 .event.assistant em{font-style:normal}
+
+/* Inline Markdown code is highlighting, not a chip: retain colour only. */
+.event.assistant :not(pre) > code{
+  padding:0;
+  border:0;
+  border-radius:0;
+  background:transparent;
+}
