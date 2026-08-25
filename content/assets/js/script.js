@@ -100,7 +100,7 @@ function renderMarkdown(row,text){
     const qm=line.match(/^>\s?(.*)$/);
     if(qm){flushList();if(!quote){quote=document.createElement('blockquote');row.append(quote)}const p=document.createElement('div');appendMarkdownInline(p,qm[1]);quote.append(p);continue}
     flushList();flushQuote();
-    if(!line.trim()){row.append(document.createElement('div')).className='md-gap';continue}
+    if(!line.trim()){const gap=document.createElement('div');gap.className='md-gap';row.append(gap);continue}
     const p=document.createElement('div');p.className='md-line';appendMarkdownInline(p,line);row.append(p)
   }
 }
