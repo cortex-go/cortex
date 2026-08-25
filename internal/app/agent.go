@@ -116,11 +116,9 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	if clientSession == "" {
 		clientSession = "default"
 	}
-	for _, r := range clientSession {
-		if !(r == '-' || r == '_' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
-			http.Error(w, "invalid client session", 400)
-			return
-		}
+	if !validRecordID(clientSession) {
+		http.Error(w, "invalid client session", 400)
+		return
 	}
 	runDir, err := os.MkdirTemp("", "cortex-opencode-config-")
 	if err != nil {
@@ -194,6 +192,13 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		writeEvent(w, flusher, "error", map[string]any{"message": err.Error()})
 		return
 	}
+	runID := randomToken(18)
+	if err := a.startAgentRun(runID, clientSession, q.Prompt, workspace, providerID, modelID); err != nil {
+		cancel()
+		_ = cmd.Wait()
+		writeEvent(w, flusher, "error", map[string]any{"message": "persist agent run: " + err.Error()})
+		return
+	}
 	errCh := make(chan string, 1)
 	go func() { b, _ := readLimit(stderr, 256<<10); errCh <- string(b) }()
 	var input, output uint64
@@ -244,9 +249,11 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		if msg == "" {
 			msg = waitErr.Error()
 		}
+		a.finishAgentRun(runID, clientSession, "failed", sessionID, msg, input, output, cost)
 		writeEvent(w, flusher, "error", map[string]any{"message": msg})
 		return
 	}
+	a.finishAgentRun(runID, clientSession, "completed", sessionID, "", input, output, cost)
 	writeEvent(w, flusher, "done", map[string]any{"inputTokens": input, "outputTokens": output, "estimatedCostUsd": cost, "sessionID": sessionID})
 }
 func cortexOpenCodeConfig(provider Provider, modelID string) ([]byte, error) {

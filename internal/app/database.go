@@ -28,6 +28,45 @@ var databaseMigrations = []migration{
 			updated_at TEXT NOT NULL
 		);`,
 	},
+	{
+		version: 2,
+		name:    "durable conversations",
+		sql: `CREATE TABLE conversations (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL DEFAULT '',
+			workspace TEXT NOT NULL DEFAULT '',
+			provider TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			opencode_session_id TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL DEFAULT 'idle',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			archived_at INTEGER
+		);
+		CREATE INDEX conversations_updated_idx ON conversations(archived_at, updated_at DESC);
+		CREATE TABLE conversation_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+			sequence INTEGER NOT NULL,
+			kind TEXT NOT NULL,
+			text TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			UNIQUE(conversation_id, sequence)
+		);
+		CREATE TABLE agent_runs (
+			id TEXT PRIMARY KEY,
+			conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+			state TEXT NOT NULL,
+			prompt TEXT NOT NULL,
+			started_at INTEGER NOT NULL,
+			finished_at INTEGER,
+			error TEXT NOT NULL DEFAULT '',
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			estimated_cost_usd REAL NOT NULL DEFAULT 0
+		);
+		CREATE INDEX agent_runs_conversation_idx ON agent_runs(conversation_id, started_at DESC);`,
+	},
 }
 
 func openDatabase(dataDir string) (*sql.DB, error) {

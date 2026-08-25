@@ -1,23 +1,30 @@
 const $=s=>document.querySelector(s);
-let root='',providers=[],browserPath='',activeId='',sessions={},closedSessions=[],settings={};
+let root='',providers=[],browserPath='',activeId='',sessions={},closedSessions=[],settings={},serverReady=false;
+const serverSaveTimers=new Map();
 const STORE='cortex.sessions.v1',COMPOSER_STORE='cortex.composer.height.v1';
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800)}
 async function api(url,opt={}){const r=await fetch(url,opt);if(!r.ok)throw Error((await r.text()).trim()||r.statusText);return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
 function sid(){return crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)}
 function sessionTitle(s){if(s.title)return s.title;if(s.workspace)return s.workspace.split('/').filter(Boolean).pop()||s.workspace;return 'New session'}
-function sessionSafe(s){return{id:s.id,workspace:s.workspace||'',title:s.title||'',openCodeSession:s.openCodeSession||'',events:s.events||[]}}
+function sessionSafe(s){return{id:s.id,workspace:s.workspace||'',title:s.title||'',provider:s.provider||'',model:s.model||'',openCodeSession:s.openCodeSession||'',state:s.busy?'running':'idle',createdAt:s.createdAt||Date.now(),updatedAt:Date.now(),archivedAt:s.archivedAt||s.closedAt||0,events:s.events||[]}}
+function scheduleServerSave(s){
+  if(!serverReady||!s?.id)return;
+  clearTimeout(serverSaveTimers.get(s.id));
+  serverSaveTimers.set(s.id,setTimeout(async()=>{serverSaveTimers.delete(s.id);try{await api('/api/conversation',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(sessionSafe(s))})}catch(e){toast('Conversation save failed · '+e.message)}},120))
+}
 function saveSessions(){
   const safe={};for(const [id,s] of Object.entries(sessions))safe[id]=sessionSafe(s);
-  localStorage.setItem(STORE,JSON.stringify({activeId,sessions:safe,closedSessions:closedSessions.slice(0,20)}))
+  localStorage.setItem(STORE,JSON.stringify({activeId,sessions:safe,closedSessions:closedSessions.slice(0,20)}));
+  for(const s of Object.values(sessions))scheduleServerSave(s);for(const s of closedSessions)scheduleServerSave(s)
 }
 function loadSessions(){
   try{const x=JSON.parse(localStorage.getItem(STORE)||'{}');sessions=x.sessions||{};closedSessions=Array.isArray(x.closedSessions)?x.closedSessions:[];activeId=x.activeId||''}catch{}
-  for(const s of Object.values(sessions)){s.busy=false;s.abort=null}
+  for(const s of Object.values(sessions)){s.busy=false;s.abort=null;s.createdAt=s.createdAt||Date.now()}
   if(!Object.keys(sessions).length)newSession('',false);
   if(!sessions[activeId])activeId=Object.keys(sessions)[0]
 }
 function newSession(workspace='',render=true){
-  const id=sid();sessions[id]={id,workspace,title:'',openCodeSession:'',events:[],busy:false,abort:null};activeId=id;saveSessions();
+  const id=sid();sessions[id]={id,workspace,title:'',openCodeSession:'',events:[],createdAt:Date.now(),busy:false,abort:null};activeId=id;saveSessions();
   if(render)renderAll();
   return sessions[id]
 }
@@ -27,7 +34,7 @@ function closeSession(id){
   const s=sessions[id];if(!s)return;
   if(s.busy&&!confirm('This agent is still working. Stop and close it?'))return;
   s.abort?.abort();
-  const archived={...sessionSafe(s),closedAt:Date.now()};
+  const archived={...sessionSafe(s),archivedAt:Date.now(),closedAt:Date.now()};
   closedSessions=[archived,...closedSessions.filter(x=>x.id!==id)].slice(0,20);
   const fallbackWorkspace=s.workspace||'';
   delete sessions[id];
@@ -38,7 +45,7 @@ function closeSession(id){
 function restoreSession(id){
   const i=closedSessions.findIndex(x=>x.id===id);if(i<0)return;
   const restored=closedSessions.splice(i,1)[0];
-  sessions[id]={...restored,busy:false,abort:null};delete sessions[id].closedAt;
+  sessions[id]={...restored,busy:false,abort:null,archivedAt:0};delete sessions[id].closedAt;
   activeId=id;saveSessions();hideSessionMenu();renderAll()
 }
 function active(){return sessions[activeId]}
@@ -137,7 +144,7 @@ async function agentStatus(){try{
 function clipped(v,n=2600){const s=String(v??'').trim();return s.length>n?s.slice(0,n)+'\n…':s}
 function toolText(raw){const p=raw.part||raw,st=p.state||{},tool=p.tool||raw.tool||raw.name||'tool',status=st.status||'';const input=st.input||p.input||{},lines=[`↳ ${tool}${status?' · '+status:''}`];if(tool==='bash'&&input.command)lines.push('$ '+input.command);else if(input.filePath||input.path)lines.push(input.filePath||input.path);if(st.error)lines.push('ERROR: '+clipped(typeof st.error==='string'?st.error:JSON.stringify(st.error)));else if(st.output)lines.push(clipped(st.output));return lines.join('\n')}
 function summarize(ev){const raw=ev?.data?.data||ev?.data||{},type=String(raw.type||'');if(ev.type==='error')return raw.message||'Agent failed';if(ev.type==='recovered')return raw.text||'';if(ev.type==='done'){const i=raw.inputTokens||0,o=raw.outputTokens||0;return i||o?`Done · ${i} input · ${o} output tokens`:'Done'};if(ev.type==='output')return raw.text||'';if(type.includes('tool'))return toolText(raw);return raw.part?.text||raw.text||''}
-async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace)return;const id=s.id;s.busy=true;s.abort=new AbortController();if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');addEvent(id,'user',prompt);renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line),text=summarize(ev),raw=ev?.data?.data||ev?.data||{},t=String(raw.type||'');if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;if(text)addEvent(id,ev.type==='error'?'error':ev.type==='done'?'done':t.includes('tool')?'tool':'assistant',text)}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].busy=false;sessions[id].abort=null;saveSessions()}if(activeId===id)renderAll();agentStatus()}}
+async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace)return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');addEvent(id,'user',prompt);renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line),text=summarize(ev),raw=ev?.data?.data||ev?.data||{},t=String(raw.type||'');if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;if(text)addEvent(id,ev.type==='error'?'error':ev.type==='done'?'done':t.includes('tool')?'tool':'assistant',text)}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].busy=false;sessions[id].abort=null;saveSessions()}if(activeId===id)renderAll();agentStatus()}}
 function joinPath(base,name){return (base.replace(/\/+$/,'')+'/'+name).replace(/\/+/g,'/')}
 function parentPath(p){if(p===root)return root;const x=p.replace(/\/+$/,'');const i=x.lastIndexOf('/');const out=i<=0?'/':x.slice(0,i);return out.length<root.length?root:out}
 async function browse(path){
@@ -180,7 +187,17 @@ function startComposerResize(e){
   };
   document.addEventListener('pointermove',move);document.addEventListener('pointerup',up)
 }
-async function boot(){const st=await api('/api/status');root=st.root;loadSessions();renderAll();restoreComposerHeight();await Promise.all([loadSettings(),agentStatus()]);if(!active()?.workspace)setTimeout(openWorkspacePicker,0)}
+async function syncServerConversations(){
+  const legacy=[...Object.values(sessions),...closedSessions].map(sessionSafe),stored=await api('/api/conversations');
+  if(!stored.length&&legacy.length){await api('/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conversations:legacy})});localStorage.setItem('cortex.sessions.migrated.sqlite.v1','1')}
+  const authoritative=stored.length?stored:await api('/api/conversations');
+  sessions={};closedSessions=[];
+  for(const s of authoritative){s.busy=false;s.abort=null;if(s.archivedAt){s.closedAt=s.archivedAt;closedSessions.push(s)}else sessions[s.id]=s}
+  if(!Object.keys(sessions).length)newSession('',false);
+  if(!sessions[activeId])activeId=Object.keys(sessions)[0];
+  serverReady=true;saveSessions();renderAll()
+}
+async function boot(){const st=await api('/api/status');root=st.root;loadSessions();renderAll();restoreComposerHeight();await Promise.all([loadSettings(),agentStatus(),syncServerConversations()]);if(!active()?.workspace)setTimeout(openWorkspacePicker,0)}
 $('#newSession').onclick=e=>{e.stopPropagation();toggleSessionMenu()};$('#newSameWorkspace').onclick=newSessionSameWorkspace;$('#newWorkspace').onclick=newWorkspaceSession;$('#workspaceBtn').onclick=openWorkspacePicker;$('#closeWorkspace').onclick=$('#cancelWorkspace').onclick=()=>$('#workspaceModal').hidden=true;$('#browserUp').onclick=()=>browse(parentPath(browserPath));$('#chooseWorkspace').onclick=chooseWorkspace;
 $('#composerResize').onpointerdown=startComposerResize;$('#composerResize').ondblclick=()=>{applyComposerHeight(150);localStorage.setItem(COMPOSER_STORE,'150')};document.addEventListener('click',e=>{if(!e.target.closest('.new-session-wrap'))hideSessionMenu()});window.addEventListener('resize',()=>applyComposerHeight($('#agentForm').getBoundingClientRect().height));
 $('#agentForm').onsubmit=e=>{e.preventDefault();const p=$('#prompt').value.trim();if(!p)return;$('#prompt').value='';runAgent(p)};$('#prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('#agentForm').requestSubmit()}};$('#stop').onclick=()=>active()?.abort?.abort();$('#copy').onclick=copySession;

@@ -113,6 +113,8 @@ func (a *App) routes() {
 	a.mux.HandleFunc("/api/file", a.fileAPI)
 	a.mux.HandleFunc("/api/agent/status", a.agentStatus)
 	a.mux.HandleFunc("/api/agent/run", a.agentRun)
+	a.mux.HandleFunc("/api/conversations", a.conversationsAPI)
+	a.mux.HandleFunc("/api/conversation", a.conversationAPI)
 	a.mux.Handle("/", http.FileServer(http.FS(cortex.PublicFS())))
 }
 func jsonOut(w http.ResponseWriter, v any) {
