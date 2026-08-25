@@ -191,8 +191,8 @@ func (a *App) authSetup(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &q) {
 		return
 	}
-	if len(q.Password) < 10 {
-		http.Error(w, "password must be at least 10 characters", 400)
+	if len(q.Password) < 7 {
+		http.Error(w, "password must be at least 7 characters", 400)
 		return
 	}
 	if q.Password != q.Confirm {
@@ -266,8 +266,8 @@ func (a *App) authPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "current password is incorrect", 401)
 		return
 	}
-	if len(q.Password) < 10 || q.Password != q.Confirm {
-		http.Error(w, "new password must match and be at least 10 characters", 400)
+	if len(q.Password) < 7 || q.Password != q.Confirm {
+		http.Error(w, "new password must match and be at least 7 characters", 400)
 		return
 	}
 	a.mu.Lock()
