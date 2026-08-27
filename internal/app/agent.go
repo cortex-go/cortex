@@ -13,6 +13,12 @@ import (
 	"strings"
 )
 
+const (
+	maxProviderLine   = 1 << 20
+	maxProviderBytes  = 32 << 20
+	maxProviderEvents = 4096
+)
+
 type agentRunRequest struct {
 	Workspace     string `json:"workspace"`
 	Prompt        string `json:"prompt"`
@@ -219,9 +225,19 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	sessionID := ""
 	sawText := false
 	scan := bufio.NewScanner(stdout)
-	scan.Buffer(make([]byte, 64<<10), 4<<20)
+	scan.Buffer(make([]byte, 64<<10), maxProviderLine)
+	streamBytes, streamEvents := 0, 0
+	truncated := false
 	for scan.Scan() {
 		line := append([]byte(nil), scan.Bytes()...)
+		streamBytes += len(line)
+		streamEvents++
+		if streamBytes > maxProviderBytes || streamEvents > maxProviderEvents {
+			truncated = true
+			cancel()
+			writeEvent(w, flusher, "truncated", map[string]any{"message": "Provider output limit reached; the run was stopped."})
+			break
+		}
 		var raw map[string]any
 		if json.Unmarshal(line, &raw) == nil {
 			collectUsage(raw, &input, &output, &cost)
@@ -240,6 +256,9 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	stderrText := <-errCh
 	if scan.Err() != nil && waitErr == nil {
 		waitErr = scan.Err()
+	}
+	if truncated {
+		waitErr = errors.New("provider output limit reached")
 	}
 	if waitErr == nil && sessionID != "" {
 		if recovered, ri, ro, rc, e := recoverSession(ctx, binary, sessionID, workspace, env); e == nil {

@@ -395,3 +395,63 @@ Findings repaired: no CSRF token; implicit loopback proxy trust; unpinned public
 Retained risks: clean-host deployment matrix is repeated in CX10
 Public claims changed: Caddy, nginx, Remote use, Security and Battle Tested updated
 ```
+
+### CX04 completion
+
+```text
+Checkpoint: CX04
+Threat and invariant: symlinks and restored paths cannot escape the canonical root
+Cortex commit: 8bd86f7
+Website source commit: 48fa46b
+Generated website commit: 9f16da0
+Focused evidence: lexical traversal, external/internal symlinks and restored workspace tests
+Full gates: Go test, race, vet, build and both Nift projects passed
+Findings repaired: lexical-only confinement; unbounded directory listing; special-file previews
+Retained risks: the root is an application boundary, not an OS sandbox
+Public claims changed: Agent and Battle Tested document exact path and preview limits
+```
+
+### CX05 completion
+
+```text
+Checkpoint: CX05
+Threat and invariant: corrupt configuration and diagnostics cannot discard or disclose secrets
+Cortex commit: 063f158
+Website source commit: b5b5192
+Generated website commit: 05d2251
+Focused evidence: owner-only mode, corruption refusal, identifier validation and multi-secret redaction
+Full gates: Go test, race, vet, build and both Nift projects passed
+Findings repaired: ignored load errors; partial redaction; unbounded key/model input
+Retained risks: host-account processes can inspect memory and environment
+Public claims changed: Providers and Battle Tested define storage and process exposure
+```
+
+### CX06 completion
+
+```text
+Checkpoint: CX06
+Threat and invariant: supervised agent children remain bounded, cancellable and owned
+Cortex commit: e678226
+Website source commit: f4f4687
+Generated website commit: 8434b4d
+Focused evidence: run registry cleanup, cancellation, concurrency cap and Windows build
+Full gates: Go test, race, vet, native/Windows build and both Nift projects passed
+Findings repaired: unlimited runs; request-only ownership; Unix direct-child-only cancellation
+Retained risks: Windows direct-child cancellation; deliberate auto-authorization
+Public claims changed: Agent and Battle Tested document four-run cap and supervision
+```
+
+### CX07 completion
+
+```text
+Checkpoint: CX07
+Threat and invariant: hostile provider output cannot create unbounded or trusted browser state
+Cortex commit: this checkpoint commit
+Website source commit: e43cff9
+Generated website commit: 645afae
+Focused evidence: pinned byte/event/line bounds, diagnostic bounds and safe renderer smoke
+Full gates: Go test, race, vet, build, JavaScript and both Nift projects passed
+Findings repaired: 4 MiB line and unbounded aggregate stream; trusted-looking provider tool state
+Retained risks: limits do not make model output truthful or defeat prompt injection
+Public claims changed: Agent and Battle Tested document exact hostile-stream boundary
+```
