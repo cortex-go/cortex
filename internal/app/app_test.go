@@ -126,19 +126,21 @@ func TestTOTPVerification(t *testing.T) {
 }
 
 func TestRequestSchemeTrustsLoopbackProxy(t *testing.T) {
+	a := &App{trustProxy: true}
 	r, _ := http.NewRequest("GET", "http://cortex.example.com/", nil)
 	r.RemoteAddr = "127.0.0.1:54321"
 	r.Header.Set("X-Forwarded-Proto", "https")
-	if got := requestScheme(r); got != "https" {
+	if got := a.requestScheme(r); got != "https" {
 		t.Fatalf("requestScheme = %q, want https", got)
 	}
 }
 
 func TestRequestSchemeRejectsForwardedProtoFromRemoteClient(t *testing.T) {
+	a := &App{trustProxy: true}
 	r, _ := http.NewRequest("GET", "http://cortex.example.com/", nil)
 	r.RemoteAddr = "203.0.113.10:54321"
 	r.Header.Set("X-Forwarded-Proto", "https")
-	if got := requestScheme(r); got != "http" {
+	if got := a.requestScheme(r); got != "http" {
 		t.Fatalf("requestScheme = %q, want http", got)
 	}
 }

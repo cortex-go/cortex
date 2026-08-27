@@ -21,8 +21,9 @@ func TestConcurrentFirstRunSetupHasOneWinner(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			rec := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPost, "/api/auth/setup", strings.NewReader(`{"password":"mudblood","confirm":"mudblood"}`))
+			req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/auth/setup", strings.NewReader(`{"password":"mudblood","confirm":"mudblood"}`))
 			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Origin", "http://127.0.0.1")
 			a.httpServer().Handler.ServeHTTP(rec, req)
 			statuses <- rec.Code
 		}()
@@ -67,8 +68,10 @@ func TestPasswordChangeRevokesOtherSessionsAndRotatesCurrent(t *testing.T) {
 	oldCookie := first.Result().Cookies()[0]
 	a.newSessionCookie(httptest.NewRecorder(), request)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/auth/password", strings.NewReader(`{"Current":"old-password","Password":"new-password","Confirm":"new-password"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/auth/password", strings.NewReader(`{"Current":"old-password","Password":"new-password","Confirm":"new-password"}`))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://127.0.0.1")
+	req.Header.Set("X-Cortex-CSRF", a.sessions[oldCookie.Value].CSRF)
 	req.AddCookie(oldCookie)
 	rec := httptest.NewRecorder()
 	a.httpServer().Handler.ServeHTTP(rec, req)

@@ -22,20 +22,67 @@ import (
 	"time"
 )
 
-func requestScheme(r *http.Request) string {
+func (a *App) trustedProxy(r *http.Request) bool {
+	if !a.trustProxy {
+		return false
+	}
+	ip := net.ParseIP(directClientIP(r))
+	return ip != nil && ip.IsLoopback()
+}
+
+func (a *App) requestScheme(r *http.Request) string {
 	if r.TLS != nil {
 		return "https"
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		ip := net.ParseIP(host)
-		if ip != nil && ip.IsLoopback() {
-			if proto := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0])); proto == "https" || proto == "http" {
+	if a.trustedProxy(r) {
+		raw := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+		if !strings.Contains(raw, ",") {
+			if proto := strings.ToLower(raw); proto == "https" || proto == "http" {
 				return proto
 			}
 		}
 	}
 	return "http"
+}
+
+func (a *App) clientIP(r *http.Request) string {
+	if a.trustedProxy(r) {
+		raw := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
+		if !strings.Contains(raw, ",") {
+			if ip := net.ParseIP(raw); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	return directClientIP(r)
+}
+
+func (a *App) validHost(hostport string) bool {
+	if a.publicOrigin != nil {
+		return strings.EqualFold(hostport, a.publicOrigin.Host)
+	}
+	host := hostport
+	if parsed, _, err := net.SplitHostPort(hostport); err == nil {
+		host = parsed
+	}
+	host = strings.Trim(host, "[]")
+	return strings.EqualFold(host, "localhost") || func() bool { ip := net.ParseIP(host); return ip != nil && ip.IsLoopback() }()
+}
+
+func (a *App) sameOrigin(r *http.Request) bool {
+	values := r.Header.Values("Origin")
+	if len(values) != 1 {
+		return false
+	}
+	u, err := url.Parse(values[0])
+	if err != nil || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	expectedScheme, expectedHost := a.requestScheme(r), r.Host
+	if a.publicOrigin != nil {
+		expectedScheme, expectedHost = a.publicOrigin.Scheme, a.publicOrigin.Host
+	}
+	return strings.EqualFold(u.Scheme, expectedScheme) && strings.EqualFold(u.Host, expectedHost)
 }
 
 type AuthSettings struct {
@@ -50,6 +97,7 @@ type AuthSettings struct {
 type sessionInfo struct {
 	Created time.Time
 	Expires time.Time
+	CSRF    string
 }
 type pendingTOTP struct {
 	Secret  string
@@ -220,9 +268,9 @@ func (a *App) newSessionCookie(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(a.sessions, oldestID)
 	}
-	a.sessions[token] = sessionInfo{Created: now, Expires: now.Add(7 * 24 * time.Hour)}
+	a.sessions[token] = sessionInfo{Created: now, Expires: now.Add(7 * 24 * time.Hour), CSRF: randomToken(24)}
 	a.authMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "cortex_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: requestScheme(r) == "https", MaxAge: 7 * 24 * 3600})
+	http.SetCookie(w, &http.Cookie{Name: "cortex_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: a.requestScheme(r) == "https", MaxAge: 7 * 24 * 3600})
 }
 func (a *App) clearSession(w http.ResponseWriter, r *http.Request) {
 	if c, e := r.Cookie("cortex_session"); e == nil {
@@ -230,7 +278,7 @@ func (a *App) clearSession(w http.ResponseWriter, r *http.Request) {
 		delete(a.sessions, c.Value)
 		a.authMu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "cortex_session", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: requestScheme(r) == "https"})
+	http.SetCookie(w, &http.Cookie{Name: "cortex_session", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: a.requestScheme(r) == "https"})
 }
 
 func directClientIP(r *http.Request) string {
@@ -241,7 +289,7 @@ func directClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 func (a *App) loginAllowed(r *http.Request) bool {
-	now, key := time.Now(), directClientIP(r)
+	now, key := time.Now(), a.clientIP(r)
 	a.authMu.Lock()
 	defer a.authMu.Unlock()
 	items := a.loginFailures[key][:0]
@@ -270,18 +318,27 @@ func (a *App) recordLoginFailure(r *http.Request) {
 		}
 		delete(a.loginFailures, oldestKey)
 	}
-	key := directClientIP(r)
+	key := a.clientIP(r)
 	a.loginFailures[key] = append(a.loginFailures[key], time.Now())
 }
 func (a *App) clearLoginFailures(r *http.Request) {
 	a.authMu.Lock()
-	delete(a.loginFailures, directClientIP(r))
+	delete(a.loginFailures, a.clientIP(r))
 	a.authMu.Unlock()
 }
 
 func (a *App) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/") || a.publicAPI(r.URL.Path) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		public := a.publicAPI(r.URL.Path)
+		if public {
+			if unsafeMethod(r.Method) && !a.sameOrigin(r) {
+				http.Error(w, "origin", http.StatusForbidden)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -293,8 +350,26 @@ func (a *App) authMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
+		if unsafeMethod(r.Method) {
+			if !a.sameOrigin(r) {
+				http.Error(w, "origin", http.StatusForbidden)
+				return
+			}
+			values := r.Header.Values("X-Cortex-CSRF")
+			token := sessionToken(r)
+			a.authMu.Lock()
+			session, ok := a.sessions[token]
+			a.authMu.Unlock()
+			if len(values) != 1 || !ok || subtle.ConstantTimeCompare([]byte(values[0]), []byte(session.CSRF)) != 1 {
+				http.Error(w, "csrf", http.StatusForbidden)
+				return
+			}
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+func unsafeMethod(method string) bool {
+	return method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
 }
 func (a *App) authState(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
@@ -305,6 +380,10 @@ func (a *App) authState(w http.ResponseWriter, r *http.Request) {
 	if authed {
 		out["googleEmail"] = x.GoogleEmail
 		out["googleClientID"] = x.GoogleClientID
+		token := sessionToken(r)
+		a.authMu.Lock()
+		out["csrf"] = a.sessions[token].CSRF
+		a.authMu.Unlock()
 	}
 	jsonOut(w, out)
 }
@@ -553,7 +632,7 @@ func (a *App) googleStart(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	scheme := requestScheme(r)
+	scheme := a.requestScheme(r)
 	redirect := scheme + "://" + r.Host + "/api/auth/google/callback"
 	a.oauthStates[state] = oauthState{Expires: now.Add(10 * time.Minute), Verifier: verifier, Redirect: redirect}
 	a.authMu.Unlock()

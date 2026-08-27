@@ -8,6 +8,7 @@ import (
 	cortex "github.com/cortex-go/cortex"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,9 +17,15 @@ import (
 	"time"
 )
 
-type Options struct{ Listen, Root, DataDir string }
+type Options struct {
+	Listen, Root, DataDir string
+	TrustProxy            bool
+	PublicOrigin          string
+}
 type App struct {
 	listen, root, dataDir string
+	trustProxy            bool
+	publicOrigin          *url.URL
 	db                    *sql.DB
 	mux                   *http.ServeMux
 	mu                    sync.RWMutex
@@ -73,7 +80,15 @@ func New(o Options) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, loginFailures: map[string][]time.Time{}, oauthStates: map[string]oauthState{}, pendingTOTP: map[string]pendingTOTP{}, usedTOTP: map[string]time.Time{}}
+	var publicOrigin *url.URL
+	if strings.TrimSpace(o.PublicOrigin) != "" {
+		publicOrigin, err = url.Parse(strings.TrimRight(strings.TrimSpace(o.PublicOrigin), "/"))
+		if err != nil || (publicOrigin.Scheme != "http" && publicOrigin.Scheme != "https") || publicOrigin.Host == "" || publicOrigin.User != nil || publicOrigin.Path != "" || publicOrigin.RawQuery != "" || publicOrigin.Fragment != "" {
+			db.Close()
+			return nil, errors.New("public origin must be an http(s) origin without a path")
+		}
+	}
+	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, trustProxy: o.TrustProxy, publicOrigin: publicOrigin, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, loginFailures: map[string][]time.Time{}, oauthStates: map[string]oauthState{}, pendingTOTP: map[string]pendingTOTP{}, usedTOTP: map[string]time.Time{}}
 	_ = a.loadSettings()
 	if a.settings.Keys == nil {
 		a.settings.Keys = map[string]string{}
@@ -92,7 +107,7 @@ func (a *App) ListenAndServe() error {
 func (a *App) httpServer() *http.Server {
 	return &http.Server{
 		Addr:              a.listen,
-		Handler:           a.security(a.recoverPanics(a.httpBoundary(a.authMiddleware(a.mux)))),
+		Handler:           a.security(a.recoverPanics(a.httpBoundary(a.hostBoundary(a.authMiddleware(a.mux))))),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      0,
@@ -128,6 +143,16 @@ func (a *App) httpBoundary(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(r.URL.RequestURI()) > 8192 {
 			http.Error(w, "request URI too long", http.StatusRequestURITooLong)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) hostBoundary(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !a.validHost(r.Host) {
+			http.Error(w, "invalid host", http.StatusBadRequest)
 			return
 		}
 		next.ServeHTTP(w, r)

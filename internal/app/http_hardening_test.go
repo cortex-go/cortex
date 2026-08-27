@@ -37,14 +37,16 @@ func TestHTTPServerHasBoundedNonStreamingTimeouts(t *testing.T) {
 func TestRoutePolicyRejectsMethodAndContentType(t *testing.T) {
 	a := hardeningTestApp(t)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodDelete, "/api/auth/login", nil)
+	req := httptest.NewRequest(http.MethodDelete, "http://127.0.0.1/api/auth/login", nil)
+	req.Header.Set("Origin", "http://127.0.0.1")
 	a.httpServer().Handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != http.MethodPost {
 		t.Fatalf("method response=%d allow=%q", rec.Code, rec.Header().Get("Allow"))
 	}
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"Password":"x"}`))
+	req = httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/auth/login", strings.NewReader(`{"Password":"x"}`))
 	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Origin", "http://127.0.0.1")
 	a.httpServer().Handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("content-type response=%d", rec.Code)

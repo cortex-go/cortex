@@ -380,3 +380,18 @@ Findings repaired: setup race, unbounded sessions/state, replay and public ident
 Retained risks: trusted proxy client identity and CSRF are CX03
 Public claims changed: exact session, TOTP and OAuth lifecycle documented
 ```
+
+### CX03 completion
+
+```text
+Checkpoint: CX03
+Threat and invariant: cross-site and forged proxy input cannot gain authority
+Cortex commit: this checkpoint commit
+Website source commit: d753bc3
+Generated website commit: 2ba0fd7
+Focused evidence: CSRF, Origin, Host, forwarded scheme/client and browser integration
+Full gates: Go test, race, vet, build and both Nift projects passed
+Findings repaired: no CSRF token; implicit loopback proxy trust; unpinned public Host
+Retained risks: clean-host deployment matrix is repeated in CX10
+Public claims changed: Caddy, nginx, Remote use, Security and Battle Tested updated
+```

@@ -53,6 +53,19 @@ Cortex listens on `127.0.0.1:7331` and uses your home directory as the default w
 
 > Remote binding is intentionally not the default. Cortex now requires browser authentication after first-run password setup, with optional TOTP and Google sign-in. For an Internet-facing deployment, TLS and normal host/reverse-proxy hardening are still recommended.
 
+When Cortex is behind Caddy or nginx on the same host, enable proxy trust
+explicitly and pin the external origin:
+
+```sh
+cortex --listen 127.0.0.1:7331 \
+  --trust-proxy \
+  --public-origin https://cortex.example.com
+```
+
+`--trust-proxy` accepts forwarding headers only from Cortex's direct loopback
+peer. `--public-origin` pins Host and same-origin checks. Do not enable proxy
+trust when clients can connect directly to the Cortex HTTP port.
+
 Open **Settings**, choose a provider and model, then save the provider credential. API-key providers are injected only into the isolated OpenCode process.
 
 For ChatGPT Plus/Pro or GitHub Copilot subscriptions, authenticate OpenCode once on the Cortex host:

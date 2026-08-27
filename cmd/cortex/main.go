@@ -14,6 +14,8 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:7331", "HTTP listen address")
 	root := flag.String("root", "", "workspace root (default: home directory)")
 	data := flag.String("data", "", "Cortex data directory")
+	trustProxy := flag.Bool("trust-proxy", false, "trust forwarding headers from a direct loopback reverse proxy")
+	publicOrigin := flag.String("public-origin", "", "canonical external origin, for example https://cortex.example.com")
 	flag.Parse()
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -33,7 +35,7 @@ func main() {
 			*data = filepath.Join(cwd, ".cortex")
 		}
 	}
-	srv, err := app.New(app.Options{Listen: *listen, Root: *root, DataDir: *data})
+	srv, err := app.New(app.Options{Listen: *listen, Root: *root, DataDir: *data, TrustProxy: *trustProxy, PublicOrigin: *publicOrigin})
 	if err != nil {
 		log.Fatal(err)
 	}
