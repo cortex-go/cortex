@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,9 @@ type App struct {
 	oauthStates           map[string]oauthState
 	pendingTOTP           map[string]pendingTOTP
 	usedTOTP              map[string]time.Time
+	runMu                 sync.Mutex
+	activeRuns            map[string]context.CancelFunc
+	runSlots              chan struct{}
 	settings              Settings
 }
 type Provider struct {
@@ -88,7 +92,7 @@ func New(o Options) (*App, error) {
 			return nil, errors.New("public origin must be an http(s) origin without a path")
 		}
 	}
-	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, trustProxy: o.TrustProxy, publicOrigin: publicOrigin, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, loginFailures: map[string][]time.Time{}, oauthStates: map[string]oauthState{}, pendingTOTP: map[string]pendingTOTP{}, usedTOTP: map[string]time.Time{}}
+	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, trustProxy: o.TrustProxy, publicOrigin: publicOrigin, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, loginFailures: map[string][]time.Time{}, oauthStates: map[string]oauthState{}, pendingTOTP: map[string]pendingTOTP{}, usedTOTP: map[string]time.Time{}, activeRuns: map[string]context.CancelFunc{}, runSlots: make(chan struct{}, 4)}
 	if err := a.loadSettings(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("load settings: %w", err)

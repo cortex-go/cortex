@@ -48,6 +48,7 @@ func (a *App) apiRoutes() []registeredRoute {
 		session("/api/file", get, a.fileAPI),
 		session("/api/agent/status", get, a.agentStatus),
 		session("/api/agent/run", post, a.agentRun),
+		session("/api/agent/cancel", post, a.agentCancel),
 		session("/api/conversations", []string{http.MethodGet, http.MethodPost}, a.conversationsAPI),
 		session("/api/conversation", []string{http.MethodPut, http.MethodDelete}, a.conversationAPI),
 	}

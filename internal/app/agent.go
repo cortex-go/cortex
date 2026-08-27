@@ -71,6 +71,13 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "prompt required", 400)
 		return
 	}
+	select {
+	case a.runSlots <- struct{}{}:
+		defer func() { <-a.runSlots }()
+	default:
+		http.Error(w, "agent concurrency limit reached", http.StatusTooManyRequests)
+		return
+	}
 	workspace, err := a.resolve(q.Workspace)
 	if err != nil {
 		http.Error(w, "invalid workspace: "+err.Error(), 400)
@@ -154,12 +161,18 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	runID := randomToken(18)
+	a.runMu.Lock()
+	a.activeRuns[runID] = cancel
+	a.runMu.Unlock()
+	defer func() { a.runMu.Lock(); delete(a.activeRuns, runID); a.runMu.Unlock() }()
 	args := []string{"--print-logs", "--log-level", "INFO", "run", "--format", "json", "--auto", "--dir", workspace, "--model", modelRef}
 	if strings.TrimSpace(q.Session) != "" {
 		args = append(args, "--session", strings.TrimSpace(q.Session))
 	}
 	args = append(args, q.Prompt)
 	cmd := exec.CommandContext(ctx, binary, args...)
+	configureProcessGroup(cmd)
 	cmd.Dir = workspace
 	env := append([]string{}, os.Environ()...)
 	if provider.AuthMode == "key" {
@@ -192,7 +205,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		writeEvent(w, flusher, "error", map[string]any{"message": err.Error()})
 		return
 	}
-	runID := randomToken(18)
+	writeEvent(w, flusher, "run", map[string]any{"runID": runID})
 	if err := a.startAgentRun(runID, clientSession, q.Prompt, workspace, providerID, modelID); err != nil {
 		cancel()
 		_ = cmd.Wait()
@@ -255,6 +268,28 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	}
 	a.finishAgentRun(runID, clientSession, "completed", sessionID, "", input, output, cost)
 	writeEvent(w, flusher, "done", map[string]any{"inputTokens": input, "outputTokens": output, "estimatedCostUsd": cost, "sessionID": sessionID})
+}
+
+func (a *App) agentCancel(w http.ResponseWriter, r *http.Request) {
+	var q struct {
+		RunID string `json:"runID"`
+	}
+	if !decode(w, r, &q) {
+		return
+	}
+	if !validRecordID(q.RunID) {
+		http.Error(w, "invalid run id", 400)
+		return
+	}
+	a.runMu.Lock()
+	cancel := a.activeRuns[q.RunID]
+	a.runMu.Unlock()
+	if cancel == nil {
+		http.Error(w, "run not found", http.StatusNotFound)
+		return
+	}
+	cancel()
+	jsonOut(w, map[string]bool{"cancelled": true})
 }
 func cortexOpenCodeConfig(provider Provider, modelID string) ([]byte, error) {
 	modelRef := provider.OpenCodeID + "/" + modelID
