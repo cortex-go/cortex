@@ -96,25 +96,9 @@ func (a *App) security(next http.Handler) http.Handler {
 	})
 }
 func (a *App) routes() {
-	a.mux.HandleFunc("/api/auth/state", a.authState)
-	a.mux.HandleFunc("/api/auth/setup", a.authSetup)
-	a.mux.HandleFunc("/api/auth/login", a.authLogin)
-	a.mux.HandleFunc("/api/auth/logout", a.authLogout)
-	a.mux.HandleFunc("/api/auth/password", a.authPassword)
-	a.mux.HandleFunc("/api/auth/totp/begin", a.authTOTPBegin)
-	a.mux.HandleFunc("/api/auth/totp/enable", a.authTOTPEnable)
-	a.mux.HandleFunc("/api/auth/totp/disable", a.authTOTPDisable)
-	a.mux.HandleFunc("/api/auth/google", a.authGoogleConfig)
-	a.mux.HandleFunc("/api/auth/google/start", a.googleStart)
-	a.mux.HandleFunc("/api/auth/google/callback", a.googleCallback)
-	a.mux.HandleFunc("/api/status", a.status)
-	a.mux.HandleFunc("/api/settings", a.settingsAPI)
-	a.mux.HandleFunc("/api/files", a.filesAPI)
-	a.mux.HandleFunc("/api/file", a.fileAPI)
-	a.mux.HandleFunc("/api/agent/status", a.agentStatus)
-	a.mux.HandleFunc("/api/agent/run", a.agentRun)
-	a.mux.HandleFunc("/api/conversations", a.conversationsAPI)
-	a.mux.HandleFunc("/api/conversation", a.conversationAPI)
+	for _, route := range a.apiRoutes() {
+		a.mux.HandleFunc(route.Policy.Path, route.Handler)
+	}
 	a.mux.Handle("/", http.FileServer(http.FS(cortex.PublicFS())))
 }
 func jsonOut(w http.ResponseWriter, v any) {

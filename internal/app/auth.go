@@ -171,7 +171,7 @@ func (a *App) clearSession(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/api/auth/") {
+		if !strings.HasPrefix(r.URL.Path, "/api/") || a.publicAPI(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}

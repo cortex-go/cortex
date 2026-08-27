@@ -335,3 +335,18 @@ Findings repaired:
 Retained risks:
 Public claims changed:
 ```
+
+### CX00 completion
+
+```text
+Checkpoint: CX00
+Threat and invariant: all authoritative HTTP surfaces must be classified
+Cortex commit: this checkpoint commit
+Website source commit: e22f4df
+Generated website commit: f45feb0
+Focused evidence: 19 unique classified routes; five deliberate public routes
+Full gates: Go test, race and vet passed; website 14/14 current
+Findings repaired: ad hoc registration; logout no longer bypasses session middleware
+Retained risks: CX01-CX11
+Public claims changed: Battle Tested and Security now distinguish inventory from proof
+```
