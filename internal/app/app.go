@@ -361,7 +361,17 @@ func (a *App) resolve(p string) (string, error) {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", errors.New("path escapes workspace root")
 	}
-	return abs, nil
+	// The lexical check above is not sufficient: an in-root symlink may target
+	// arbitrary host data. Resolve the existing target again at the point of use.
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", errors.New("path is unavailable")
+	}
+	rel, err = filepath.Rel(a.root, real)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", errors.New("path escapes workspace root")
+	}
+	return real, nil
 }
 
 type fileEntry struct {
@@ -386,9 +396,16 @@ func (a *App) filesAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	if len(ents) > 5000 {
+		http.Error(w, "directory has too many entries", http.StatusRequestEntityTooLarge)
+		return
+	}
 	out := []fileEntry{}
 	for _, e := range ents {
-		info, _ := e.Info()
+		info, infoErr := e.Info()
+		if infoErr != nil {
+			continue
+		}
 		rel, _ := filepath.Rel(a.root, filepath.Join(p, e.Name()))
 		out = append(out, fileEntry{e.Name(), filepath.ToSlash(rel), e.IsDir(), info.Size()})
 	}
@@ -416,9 +433,17 @@ func (a *App) fileAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	st, _ := f.Stat()
+	st, err := f.Stat()
+	if err != nil {
+		http.Error(w, "file is unavailable", 400)
+		return
+	}
 	if st.IsDir() {
 		http.Error(w, "directory", 400)
+		return
+	}
+	if !st.Mode().IsRegular() {
+		http.Error(w, "only regular files can be previewed", 400)
 		return
 	}
 	if st.Size() > 2<<20 {
