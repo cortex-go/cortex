@@ -29,6 +29,7 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
+          case "$TAG" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "release tag must be vMAJOR.MINOR.PATCH" >&2; exit 1;; esac
           mkdir -p dist
           build() {
             os="$1"
@@ -52,6 +53,8 @@ jobs:
           build windows amd64 .exe
           build windows arm64 .exe
           (cd dist && sha256sum * > checksums.txt)
+          for archive in dist/*.tar.gz; do tar -tzf "$archive" | sort | diff -u - <(printf '%s\n' LICENSE README.md cortex | sort); done
+          for archive in dist/*.zip; do unzip -Z1 "$archive" | sort | diff -u - <(printf '%s\n' LICENSE README.md cortex.exe | sort); done
           ls -lh dist
 
       - name: Upload assets to GitHub release
