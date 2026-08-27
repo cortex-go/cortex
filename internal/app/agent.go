@@ -245,7 +245,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if waitErr != nil {
-		msg := sanitize(strings.TrimSpace(stderrText), key)
+		msg := a.redactSecrets(strings.TrimSpace(stderrText))
 		if msg == "" {
 			msg = waitErr.Error()
 		}

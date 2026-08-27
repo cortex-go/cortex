@@ -89,7 +89,10 @@ func New(o Options) (*App, error) {
 		}
 	}
 	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, trustProxy: o.TrustProxy, publicOrigin: publicOrigin, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, loginFailures: map[string][]time.Time{}, oauthStates: map[string]oauthState{}, pendingTOTP: map[string]pendingTOTP{}, usedTOTP: map[string]time.Time{}}
-	_ = a.loadSettings()
+	if err := a.loadSettings(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("load settings: %w", err)
+	}
 	if a.settings.Keys == nil {
 		a.settings.Keys = map[string]string{}
 	}
@@ -194,7 +197,13 @@ func (a *App) loadSettings() error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(b, &a.settings)
+	if len(b) > 1<<20 {
+		return errors.New("settings file is too large")
+	}
+	if err := json.Unmarshal(b, &a.settings); err != nil {
+		return errors.New("settings file is corrupt")
+	}
+	return nil
 }
 func (a *App) saveSettings() error {
 	a.mu.RLock()
@@ -205,6 +214,9 @@ func (a *App) saveSettings() error {
 	}
 	tmp := a.settingsPath() + ".tmp"
 	if err = os.WriteFile(tmp, b, 0600); err != nil {
+		return err
+	}
+	if err = os.Chmod(tmp, 0600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, a.settingsPath())
@@ -271,8 +283,12 @@ func (a *App) settingsAPI(w http.ResponseWriter, r *http.Request) {
 		if model == "" {
 			model = p.DefaultModel
 		}
-		if strings.Contains(model, "#") {
+		if len(model) > 256 || !validProviderValue(model) || strings.Contains(model, "#") {
 			http.Error(w, "model variants are not supported in Settings yet", 400)
+			return
+		}
+		if len(q.Key) > 16<<10 {
+			http.Error(w, "credential is too large", 400)
 			return
 		}
 		a.mu.Lock()
@@ -300,6 +316,32 @@ func (a *App) settingsAPI(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method", 405)
 	}
+}
+
+func validProviderValue(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r <= 0x20 || r == 0x7f || r == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) redactSecrets(s string) string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, secret := range a.settings.Keys {
+		if len(secret) >= 4 {
+			s = strings.ReplaceAll(s, secret, "[redacted]")
+		}
+	}
+	if x := a.settings.Auth.GoogleClientSecret; len(x) >= 4 {
+		s = strings.ReplaceAll(s, x, "[redacted]")
+	}
+	return sanitize(s, "")
 }
 func hostOpenCodeAuthPath() string {
 	if xdg := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); xdg != "" {
