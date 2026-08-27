@@ -23,9 +23,12 @@ type App struct {
 	mux                   *http.ServeMux
 	mu                    sync.RWMutex
 	authMu                sync.Mutex
+	setupMu               sync.Mutex
 	sessions              map[string]sessionInfo
-	oauthStates           map[string]time.Time
-	pendingTOTP           string
+	loginFailures         map[string][]time.Time
+	oauthStates           map[string]oauthState
+	pendingTOTP           map[string]pendingTOTP
+	usedTOTP              map[string]time.Time
 	settings              Settings
 }
 type Provider struct {
@@ -70,7 +73,7 @@ func New(o Options) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, oauthStates: map[string]time.Time{}}
+	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, loginFailures: map[string][]time.Time{}, oauthStates: map[string]oauthState{}, pendingTOTP: map[string]pendingTOTP{}, usedTOTP: map[string]time.Time{}}
 	_ = a.loadSettings()
 	if a.settings.Keys == nil {
 		a.settings.Keys = map[string]string{}

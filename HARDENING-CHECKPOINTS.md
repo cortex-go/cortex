@@ -365,3 +365,18 @@ Findings repaired: unbounded default server; permissive methods and trailing JSO
 Retained risks: stream/process bounds are CX06-CX09
 Public claims changed: exact HTTP limits and streaming exception documented
 ```
+
+### CX02 completion
+
+```text
+Checkpoint: CX02
+Threat and invariant: authentication replay, races and state growth must fail closed
+Cortex commit: this checkpoint commit
+Website source commit: c9479d1
+Generated website commit: 862e1a0
+Focused evidence: setup race, sessions, password rotation, throttle, TOTP and OAuth
+Full gates: Go test, race and vet passed; website 14/14 current
+Findings repaired: setup race, unbounded sessions/state, replay and public identity leak
+Retained risks: trusted proxy client identity and CSRF are CX03
+Public claims changed: exact session, TOTP and OAuth lifecycle documented
+```
