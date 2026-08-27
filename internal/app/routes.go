@@ -1,6 +1,7 @@
 package app
 
 import "net/http"
+import "strings"
 
 type routeBoundary string
 
@@ -59,4 +60,26 @@ func (a *App) publicAPI(path string) bool {
 		}
 	}
 	return false
+}
+
+func enforceRoutePolicy(policy routePolicy, next http.Handler) http.Handler {
+	allowed := map[string]bool{}
+	for _, method := range policy.Methods {
+		allowed[method] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !allowed[r.Method] {
+			w.Header().Set("Allow", strings.Join(policy.Methods, ", "))
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.Body != nil && r.ContentLength != 0 {
+			contentType := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
+			if contentType != "application/json" {
+				http.Error(w, "content type must be application/json", http.StatusUnsupportedMediaType)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }

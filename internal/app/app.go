@@ -84,29 +84,74 @@ func New(o Options) (*App, error) {
 func (a *App) Close() error { return a.db.Close() }
 func (a *App) Root() string { return a.root }
 func (a *App) ListenAndServe() error {
-	return http.ListenAndServe(a.listen, a.security(a.authMiddleware(a.mux)))
+	return a.httpServer().ListenAndServe()
+}
+func (a *App) httpServer() *http.Server {
+	return &http.Server{
+		Addr:              a.listen,
+		Handler:           a.security(a.recoverPanics(a.httpBoundary(a.authMiddleware(a.mux)))),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      0,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 }
 func (a *App) security(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+func (a *App) recoverPanics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if recover() != nil {
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+func (a *App) httpBoundary(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.URL.RequestURI()) > 8192 {
+			http.Error(w, "request URI too long", http.StatusRequestURITooLong)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
 func (a *App) routes() {
 	for _, route := range a.apiRoutes() {
-		a.mux.HandleFunc(route.Policy.Path, route.Handler)
+		a.mux.Handle(route.Policy.Path, enforceRoutePolicy(route.Policy, route.Handler))
 	}
 	a.mux.Handle("/", http.FileServer(http.FS(cortex.PublicFS())))
 }
 func jsonOut(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(v); err != nil {
+	return decodeJSON(w, r, v, 1<<20)
+}
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any, limit int64) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		http.Error(w, "invalid json", 400)
+		return false
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
 		http.Error(w, "invalid json", 400)
 		return false
 	}

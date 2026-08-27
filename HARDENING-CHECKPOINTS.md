@@ -350,3 +350,18 @@ Findings repaired: ad hoc registration; logout no longer bypasses session middle
 Retained risks: CX01-CX11
 Public claims changed: Battle Tested and Security now distinguish inventory from proof
 ```
+
+### CX01 completion
+
+```text
+Checkpoint: CX01
+Threat and invariant: malformed or slow HTTP input must remain bounded
+Cortex commit: this checkpoint commit
+Website source commit: 1279ea4
+Generated website commit: 47bc7aa
+Focused evidence: timeout, method, content type, JSON, header and panic tests
+Full gates: Go test, race, vet and production build passed; website 14/14 current
+Findings repaired: unbounded default server; permissive methods and trailing JSON
+Retained risks: stream/process bounds are CX06-CX09
+Public claims changed: exact HTTP limits and streaming exception documented
+```

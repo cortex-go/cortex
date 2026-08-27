@@ -2,7 +2,6 @@ package app
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -102,11 +101,7 @@ func (a *App) conversationAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func decodeSized(w http.ResponseWriter, r *http.Request, v any, limit int64) bool {
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit)).Decode(v); err != nil {
-		http.Error(w, "invalid json", 400)
-		return false
-	}
-	return true
+	return decodeJSON(w, r, v, limit)
 }
 
 func (a *App) saveConversation(c *conversation) error {
