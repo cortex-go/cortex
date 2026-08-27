@@ -455,3 +455,56 @@ Findings repaired: 4 MiB line and unbounded aggregate stream; trusted-looking pr
 Retained risks: limits do not make model output truthful or defeat prompt injection
 Public claims changed: Agent and Battle Tested document exact hostile-stream boundary
 ```
+
+### CX08 completion
+
+```text
+Checkpoint: CX08
+Threat and invariant: durable state is transactional, bounded and restart-consistent
+Cortex commit: edc9ec2
+Website source commit: ee8f4df
+Generated website commit: 5281a91
+Focused evidence: atomic import rollback, interrupted-run recovery, schema and usage tests
+Full gates: Go test, race, vet, build and both Nift projects passed
+Retained risks: usage and cost remain provider estimates
+```
+
+### CX09 completion
+
+```text
+Checkpoint: CX09
+Threat and invariant: pressure fails explicitly and capacity recovers without leaks
+Cortex commit: 87b27c6
+Website source commit: 8db8b70
+Generated website commit: 187a275
+Focused evidence: 128-request saturation/recovery and concurrent settings race test
+Full gates: Go test, race, vet, frontend and Nift gates passed
+Retained risks: safety limits are not hardware-independent throughput promises
+```
+
+### CX10 completion
+
+```text
+Checkpoint: CX10
+Threat and invariant: unverified release bytes never replace an installed executable
+Cortex commit: ae63816
+Website source commit: 401adfa
+Generated website commit: e75f248
+Focused evidence: release script smoke, six targets, archive membership and history scan
+Full gates: shell, Go, frontend and Nift gates passed
+Retained risks: publication and clean-host proxy drills depend on release infrastructure
+```
+
+### CX11 completion
+
+```text
+Checkpoint: CX11
+Threat and invariant: the complete product contract remains reproducible and limitations public
+Cortex commit: this checkpoint commit
+Website source commit: 3f759d2
+Generated website commit: e3a4352
+Focused evidence: boundary fuzz seeds, integrated regression suite and security contract audit
+Full gates: Go test/race/vet, builds, frontend, release, Nift, Git and history gates passed
+Retained risks: OS sandbox, Windows process groups, host-account secrets and model truth
+Public claims changed: Battle Tested is a completed evidence ledger, not a plan
+```
