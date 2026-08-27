@@ -104,6 +104,11 @@ func New(o Options) (*App, error) {
 		a.settings.Models = map[string]string{}
 	}
 	a.routes()
+	// A process restart cannot preserve a child process. Resolve durable state
+	// before serving so clients never see a permanently running phantom.
+	now := time.Now().UnixMilli()
+	_, _ = a.db.Exec("UPDATE agent_runs SET state='interrupted',finished_at=?,error='Cortex restarted while the run was active' WHERE state='running'", now)
+	_, _ = a.db.Exec("UPDATE conversations SET state='interrupted',updated_at=? WHERE state='running'", now)
 	return a, nil
 }
 func (a *App) Close() error { return a.db.Close() }

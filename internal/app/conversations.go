@@ -60,11 +60,21 @@ func (a *App) conversationsAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "too many conversations", 400)
 			return
 		}
+		tx, err := a.db.Begin()
+		if err != nil {
+			http.Error(w, "begin import", 500)
+			return
+		}
+		defer tx.Rollback()
 		for i := range q.Conversations {
-			if err := a.saveConversation(&q.Conversations[i]); err != nil {
+			if err := a.saveConversationTx(tx, &q.Conversations[i]); err != nil {
 				http.Error(w, err.Error(), 400)
 				return
 			}
+		}
+		if err := tx.Commit(); err != nil {
+			http.Error(w, "commit import", 500)
+			return
 		}
 		jsonOut(w, map[string]any{"ok": true, "imported": len(q.Conversations)})
 	default:
@@ -105,6 +115,18 @@ func decodeSized(w http.ResponseWriter, r *http.Request, v any, limit int64) boo
 }
 
 func (a *App) saveConversation(c *conversation) error {
+	tx, err := a.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := a.saveConversationTx(tx, c); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (a *App) saveConversationTx(tx *sql.Tx, c *conversation) error {
 	if !validRecordID(c.ID) {
 		return errors.New("invalid conversation id")
 	}
@@ -126,16 +148,11 @@ func (a *App) saveConversation(c *conversation) error {
 	if c.State == "" {
 		c.State = "idle"
 	}
-	tx, err := a.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 	var archived any
 	if c.ArchivedAt > 0 {
 		archived = c.ArchivedAt
 	}
-	_, err = tx.Exec(`INSERT INTO conversations(id,title,workspace,provider,model,opencode_session_id,state,created_at,updated_at,archived_at)
+	_, err := tx.Exec(`INSERT INTO conversations(id,title,workspace,provider,model,opencode_session_id,state,created_at,updated_at,archived_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET title=excluded.title, workspace=excluded.workspace,
 		provider=excluded.provider, model=excluded.model, opencode_session_id=excluded.opencode_session_id,
@@ -159,7 +176,7 @@ func (a *App) saveConversation(c *conversation) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (a *App) loadConversations(query string) ([]conversation, error) {
@@ -171,7 +188,7 @@ func (a *App) loadConversations(query string) ([]conversation, error) {
 		args = append(args, like, like)
 	}
 	rows, err := a.db.Query(`SELECT id,title,workspace,provider,model,opencode_session_id,state,created_at,updated_at,archived_at
-		FROM conversations`+where+` ORDER BY updated_at DESC`, args...)
+		FROM conversations`+where+` ORDER BY updated_at DESC LIMIT 251`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -192,6 +209,9 @@ func (a *App) loadConversations(query string) ([]conversation, error) {
 		}
 		c.Events = events
 		items = append(items, c)
+		if len(items) > 250 {
+			return nil, errors.New("conversation result exceeds 250 items; narrow the search")
+		}
 	}
 	return items, rows.Err()
 }
