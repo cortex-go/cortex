@@ -40,6 +40,7 @@ type App struct {
 	runMu                 sync.Mutex
 	activeRuns            map[string]context.CancelFunc
 	runSlots              chan struct{}
+	requestSlots          chan struct{}
 	settings              Settings
 }
 type Provider struct {
@@ -92,7 +93,7 @@ func New(o Options) (*App, error) {
 			return nil, errors.New("public origin must be an http(s) origin without a path")
 		}
 	}
-	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, trustProxy: o.TrustProxy, publicOrigin: publicOrigin, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, loginFailures: map[string][]time.Time{}, oauthStates: map[string]oauthState{}, pendingTOTP: map[string]pendingTOTP{}, usedTOTP: map[string]time.Time{}, activeRuns: map[string]context.CancelFunc{}, runSlots: make(chan struct{}, 4)}
+	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, trustProxy: o.TrustProxy, publicOrigin: publicOrigin, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, loginFailures: map[string][]time.Time{}, oauthStates: map[string]oauthState{}, pendingTOTP: map[string]pendingTOTP{}, usedTOTP: map[string]time.Time{}, activeRuns: map[string]context.CancelFunc{}, runSlots: make(chan struct{}, 4), requestSlots: make(chan struct{}, 128)}
 	if err := a.loadSettings(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("load settings: %w", err)
@@ -119,13 +120,25 @@ func (a *App) ListenAndServe() error {
 func (a *App) httpServer() *http.Server {
 	return &http.Server{
 		Addr:              a.listen,
-		Handler:           a.security(a.recoverPanics(a.httpBoundary(a.hostBoundary(a.authMiddleware(a.mux))))),
+		Handler:           a.overload(a.security(a.recoverPanics(a.httpBoundary(a.hostBoundary(a.authMiddleware(a.mux)))))),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      0,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
+}
+func (a *App) overload(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case a.requestSlots <- struct{}{}:
+			defer func() { <-a.requestSlots }()
+			next.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "server is busy", http.StatusServiceUnavailable)
+		}
+	})
 }
 func (a *App) security(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

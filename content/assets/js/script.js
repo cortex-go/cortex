@@ -19,11 +19,13 @@ function saveSessions(){
 }
 function loadSessions(){
   try{const x=JSON.parse(localStorage.getItem(STORE)||'{}');sessions=x.sessions||{};closedSessions=Array.isArray(x.closedSessions)?x.closedSessions:[];activeId=x.activeId||''}catch{}
-  for(const s of Object.values(sessions)){s.busy=false;s.abort=null;s.createdAt=s.createdAt||Date.now()}
+  const retained=Object.values(sessions).sort((a,b)=>(b.updatedAt||b.createdAt||0)-(a.updatedAt||a.createdAt||0)).slice(0,32);sessions=Object.fromEntries(retained.map(s=>[s.id,s]));closedSessions=closedSessions.slice(0,20);
+  for(const s of Object.values(sessions)){s.busy=false;s.abort=null;s.createdAt=s.createdAt||Date.now();s.events=(s.events||[]).slice(-500)}
   if(!Object.keys(sessions).length)newSession('',false);
   if(!sessions[activeId])activeId=Object.keys(sessions)[0]
 }
 function newSession(workspace='',render=true){
+	if(Object.keys(sessions).length>=32){toast('Close a session before opening another.');return null}
   const id=sid();sessions[id]={id,workspace,title:'',openCodeSession:'',events:[],createdAt:Date.now(),busy:false,abort:null};activeId=id;saveSessions();
   if(render)renderAll();
   return sessions[id]
