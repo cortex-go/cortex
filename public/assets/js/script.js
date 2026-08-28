@@ -2,6 +2,8 @@ const $=s=>document.querySelector(s);
 let root='',providers=[],browserPath='',activeId='',sessions={},closedSessions=[],settings={},serverReady=false;
 const serverSaveTimers=new Map();
 const STORE='cortex.sessions.v1',COMPOSER_STORE='cortex.composer.height.v1';
+const MAX_IMAGES=6,MAX_IMAGE_BYTES=10*1024*1024;
+let attachments=[],modelCatalog=[];
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800)}
 async function api(url,opt={}){opt={...opt,headers:{...(opt.headers||{})}};const method=(opt.method||'GET').toUpperCase();if(!['GET','HEAD','OPTIONS'].includes(method)&&authState?.csrf)opt.headers['X-Cortex-CSRF']=authState.csrf;const r=await fetch(url,opt);if(!r.ok)throw Error((await r.text()).trim()||r.statusText);return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
 function sid(){return crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)}
@@ -113,15 +115,33 @@ function renderMarkdown(row,text){
     const p=document.createElement('div');p.className='md-line';appendMarkdownInline(p,line);row.append(p)
   }
 }
-function eventNode(ev){const row=document.createElement('div');row.className='event '+ev.kind;row.dataset.kind=ev.kind;if(ev.kind==='tool')renderTool(row,ev.text);else if(ev.kind==='assistant')renderMarkdown(row,ev.text);else row.textContent=ev.text;return row}
+function eventNode(ev){const row=document.createElement('div');row.className='event '+ev.kind;row.dataset.kind=ev.kind;if(ev.kind==='tool')renderTool(row,ev.text);else if(ev.kind==='assistant')renderMarkdown(row,ev.text);else if(ev.kind==='image'){const fig=document.createElement('figure');fig.className='image-attach';const img=document.createElement('img');img.src=ev.text;img.alt=ev.name||'attached image';img.title=ev.name||'';fig.append(img);if(ev.name){const cap=document.createElement('figcaption');cap.textContent=ev.name;fig.append(cap)}row.append(fig)}else row.textContent=ev.text;return row}
 function renderFeed(){const s=active(),box=$('#feed');box.innerHTML='';if(!s.events.length){box.innerHTML='<div class="empty"><span class="orb">C</span><strong>What do you want to build?</strong><span>Choose a workspace, then give Cortex a development task.</span></div>';return}for(const ev of s.events)box.append(eventNode(ev));box.scrollTop=box.scrollHeight}
 function renderSession(){const s=active();$('#workspaceLabel').textContent=s.workspace||'Choose workspace';$('#run').disabled=s.busy||!s.workspace;$('#prompt').disabled=s.busy;$('#stop').hidden=!s.busy;$('#activity').hidden=!s.busy;renderFeed()}
 function renderAll(){renderTabs();renderSession()}
-function addEvent(id,kind,text){const clean=String(text??'').trim();if(!clean)return;const s=sessions[id];if(!s)return;s.events.push({kind,text:clean});if(s.events.length>500)s.events=s.events.slice(-500);saveSessions();if(activeId===id){$('#feed .empty')?.remove();$('#feed').append(eventNode({kind,text:clean}));$('#feed').scrollTop=$('#feed').scrollHeight}}
+function addEvent(id,kind,text,name=''){const clean=String(text??'').trim();if(!clean)return;const s=sessions[id];if(!s)return;s.events.push({kind,text:clean,name});if(s.events.length>500)s.events=s.events.slice(-500);saveSessions();if(activeId===id){$('#feed .empty')?.remove();$('#feed').append(eventNode({kind,text:clean,name}));$('#feed').scrollTop=$('#feed').scrollHeight}}
 async function loadSettings(){settings=await api('/api/settings');providers=settings.providers||[];const sel=$('#provider');sel.innerHTML='';for(const p of providers){const o=document.createElement('option');o.value=p.id;o.textContent=p.label+(p.configured?' · configured':'');sel.append(o)}sel.value=settings.activeProvider||providers[0]?.id||'';updateProviderUI()}
+function currentModel(){
+  const sel=$('#model');
+  return sel.value==='__custom__'?$('#modelCustom').value.trim():sel.value||''
+}
+function renderModelSelect(p,useDefault){
+  const sel=$('#model');
+  const base=useDefault?(p.model||p.defaultModel||''):currentModel();
+  const opts=[...new Set([...(p.model?[p.model]:[]),...(p.defaultModel?[p.defaultModel]:[]),...modelCatalog])];
+  sel.innerHTML='';
+  for(const m of opts){const o=document.createElement('option');o.value=m;o.textContent=m;sel.append(o)}
+  const custom=document.createElement('option');custom.value='__custom__';custom.textContent='Custom model…';sel.append(custom);
+  const val=opts.includes(base)?base:'';
+  sel.value=val;
+  const isCustom=!val;
+  $('#modelCustom').hidden=!isCustom;
+  if(isCustom)$('#modelCustom').value=base
+}
 function updateProviderUI(){
   const p=providers.find(x=>x.id===$('#provider').value);if(!p)return;
-  $('#model').value=p.model||p.defaultModel||'';
+  modelCatalog=[];
+  renderModelSelect(p,true);
   $('#apiKey').value='';
   const auth=p.authMode==='opencode-auth';
   $('#keyLabel').hidden=auth;$('#deleteKey').hidden=auth;
@@ -131,9 +151,19 @@ function updateProviderUI(){
         ? `Connected through OpenCode on this host. Cortex copies that ${p.label} OAuth credential into the isolated session.`
         : `Not connected yet. Run: opencode auth login --provider ${p.openCodeID} on the Cortex host, then reopen Settings.`)
     : `Cortex passes this key only to the isolated OpenCode process. Model IDs use OpenCode's ${p.openCodeID}/… catalog.`;
+  loadModels(p.id)
+}
+async function loadModels(providerID,quiet=true){
+  try{
+    const x=await api('/api/agent/models?provider='+encodeURIComponent(providerID));
+    modelCatalog=x.models||[];
+    const p=providers.find(q=>q.id===$('#provider').value);
+    if(p&&p.id===providerID)renderModelSelect(p,false);
+    if(!quiet)toast(modelCatalog.length?modelCatalog.length+' models loaded':'No models available')
+  }catch(e){if(!quiet)toast('Could not load models · '+e.message)}
 }
 async function saveKey(remove=false){
-  const provider=$('#provider').value,p=providers.find(x=>x.id===provider),key=$('#apiKey').value.trim(),model=$('#model').value.trim();
+  const provider=$('#provider').value,p=providers.find(x=>x.id===provider),key=$('#apiKey').value.trim(),model=currentModel();
   if(!model)return toast('Enter a model ID');
   await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider,key,model,removeKey:remove})});
   await loadSettings();await agentStatus();toast(remove?'Key removed':'Provider saved')
@@ -144,9 +174,61 @@ async function agentStatus(){try{
   $('#agentState').textContent=!s.opencodeInstalled?'OpenCode not installed':!s.credentialAvailable?(s.authMode==='opencode-auth'?'OpenCode login required':'API key required'):'Ready'
 }catch(e){$('#agentState').textContent=e.message}}
 function clipped(v,n=2600){const s=String(v??'').trim();return s.length>n?s.slice(0,n)+'\n…':s}
+function readDataURL(file){return new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=()=>rej(fr.error);fr.readAsDataURL(file)})}
+function thumbnail(dataUrl){return new Promise((res,rej)=>{const img=new Image();img.onload=()=>{const max=512;let w=img.width,h=img.height;if(w>max||h>max){const r=Math.min(max/w,max/h);w=Math.round(w*r);h=Math.round(h*r)}const c=document.createElement('canvas');c.width=w;c.height=h;const ctx=c.getContext('2d');ctx.fillStyle='#111312';ctx.fillRect(0,0,w,h);ctx.drawImage(img,0,0,w,h);res(c.toDataURL('image/jpeg',.8))};img.onerror=()=>rej(new Error('Could not read image'));img.src=dataUrl})}
+function addImage(file){
+  if(!file.type||!file.type.startsWith('image/')){toast('Only image files can be attached');return false}
+  if(file.size>MAX_IMAGE_BYTES){toast('Image too large · max 10 MiB');return false}
+  if(sessions[activeId]?.busy){toast('Agent is running');return false}
+  if(attachments.length>=MAX_IMAGES){toast('Limit of '+MAX_IMAGES+' images per run');return false}
+  readDataURL(file).then(dataUrl=>thumbnail(dataUrl).then(thumb=>{
+    if(attachments.length>=MAX_IMAGES){toast('Limit of '+MAX_IMAGES+' images per run');return}
+    attachments.push({id:sid(),name:file.name||'image',dataUrl,thumb,size:file.size});
+    renderAttachments()
+  })).catch(()=>toast('Could not read image'));
+  return true
+}
+function fmtSize(n){if(n>1<<20)return (n/(1<<20)).toFixed(1)+' MiB';if(n>1024)return Math.round(n/1024)+' KiB';return n+' B'}
+function renderAttachments(){
+  const box=$('#attachments');box.innerHTML='';
+  if(!attachments.length){box.hidden=true;return}
+  for(const a of attachments){
+    const chip=document.createElement('div');chip.className='attachment-chip';
+    const img=document.createElement('img');img.src=a.thumb;img.alt=a.name;
+    const meta=document.createElement('div');meta.className='attach-meta';
+    const name=document.createElement('span');name.className='attach-name';name.textContent=a.name;name.title=a.name;
+    const size=document.createElement('span');size.className='attach-size';size.textContent=fmtSize(a.size);
+    const x=document.createElement('button');x.type='button';x.title='Remove image';x.textContent='×';
+    x.onclick=()=>{attachments=attachments.filter(y=>y.id!==a.id);renderAttachments()};
+    meta.append(name,size);chip.append(img,meta,x);box.append(chip)
+  }
+  box.hidden=false
+}
+function extractImages(raw){
+  const out=[];const add=(u,n)=>{if(u&&!out.some(x=>x.url===u))out.push({url:u,name:n})};
+  const part=p=>{
+    if(!p||typeof p!=='object')return;
+    if((p.type==='file'||p.type==='image')&&String(p.mediaType||'').startsWith('image/'))add(p.url,p.filename);
+    const atts=p.state?.attachments||p.attachments;
+    if(Array.isArray(atts))for(const a of atts){if(a&&String(a.mime||a.mediaType||'').startsWith('image/'))add(a.url,a.filename)}
+  };
+  part(raw?.part);
+  if(Array.isArray(raw?.parts))raw.parts.forEach(part);
+  if(Array.isArray(raw?.info?.parts))raw.info.parts.forEach(part);
+  return out
+}
+async function addGeneratedImage(id,im){
+  let url=im.url;
+  try{
+    if(url.startsWith('/api/')){const blob=await (await fetch(url)).blob();const data=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=()=>rej(fr.error);fr.readAsDataURL(blob)});url=await thumbnail(data)}
+    else if(url.startsWith('data:'))url=await thumbnail(url);
+    else return;
+  }catch{return}
+  addEvent(id,'image',url,im.name||'Generated image')
+}
 function toolText(raw){const p=raw.part||raw,st=p.state||{},tool=p.tool||raw.tool||raw.name||'tool',status=st.status||'';const input=st.input||p.input||{},lines=[`↳ ${tool}${status?' · '+status:''}`];if(tool==='bash'&&input.command)lines.push('$ '+input.command);else if(input.filePath||input.path)lines.push(input.filePath||input.path);if(st.error)lines.push('ERROR: '+clipped(typeof st.error==='string'?st.error:JSON.stringify(st.error)));else if(st.output)lines.push(clipped(st.output));return lines.join('\n')}
 function summarize(ev){const raw=ev?.data?.data||ev?.data||{},type=String(raw.type||'');if(ev.type==='error')return raw.message||'Agent failed';if(ev.type==='truncated')return raw.message||'Provider output was truncated.';if(ev.type==='recovered')return raw.text||'';if(ev.type==='done'){const i=raw.inputTokens||0,o=raw.outputTokens||0;return i||o?`Done · ${i} input · ${o} output tokens`:'Done'};if(ev.type==='output')return raw.text||'';if(type.includes('tool'))return `Provider-reported tool event\n${toolText(raw)}`;return raw.part?.text||raw.text||''}
-async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace)return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');addEvent(id,'user',prompt);renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line),text=summarize(ev),raw=ev?.data?.data||ev?.data||{},t=String(raw.type||'');if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;if(text)addEvent(id,ev.type==='error'?'error':ev.type==='done'?'done':'assistant',text)}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].busy=false;sessions[id].abort=null;saveSessions()}if(activeId===id)renderAll();agentStatus()}}
+async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace)return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');const images=attachments.map(a=>({name:a.name,data:a.dataUrl}));for(const a of attachments)addEvent(id,'image',a.thumb,a.name);addEvent(id,'user',prompt);attachments=[];renderAttachments();renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id,images}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';const seenImages=new Set();for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line),text=summarize(ev),raw=ev?.data?.data||ev?.data||{},t=String(raw.type||'');if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;if(text)addEvent(id,ev.type==='error'?'error':ev.type==='done'?'done':'assistant',text);if(ev.type==='recovered-images'){for(const im of (raw.images||[]))addGeneratedImage(id,im)}for(const im of extractImages(raw)){if(seenImages.has(im.url))continue;seenImages.add(im.url);addGeneratedImage(id,im)}}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].busy=false;sessions[id].abort=null;saveSessions()}if(activeId===id)renderAll();agentStatus()}}
 function joinPath(base,name){return (base.replace(/\/+$/,'')+'/'+name).replace(/\/+/g,'/')}
 function parentPath(p){if(p===root)return root;const x=p.replace(/\/+$/,'');const i=x.lastIndexOf('/');const out=i<=0?'/':x.slice(0,i);return out.length<root.length?root:out}
 async function browse(path){
@@ -168,7 +250,7 @@ async function browse(path){
 }
 async function openWorkspacePicker(){const s=active();$('#workspaceModal').hidden=false;try{await browse(s.workspace||root)}catch(e){toast(e.message)}}
 function chooseWorkspace(){const s=active();s.workspace=browserPath;s.openCodeSession='';s.title='';s.events=[];saveSessions();$('#workspaceModal').hidden=true;renderAll();toast('Workspace selected')}
-async function copySession(){const s=active(),labels={user:'You',assistant:'Agent',tool:'Tool',error:'Error',done:'Status'},text=s.events.map(x=>`${labels[x.kind]||'Agent'}:\n${x.text}`).join('\n\n');if(!text)return toast('Nothing to copy');await navigator.clipboard.writeText(text);toast('Session copied')}
+async function copySession(){const s=active(),labels={user:'You',assistant:'Agent',tool:'Tool',error:'Error',done:'Status'},text=s.events.filter(x=>x.kind!=='image').map(x=>`${labels[x.kind]||'Agent'}:\n${x.text}`).join('\n\n');if(!text)return toast('Nothing to copy');await navigator.clipboard.writeText(text);toast('Session copied')}
 function applyComposerHeight(value){
   const card=document.querySelector('.agent-card');if(!card)return;
   const max=Math.max(170,Math.floor(card.getBoundingClientRect().height*.55));
@@ -203,7 +285,10 @@ async function boot(){const st=await api('/api/status');root=st.root;loadSession
 $('#newSession').onclick=e=>{e.stopPropagation();toggleSessionMenu()};$('#newSameWorkspace').onclick=newSessionSameWorkspace;$('#newWorkspace').onclick=newWorkspaceSession;$('#workspaceBtn').onclick=openWorkspacePicker;$('#closeWorkspace').onclick=$('#cancelWorkspace').onclick=()=>$('#workspaceModal').hidden=true;$('#browserUp').onclick=()=>browse(parentPath(browserPath));$('#chooseWorkspace').onclick=chooseWorkspace;
 $('#composerResize').onpointerdown=startComposerResize;$('#composerResize').ondblclick=()=>{applyComposerHeight(150);localStorage.setItem(COMPOSER_STORE,'150')};document.addEventListener('click',e=>{if(!e.target.closest('.new-session-wrap'))hideSessionMenu()});window.addEventListener('resize',()=>applyComposerHeight($('#agentForm').getBoundingClientRect().height));
 $('#agentForm').onsubmit=e=>{e.preventDefault();const p=$('#prompt').value.trim();if(!p)return;$('#prompt').value='';runAgent(p)};$('#prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('#agentForm').requestSubmit()}};$('#stop').onclick=()=>active()?.abort?.abort();$('#copy').onclick=copySession;
-$('#settingsBtn').onclick=()=>{$('#settingsModal').hidden=false;loadSettings()};$('#closeSettings').onclick=()=>$('#settingsModal').hidden=true;$('#settingsModal').onclick=e=>{if(e.target===$('#settingsModal'))$('#settingsModal').hidden=true};$('#workspaceModal').onclick=e=>{if(e.target===$('#workspaceModal'))$('#workspaceModal').hidden=true};$('#provider').onchange=updateProviderUI;$('#saveKey').onclick=()=>saveKey(false);$('#deleteKey').onclick=()=>saveKey(true);
+$('#prompt').addEventListener('paste',e=>{const files=[...(e.clipboardData?.items||[])].map(i=>i.getAsFile()).filter(Boolean).filter(f=>f.type&&f.type.startsWith('image/'));if(!files.length)return;let handled=false;for(const f of files)handled=addImage(f)||handled;if(handled)e.preventDefault()});
+document.addEventListener('dragover',e=>{if([...(e.dataTransfer?.types||[])].includes('Files'))e.preventDefault()});
+document.addEventListener('drop',e=>{const files=[...(e.dataTransfer?.files||[])].filter(f=>f.type&&f.type.startsWith('image/'));if(!files.length)return;e.preventDefault();for(const f of files)addImage(f)});
+$('#settingsBtn').onclick=()=>{$('#settingsModal').hidden=false;loadSettings()};$('#closeSettings').onclick=()=>$('#settingsModal').hidden=true;$('#settingsModal').onclick=e=>{if(e.target===$('#settingsModal'))$('#settingsModal').hidden=true};$('#workspaceModal').onclick=e=>{if(e.target===$('#workspaceModal'))$('#workspaceModal').hidden=true};$('#provider').onchange=updateProviderUI;$('#model').onchange=()=>{if($('#model').value==='__custom__'){$('#modelCustom').hidden=false;$('#modelCustom').focus()}else $('#modelCustom').hidden=true};$('#saveKey').onclick=()=>saveKey(false);$('#deleteKey').onclick=()=>saveKey(true);$('#refreshModels').onclick=()=>{const p=providers.find(x=>x.id===$('#provider').value);if(p)loadModels(p.id,false)};
 async function bootAuthenticated(){if(!await loadAuthState())return;await boot()}
 // Authentication and self-hosted security settings.
 let authState={};

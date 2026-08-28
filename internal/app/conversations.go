@@ -11,6 +11,7 @@ import (
 type conversationEvent struct {
 	Kind      string `json:"kind"`
 	Text      string `json:"text"`
+	Name      string `json:"name,omitempty"`
 	CreatedAt int64  `json:"createdAt,omitempty"`
 }
 
@@ -165,14 +166,14 @@ func (a *App) saveConversationTx(tx *sql.Tx, c *conversation) error {
 		return err
 	}
 	for i, event := range c.Events {
-		if len(event.Text) > 1<<20 || event.Kind == "" {
+		if len(event.Text) > 1<<20 || len(event.Name) > 500 || event.Kind == "" {
 			return errors.New("invalid conversation event")
 		}
 		created := event.CreatedAt
 		if created <= 0 {
 			created = c.CreatedAt + int64(i)
 		}
-		if _, err = tx.Exec("INSERT INTO conversation_events(conversation_id,sequence,kind,text,created_at) VALUES(?,?,?,?,?)", c.ID, i, event.Kind, event.Text, created); err != nil {
+		if _, err = tx.Exec("INSERT INTO conversation_events(conversation_id,sequence,kind,text,name,created_at) VALUES(?,?,?,?,?,?)", c.ID, i, event.Kind, event.Text, event.Name, created); err != nil {
 			return err
 		}
 	}
@@ -217,7 +218,7 @@ func (a *App) loadConversations(query string) ([]conversation, error) {
 }
 
 func (a *App) loadConversationEvents(id string) ([]conversationEvent, error) {
-	rows, err := a.db.Query("SELECT kind,text,created_at FROM conversation_events WHERE conversation_id = ? ORDER BY sequence", id)
+	rows, err := a.db.Query("SELECT kind,text,name,created_at FROM conversation_events WHERE conversation_id = ? ORDER BY sequence", id)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +226,7 @@ func (a *App) loadConversationEvents(id string) ([]conversationEvent, error) {
 	events := []conversationEvent{}
 	for rows.Next() {
 		var event conversationEvent
-		if err := rows.Scan(&event.Kind, &event.Text, &event.CreatedAt); err != nil {
+		if err := rows.Scan(&event.Kind, &event.Text, &event.Name, &event.CreatedAt); err != nil {
 			return nil, err
 		}
 		events = append(events, event)

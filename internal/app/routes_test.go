@@ -5,8 +5,8 @@ import "testing"
 func TestEveryAPIRouteHasACompletePolicy(t *testing.T) {
 	a := &App{}
 	routes := a.apiRoutes()
-	if len(routes) != 20 {
-		t.Fatalf("route inventory has %d entries, want 20", len(routes))
+	if len(routes) != 22 {
+		t.Fatalf("route inventory has %d entries, want 22", len(routes))
 	}
 	seen := map[string]bool{}
 	for _, route := range routes {

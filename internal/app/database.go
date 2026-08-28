@@ -67,6 +67,11 @@ var databaseMigrations = []migration{
 		);
 		CREATE INDEX agent_runs_conversation_idx ON agent_runs(conversation_id, started_at DESC);`,
 	},
+	{
+		version: 3,
+		name:    "image attachment names",
+		sql:     `ALTER TABLE conversation_events ADD COLUMN name TEXT NOT NULL DEFAULT '';`,
+	},
 }
 
 func openDatabase(dataDir string) (*sql.DB, error) {
