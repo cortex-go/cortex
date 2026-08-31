@@ -890,19 +890,32 @@ func TestStateExitValidation(t *testing.T) {
 		code      int
 		want      svcState
 	}{
+		// systemctl is-active (v252): only active and reloading are exit 0.
 		{"is-active", "active", 0, stateActive},
+		{"is-active", "reloading", 0, stateReloading},
 		{"is-active", "inactive", 3, stateInactive},
 		{"is-active", "dead", 3, stateInactive},
 		{"is-active", "failed", 3, stateInactive},
 		{"is-active", "activating", 3, stateTransition},
 		{"is-active", "deactivating", 3, stateTransition},
-		{"is-active", "reloading", 3, stateTransition},
+		{"is-active", "maintenance", 3, stateTransition},
+		{"is-active", "refreshing", 3, stateTransition},
 		{"is-active", "unknown", 3, stateUnknown},
 		{"is-active", "not-found", 3, stateUnknown},
+		// systemctl is-enabled (v252): enabled-family states exit 0.
 		{"is-enabled", "enabled", 0, stateEnabled},
+		{"is-enabled", "enabled-runtime", 0, stateEnabled},
+		{"is-enabled", "static", 0, stateEnabled},
+		{"is-enabled", "alias", 0, stateEnabled},
+		{"is-enabled", "indirect", 0, stateEnabled},
+		{"is-enabled", "generated", 0, stateEnabled},
 		{"is-enabled", "disabled", 1, stateDisabled},
-		{"is-enabled", "static", 2, stateDisabled},
+		{"is-enabled", "linked", 1, stateDisabled},
+		{"is-enabled", "linked-runtime", 1, stateDisabled},
+		{"is-enabled", "transient", 1, stateDisabled},
 		{"is-enabled", "not-found", 4, stateDisabled},
+		{"is-enabled", "masked", 1, stateMasked},
+		{"is-enabled", "masked-runtime", 1, stateMasked},
 	}
 	for _, tc := range valid {
 		m, _ := stateTestManager(t, tc.out, tc.code, tc.out, tc.code)
@@ -919,10 +932,18 @@ func TestStateExitValidation(t *testing.T) {
 		code      int
 	}{
 		{"is-active", "active", 3},
+		{"is-active", "reloading", 3},
 		{"is-active", "inactive", 0},
+		{"is-active", "dead", 0},
 		{"is-active", "failed", 0},
+		{"is-active", "activating", 0},
+		{"is-active", "unknown", 0},
 		{"is-enabled", "enabled", 1},
+		{"is-enabled", "static", 1},
+		{"is-enabled", "alias", 1},
 		{"is-enabled", "disabled", 0},
+		{"is-enabled", "linked", 0},
+		{"is-enabled", "masked", 0},
 	}
 	for _, tc := range invalid {
 		m, _ := stateTestManager(t, tc.out, tc.code, tc.out, tc.code)
@@ -933,8 +954,10 @@ func TestStateExitValidation(t *testing.T) {
 }
 
 func TestTransitionalUninstall(t *testing.T) {
-	for _, state := range []string{"activating", "deactivating", "reloading"} {
-		t.Run(state, func(t *testing.T) {
+	for _, tc := range []struct{ state string; code int }{
+		{"activating", 3}, {"deactivating", 3}, {"maintenance", 3}, {"refreshing", 3}, {"reloading", 0},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
 			m, fr, _ := newFakeManager(t)
 			if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
 				t.Fatal(err)
@@ -946,21 +969,21 @@ func TestTransitionalUninstall(t *testing.T) {
 					if fr.saw("stop cortex.service") {
 						return "inactive", 3, nil
 					}
-					return state, 3, nil
+					return tc.state, tc.code, nil
 				case fr.contains(args, "is-enabled"):
 					return "disabled", 1, nil
 				}
 				return "", 0, nil
 			}
 			if err := m.uninstall(os.Stderr); err != nil {
-				t.Fatalf("uninstall of a %s service failed: %v", state, err)
+				t.Fatalf("uninstall of a %s service failed: %v", tc.state, err)
 			}
 			if _, err := os.Stat(m.unitPath); !os.IsNotExist(err) {
 				t.Fatal("unit still present after uninstall")
 			}
 			joined := strings.Join(fr.calls, "\n")
 			if !strings.Contains(joined, "stop cortex.service") {
-				t.Fatalf("%s service was not stopped before removal: %s", state, joined)
+				t.Fatalf("%s service was not stopped before removal: %s", tc.state, joined)
 			}
 		})
 	}
@@ -1010,6 +1033,125 @@ func TestTransitionalUninstall(t *testing.T) {
 		}
 		if strings.Contains(strings.Join(fr.calls, "\n"), "daemon-reload") {
 			t.Fatal("daemon-reload ran although the service was not safely disabled")
+		}
+	})
+}
+
+func TestDisableVerificationFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		afterDisableOut string
+		afterDisableCode int
+		afterDisableErr error
+	}{
+		{"unknown", "unknown", 3, nil},
+		{"unrecognized", "bogus-state", 1, nil},
+		{"launch failure", "", -1, errors.New("bus gone")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, fr, _ := newFakeManager(t)
+			if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+				t.Fatal(err)
+			}
+			fr.calls = nil
+			fr.handler = func(name string, args ...string) (string, int, error) {
+				switch {
+				case fr.contains(args, "is-active"):
+					return "inactive", 3, nil
+				case fr.contains(args, "is-enabled"):
+					if fr.saw("disable cortex.service") {
+						return tc.afterDisableOut, tc.afterDisableCode, tc.afterDisableErr
+					}
+					return "enabled", 0, nil
+				}
+				return "", 0, nil
+			}
+			if err := m.uninstall(os.Stderr); err == nil {
+				t.Fatalf("uninstall proceeded after a %q disable verification", tc.name)
+			}
+			if _, err := os.Stat(m.unitPath); err != nil {
+				t.Fatalf("unit removed despite failed disable verification: %v", err)
+			}
+			joined := strings.Join(fr.calls, "\n")
+			if strings.Contains(joined, "daemon-reload") {
+				t.Fatalf("daemon-reload ran after a failed disable verification: %s", joined)
+			}
+		})
+	}
+}
+
+func TestUninstallRollback(t *testing.T) {
+	t.Run("reload failure restores the unit byte-for-byte", func(t *testing.T) {
+		m, fr, base := newFakeManager(t)
+		dataDir := filepath.Join(base, "data")
+		if err := os.MkdirAll(dataDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dataDir, "conversations.db"), []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		opts := testOpts("127.0.0.1:7331")
+		opts.data = dataDir
+		if err := m.install(opts, os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		orig, _ := os.ReadFile(m.unitPath)
+		fr.calls = nil
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "inactive", 3, nil
+			case fr.contains(args, "is-enabled"):
+				return "disabled", 1, nil
+			case fr.contains(args, "daemon-reload"):
+				return "Failed to reload", 1, nil
+			}
+			return "", 0, nil
+		}
+		err := m.uninstall(os.Stderr)
+		if err == nil {
+			t.Fatal("uninstall did not report the reload failure")
+		}
+		if !strings.Contains(err.Error(), "restored") {
+			t.Fatalf("reload failure did not restore the unit: %v", err)
+		}
+		got, _ := os.ReadFile(m.unitPath)
+		if string(got) != string(orig) {
+			t.Fatal("restored unit does not match the original byte-for-byte")
+		}
+		if _, err := os.Stat(filepath.Join(dataDir, "conversations.db")); err != nil {
+			t.Fatalf("data was lost during rollback: %v", err)
+		}
+	})
+	t.Run("restoration cannot overwrite a concurrently created file", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.calls = nil
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "inactive", 3, nil
+			case fr.contains(args, "is-enabled"):
+				return "disabled", 1, nil
+			case fr.contains(args, "daemon-reload"):
+				// Another actor replaces the unit while the reload fails.
+				_ = os.WriteFile(m.unitPath, []byte("# replacement\n"), 0644)
+				return "Failed to reload", 1, nil
+			}
+			return "", 0, nil
+		}
+		err := m.uninstall(os.Stderr)
+		if err == nil {
+			t.Fatal("uninstall did not report the reload failure")
+		}
+		if !strings.Contains(err.Error(), "additionally failed to restore") || !strings.Contains(err.Error(), "concurrently created") {
+			t.Fatalf("restoration failure not reported clearly: %v", err)
+		}
+		got, _ := os.ReadFile(m.unitPath)
+		if string(got) != "# replacement\n" {
+			t.Fatalf("concurrently created file was overwritten: %q", got)
 		}
 	})
 }

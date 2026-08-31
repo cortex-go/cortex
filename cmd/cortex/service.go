@@ -108,30 +108,37 @@ func (m *serviceManager) systemctl(args ...string) (string, int, error) {
 }
 
 // svcState is a deliberately resolved systemd state category. It preserves
-// enough information to distinguish definitely-active, safely-stopped,
-// transitional and unknown states so uninstall can fail closed correctly.
+// enough information to distinguish definitely-active, reloading,
+// transitional, safely-stopped, unknown, enabled, disabled and masked states
+// so uninstall can fail closed correctly.
 type svcState string
 
 const (
 	stateActive     svcState = "active"
-	stateInactive   svcState = "inactive"
+	stateReloading  svcState = "reloading"
 	stateTransition svcState = "transitioning"
+	stateInactive   svcState = "inactive"
 	stateUnknown    svcState = "unknown"
 	stateEnabled    svcState = "enabled"
 	stateDisabled   svcState = "disabled"
+	stateMasked     svcState = "masked"
 )
 
 func stateName(s svcState) string { return string(s) }
 
 // classifyActive maps an is-active output word to a state category and whether
-// that state requires exit 0.
+// that state requires exit 0. This follows systemd's documented contract
+// (systemctl-is-active.c, v252): only active and reloading are considered
+// "active" (exit 0); every other state exits 3.
 func classifyActive(word string) (svcState, bool, bool) {
 	switch word {
 	case "active":
 		return stateActive, true, true
+	case "reloading":
+		return stateReloading, true, true
 	case "inactive", "dead", "failed":
 		return stateInactive, false, true
-	case "activating", "deactivating", "reloading":
+	case "activating", "deactivating", "maintenance", "refreshing":
 		return stateTransition, false, true
 	case "unknown", "not-found":
 		return stateUnknown, false, true
@@ -140,13 +147,19 @@ func classifyActive(word string) (svcState, bool, bool) {
 }
 
 // classifyEnabled maps an is-enabled output word to a state category and
-// whether that state requires exit 0.
+// whether that state requires exit 0. This follows systemd's documented
+// contract (systemctl-is-enabled.c, v252): enabled, enabled-runtime, static,
+// alias, indirect and generated are considered "enabled" (exit 0); disabled,
+// linked, linked-runtime, transient and not-found are not enabled (exit 1);
+// masked and masked-runtime are distinct not-enabled states that cannot start.
 func classifyEnabled(word string) (svcState, bool, bool) {
 	switch word {
-	case "enabled":
+	case "enabled", "enabled-runtime", "static", "alias", "indirect", "generated":
 		return stateEnabled, true, true
-	case "disabled", "static", "indirect", "generated", "transient", "not-found":
+	case "disabled", "linked", "linked-runtime", "transient", "not-found":
 		return stateDisabled, false, true
+	case "masked", "masked-runtime":
+		return stateMasked, false, true
 	case "unknown":
 		return stateUnknown, false, true
 	}
@@ -580,18 +593,44 @@ func (m *serviceManager) logs(follow bool, out io.Writer) error {
 	return nil
 }
 
+// restoreUnitFile writes the original managed unit back after a failed final
+// daemon-reload. O_EXCL ensures a concurrently created replacement is never
+// overwritten; the original permissions are preserved.
+func restoreUnitFile(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("refusing to overwrite a concurrently created unit at %s", path)
+		}
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 func (m *serviceManager) uninstall(out io.Writer) error {
-	if _, err := readManagedUnit(m.unitPath); err != nil {
+	data, err := os.ReadFile(m.unitPath)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("%s is not installed", m.unitName)
 		}
+		return err
+	}
+	if _, err := readManagedUnit(m.unitPath); err != nil {
 		return fmt.Errorf("refusing to uninstall %s: %w", m.unitName, err)
+	}
+	info, err := os.Stat(m.unitPath)
+	if err != nil {
+		return err
 	}
 	active, err := m.queryState("is-active")
 	if err != nil {
 		return fmt.Errorf("cannot determine %s state before uninstall: %w", m.unitName, err)
 	}
-	if active == stateActive || active == stateTransition {
+	if active == stateActive || active == stateReloading || active == stateTransition {
 		if err := m.systemctlSuccess("stop", m.unitName); err != nil {
 			return fmt.Errorf("stop %s failed: %w", m.unitName, err)
 		}
@@ -619,11 +658,11 @@ func (m *serviceManager) uninstall(out io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("cannot verify %s disabled after disable: %w", m.unitName, err)
 		}
-		if after == stateEnabled {
-			return fmt.Errorf("%s still reports enabled after disable; not removing the unit", m.unitName)
+		if after != stateDisabled && after != stateMasked {
+			return fmt.Errorf("%s still reports %q after disable; not removing the unit", m.unitName, stateName(after))
 		}
-	} else if enabled == stateDisabled {
-		fmt.Fprintf(out, "note: %s is not enabled; nothing to disable\n", m.unitName)
+	} else if enabled == stateDisabled || enabled == stateMasked {
+		fmt.Fprintf(out, "note: %s is %s; nothing to disable\n", m.unitName, stateName(enabled))
 	} else {
 		return fmt.Errorf("%s enablement is %q; cannot confirm it is disabled before uninstall", m.unitName, stateName(enabled))
 	}
@@ -631,7 +670,11 @@ func (m *serviceManager) uninstall(out io.Writer) error {
 		return err
 	}
 	if err := m.systemctlSuccess("daemon-reload"); err != nil {
-		return fmt.Errorf("reloading systemd after removing %s: %w", m.unitName, err)
+		if restoreErr := restoreUnitFile(m.unitPath, data, info.Mode()); restoreErr != nil {
+			return fmt.Errorf("reloading systemd after removing %s: %w; additionally failed to restore the unit: %v", m.unitName, err, restoreErr)
+		}
+		_ = m.systemctlSuccess("daemon-reload") // best-effort reload after restoring the unit
+		return fmt.Errorf("reloading systemd after removing %s: %w; the managed unit was restored", m.unitName, err)
 	}
 	fmt.Fprintf(out, "Removed %s. Application configuration, conversations and data were preserved.\n", m.unitName)
 	return nil
