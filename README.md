@@ -76,3 +76,27 @@ opencode auth login --provider github-copilot
 ```
 
 Cortex detects those OAuth credentials and copies the selected provider credential into the isolated session data when that subscription is used. Exact model availability remains determined by the installed OpenCode version and provider account.
+
+## Run as a systemd user service
+
+Run Cortex in the foreground with `cortex` or `cortex serve`. To keep it running without a terminal, install a per-user systemd unit:
+
+```sh
+cortex service install            # --listen, --root, --data, --public-origin, --trust-proxy accepted
+cortex service status
+cortex service logs               # or: cortex service logs --follow
+cortex service restart
+cortex service uninstall          # stops the service but keeps all Cortex data
+```
+
+The user unit is written to `~/.config/systemd/user/cortex.service` and managed with `systemctl --user` and `journalctl --user-unit cortex.service`. `service install` resolves the executable to a stable absolute path, refuses empty, relative or transient paths, writes the unit atomically, reloads systemd, and enables and starts the service. An existing unit that is not managed by Cortex is never overwritten or removed silently. `cortex service status` reports enabled/running state, PID, version, listen address and a live health check, and exits nonzero when the service is failed or missing.
+
+`service install --system` (system-wide units) is a documented follow-up and is not yet supported; user mode is the default.
+
+### Terminal, user-service and system-service execution
+
+* **Terminal:** running `cortex` from your login shell inherits your session environment. `gh auth status` and other CLI tools work exactly as in your shell, including the GitHub token stored in your login keyring.
+* **User service:** systemd user units run as your OS user but start with a minimal environment. Cortex resolves stable paths and preserves `HOME`, and when `~/.config/gh/hosts.yml` exists the unit records `GH_CONFIG_DIR` so the GitHub CLI keeps working. Because a user service runs inside your user session, it can still reach your login keyring; if that keyring is locked, run `gh auth login` once in the session first.
+* **System service:** not yet supported. A future system-wide service would run under a dedicated account with no login keyring, so GitHub CLI authentication would need `gh auth login` for that account or an explicit `GH_TOKEN`/`GITHUB_TOKEN` in its environment.
+
+Cortex's agent subprocesses inherit the host GitHub CLI configuration directory (`GH_CONFIG_DIR`) when `hosts.yml` exists, without copying any file or token; the token itself stays in your keyring. OpenCode's own configuration and session data remain isolated in per-run temporary directories.

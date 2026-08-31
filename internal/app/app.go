@@ -556,6 +556,39 @@ func setEnv(env []string, name, value string) []string {
 	}
 	return append(out, prefix+value)
 }
+func envValue(env []string, name string) string {
+	prefix := name + "="
+	for _, v := range env {
+		if strings.HasPrefix(v, prefix) {
+			return v[len(prefix):]
+		}
+	}
+	return ""
+}
+
+// ghConfigDirEnv inherits the host GitHub CLI configuration directory into a
+// subprocess environment when one exists, without copying any file or token.
+// It must be called before XDG_CONFIG_HOME is redirected to the isolated run
+// directory, so the host value is still visible. An explicit GH_CONFIG_DIR in
+// the inherited environment is always respected.
+func ghConfigDirEnv(env []string) []string {
+	if v := strings.TrimSpace(envValue(env, "GH_CONFIG_DIR")); v != "" {
+		return env
+	}
+	dir := ""
+	if v := strings.TrimSpace(envValue(env, "XDG_CONFIG_HOME")); v != "" {
+		dir = filepath.Join(v, "gh")
+	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
+		dir = filepath.Join(home, ".config", "gh")
+	}
+	if dir == "" {
+		return env
+	}
+	if st, err := os.Stat(filepath.Join(dir, "hosts.yml")); err != nil || st.IsDir() {
+		return env
+	}
+	return setEnv(env, "GH_CONFIG_DIR", dir)
+}
 func errText(err error) string {
 	if err == nil {
 		return ""

@@ -208,6 +208,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	if provider.AuthMode == "key" {
 		env = setEnv(env, "CORTEX_PROVIDER_API_KEY", key)
 	}
+	env = ghConfigDirEnv(env)
 	env = setEnv(env, "OPENCODE_CONFIG", configPath)
 	env = setEnv(env, "OPENCODE_CONFIG_DIR", configDir)
 	env = setEnv(env, "XDG_CONFIG_HOME", configDir)
@@ -528,6 +529,7 @@ func (a *App) agentModels(w http.ResponseWriter, r *http.Request) {
 	if p.AuthMode == "key" {
 		env = setEnv(env, "CORTEX_PROVIDER_API_KEY", key)
 	}
+	env = ghConfigDirEnv(env)
 	env = setEnv(env, "OPENCODE_CONFIG", configPath)
 	env = setEnv(env, "OPENCODE_CONFIG_DIR", configDir)
 	env = setEnv(env, "XDG_CONFIG_HOME", configDir)

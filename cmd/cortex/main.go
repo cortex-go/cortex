@@ -10,8 +10,20 @@ import (
 	"github.com/cortex-go/cortex/internal/app"
 )
 
+const defaultListen = "127.0.0.1:7331"
+
+var version = "0.1.0-dev"
+
 func main() {
-	listen := flag.String("listen", "127.0.0.1:7331", "HTTP listen address")
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "service":
+			os.Exit(runService(os.Args[2:], version))
+		case "serve":
+			os.Args = append(os.Args[:1], os.Args[2:]...)
+		}
+	}
+	listen := flag.String("listen", defaultListen, "HTTP listen address")
 	root := flag.String("root", "", "workspace root (default: home directory)")
 	data := flag.String("data", "", "Cortex data directory")
 	trustProxy := flag.Bool("trust-proxy", false, "trust forwarding headers from a direct loopback reverse proxy")
