@@ -107,48 +107,104 @@ func (m *serviceManager) systemctl(args ...string) (string, int, error) {
 	return m.run.Run("systemctl", append([]string{"--user"}, args...)...)
 }
 
-// svcState is a recognized, deliberately resolved systemd state word.
+// svcState is a deliberately resolved systemd state category. It preserves
+// enough information to distinguish definitely-active, safely-stopped,
+// transitional and unknown states so uninstall can fail closed correctly.
 type svcState string
 
 const (
-	stateActive   svcState = "active"
-	stateInactive svcState = "inactive"
-	stateEnabled  svcState = "enabled"
-	stateDisabled svcState = "disabled"
+	stateActive     svcState = "active"
+	stateInactive   svcState = "inactive"
+	stateTransition svcState = "transitioning"
+	stateUnknown    svcState = "unknown"
+	stateEnabled    svcState = "enabled"
+	stateDisabled   svcState = "disabled"
 )
 
-var inactiveStates = map[string]bool{"inactive": true, "failed": true, "dead": true, "unknown": true, "activating": true, "deactivating": true, "reloading": true}
-var disabledStates = map[string]bool{"disabled": true, "static": true, "indirect": true, "generated": true, "transient": true, "not-found": true}
+func stateName(s svcState) string { return string(s) }
 
-// queryState resolves an is-active or is-enabled state from systemctl output.
-// systemctl exits nonzero for inactive/disabled states, which the runner
-// reports as an exit code with nil error; a real launch failure (e.g. the
-// user manager bus is unreachable) is surfaced as an error, and any output
-// that is not a recognized state word is surfaced as an error too, so
-// infrastructure failures are never mistaken for an inactive or disabled unit.
+// classifyActive maps an is-active output word to a state category and whether
+// that state requires exit 0.
+func classifyActive(word string) (svcState, bool, bool) {
+	switch word {
+	case "active":
+		return stateActive, true, true
+	case "inactive", "dead", "failed":
+		return stateInactive, false, true
+	case "activating", "deactivating", "reloading":
+		return stateTransition, false, true
+	case "unknown", "not-found":
+		return stateUnknown, false, true
+	}
+	return "", false, false
+}
+
+// classifyEnabled maps an is-enabled output word to a state category and
+// whether that state requires exit 0.
+func classifyEnabled(word string) (svcState, bool, bool) {
+	switch word {
+	case "enabled":
+		return stateEnabled, true, true
+	case "disabled", "static", "indirect", "generated", "transient", "not-found":
+		return stateDisabled, false, true
+	case "unknown":
+		return stateUnknown, false, true
+	}
+	return "", false, false
+}
+
+// queryState resolves an is-active or is-enabled state and validates the
+// output/exit pair together: positive states require exit 0, negative states
+// require a documented nonzero exit, launch failures surface as errors, and
+// inconsistent or unrecognized pairs surface as errors.
 func (m *serviceManager) queryState(verb string) (svcState, error) {
 	out, code, err := m.systemctl(verb, m.unitName)
 	if err != nil {
 		return "", fmt.Errorf("cannot run systemctl %s %s: %w", verb, m.unitName, err)
 	}
-	state := strings.TrimSpace(out)
+	word := strings.TrimSpace(out)
+	var st svcState
+	var needZero bool
+	var ok bool
 	switch verb {
 	case "is-active":
-		if state == "active" {
-			return stateActive, nil
-		}
-		if inactiveStates[state] {
-			return stateInactive, nil
-		}
+		st, needZero, ok = classifyActive(word)
 	case "is-enabled":
-		if state == "enabled" {
-			return stateEnabled, nil
-		}
-		if disabledStates[state] {
-			return stateDisabled, nil
-		}
+		st, needZero, ok = classifyEnabled(word)
 	}
-	return "", fmt.Errorf("systemctl %s %s returned unrecognized state %q (exit %d)", verb, m.unitName, state, code)
+	if !ok {
+		return "", fmt.Errorf("systemctl %s %s returned unrecognized state %q (exit %d)", verb, m.unitName, word, code)
+	}
+	if needZero && code != 0 {
+		return "", fmt.Errorf("systemctl %s %s reported %q but exited %d; inconsistent state result", verb, m.unitName, word, code)
+	}
+	if !needZero && code == 0 {
+		return "", fmt.Errorf("systemctl %s %s reported %q but exited 0; inconsistent state result", verb, m.unitName, word)
+	}
+	return st, nil
+}
+
+// bounded caps captured command output used in errors.
+func bounded(s string) string {
+	const max = 2000
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
+}
+
+// systemctlSuccess runs a systemctl operation that must exit zero; launch
+// failures and nonzero exits are both errors. Call sites must never discard
+// the exit code at strict-operation sites.
+func (m *serviceManager) systemctlSuccess(args ...string) error {
+	out, code, err := m.systemctl(args...)
+	if err != nil {
+		return fmt.Errorf("cannot run systemctl %s: %w", strings.Join(args, " "), err)
+	}
+	if code != 0 {
+		return fmt.Errorf("systemctl %s exited %d: %s", strings.Join(args, " "), code, bounded(strings.TrimSpace(out)))
+	}
+	return nil
 }
 
 // validateNoControl rejects CR, LF, NUL and other control characters so no
@@ -433,9 +489,8 @@ func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
 		{"enabling", []string{"enable", m.unitName}},
 		{"starting", []string{"start", m.unitName}},
 	} {
-		o, _, err := m.systemctl(step.args...)
-		if err != nil {
-			return fmt.Errorf("%s %s: %w: %s", step.verb, m.unitName, err, strings.TrimSpace(o))
+		if err := m.systemctlSuccess(step.args...); err != nil {
+			return fmt.Errorf("%s %s: %w", step.verb, m.unitName, err)
 		}
 	}
 	active, _, _ := m.systemctl("is-active", m.unitName)
@@ -450,12 +505,15 @@ func (m *serviceManager) action(verb string, out io.Writer) error {
 	if err := m.requireManaged(verb); err != nil {
 		return err
 	}
-	o, _, err := m.systemctl(verb, m.unitName)
+	o, code, err := m.systemctl(verb, m.unitName)
 	if out != nil && strings.TrimSpace(o) != "" {
 		fmt.Fprintln(out, strings.TrimSpace(o))
 	}
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", verb, m.unitName, err)
+		return fmt.Errorf("cannot run systemctl %s %s: %w", verb, m.unitName, err)
+	}
+	if code != 0 {
+		return fmt.Errorf("systemctl %s %s exited %d: %s", verb, m.unitName, code, bounded(strings.TrimSpace(o)))
 	}
 	return nil
 }
@@ -511,9 +569,12 @@ func (m *serviceManager) logs(follow bool, out io.Writer) error {
 		}
 		return nil
 	}
-	o, _, err := m.run.Run("journalctl", args...)
+	o, code, err := m.run.Run("journalctl", args...)
 	if err != nil {
-		return fmt.Errorf("journalctl: %w: %s", err, strings.TrimSpace(o))
+		return fmt.Errorf("cannot run journalctl: %w", err)
+	}
+	if code != 0 {
+		return fmt.Errorf("journalctl exited %d: %s", code, bounded(strings.TrimSpace(o)))
 	}
 	fmt.Fprint(out, o)
 	return nil
@@ -530,29 +591,47 @@ func (m *serviceManager) uninstall(out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("cannot determine %s state before uninstall: %w", m.unitName, err)
 	}
-	if active == stateActive {
-		if o, _, err := m.systemctl("stop", m.unitName); err != nil {
-			return fmt.Errorf("stop %s failed: %w: %s", m.unitName, err, strings.TrimSpace(o))
+	if active == stateActive || active == stateTransition {
+		if err := m.systemctlSuccess("stop", m.unitName); err != nil {
+			return fmt.Errorf("stop %s failed: %w", m.unitName, err)
 		}
+		after, err := m.queryState("is-active")
+		if err != nil {
+			return fmt.Errorf("cannot verify %s stopped after stop: %w", m.unitName, err)
+		}
+		if after != stateInactive {
+			return fmt.Errorf("%s still reports %q after stop; not removing the unit", m.unitName, stateName(after))
+		}
+	} else if active == stateInactive {
+		fmt.Fprintf(out, "note: %s is inactive; nothing to stop\n", m.unitName)
 	} else {
-		fmt.Fprintf(out, "note: %s is %s; nothing to stop\n", m.unitName, active)
+		return fmt.Errorf("%s is in %q; cannot confirm it is safely stopped before uninstall", m.unitName, stateName(active))
 	}
 	enabled, err := m.queryState("is-enabled")
 	if err != nil {
 		return fmt.Errorf("cannot determine %s enablement before uninstall: %w", m.unitName, err)
 	}
 	if enabled == stateEnabled {
-		if o, _, err := m.systemctl("disable", m.unitName); err != nil {
-			return fmt.Errorf("disable %s failed: %w: %s", m.unitName, err, strings.TrimSpace(o))
+		if err := m.systemctlSuccess("disable", m.unitName); err != nil {
+			return fmt.Errorf("disable %s failed: %w", m.unitName, err)
 		}
+		after, err := m.queryState("is-enabled")
+		if err != nil {
+			return fmt.Errorf("cannot verify %s disabled after disable: %w", m.unitName, err)
+		}
+		if after == stateEnabled {
+			return fmt.Errorf("%s still reports enabled after disable; not removing the unit", m.unitName)
+		}
+	} else if enabled == stateDisabled {
+		fmt.Fprintf(out, "note: %s is not enabled; nothing to disable\n", m.unitName)
 	} else {
-		fmt.Fprintf(out, "note: %s is %s; nothing to disable\n", m.unitName, enabled)
+		return fmt.Errorf("%s enablement is %q; cannot confirm it is disabled before uninstall", m.unitName, stateName(enabled))
 	}
 	if err := os.Remove(m.unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if _, _, err := m.systemctl("daemon-reload"); err != nil {
-		return err
+	if err := m.systemctlSuccess("daemon-reload"); err != nil {
+		return fmt.Errorf("reloading systemd after removing %s: %w", m.unitName, err)
 	}
 	fmt.Fprintf(out, "Removed %s. Application configuration, conversations and data were preserved.\n", m.unitName)
 	return nil

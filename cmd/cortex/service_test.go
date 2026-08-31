@@ -27,10 +27,11 @@ type fakeRunner struct {
 
 func (f *fakeRunner) Run(name string, args ...string) (string, int, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
-	if f.handler != nil {
-		return f.handler(name, args...)
+	h := f.handler
+	f.mu.Unlock()
+	if h != nil {
+		return h(name, args...)
 	}
 	return f.out, f.code, f.err
 }
@@ -43,6 +44,20 @@ func (f *fakeRunner) Stream(name string, args ...string) (int, error) {
 func (f *fakeRunner) contains(args []string, s string) bool {
 	for _, a := range args {
 		if a == s {
+			return true
+		}
+	}
+	return false
+}
+
+// saw reports whether any previously recorded call contained needle. The
+// current call is excluded, so handlers can branch on prior steps (e.g. a
+// post-stop state query that must report inactive).
+func (f *fakeRunner) saw(needle string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls[:len(f.calls)-1] {
+		if strings.Contains(c, needle) {
 			return true
 		}
 	}
@@ -339,7 +354,21 @@ func TestUninstallFailClosed(t *testing.T) {
 		if err := m.install(opts, os.Stderr); err != nil {
 			t.Fatal(err)
 		}
-		fr.handler = activeHandler(fr)
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				if fr.saw("stop cortex.service") {
+					return "inactive", 3, nil
+				}
+				return "active", 0, nil
+			case fr.contains(args, "is-enabled"):
+				if fr.saw("disable cortex.service") {
+					return "disabled", 1, nil
+				}
+				return "enabled", 0, nil
+			}
+			return "", 0, nil
+		}
 		if err := m.uninstall(os.Stderr); err != nil {
 			t.Fatalf("uninstall: %v", err)
 		}
@@ -681,6 +710,308 @@ func TestRealCortexHealthAndStatusBoundary(t *testing.T) {
 	if err := m.status(os.Stderr, "1.0"); err != nil {
 		t.Fatalf("service status against the real Cortex health endpoint failed: %v", err)
 	}
+}
+
+func TestStrictExitFailures(t *testing.T) {
+	t.Run("install daemon-reload nonzero prevents enable and start", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "daemon-reload") {
+				return "Failed to reload", 1, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err == nil {
+			t.Fatal("install succeeded despite a failed daemon-reload")
+		}
+		joined := strings.Join(fr.calls, "\n")
+		if strings.Contains(joined, "enable cortex.service") || strings.Contains(joined, "start cortex.service") {
+			t.Fatalf("enable/start ran after a failed daemon-reload: %s", joined)
+		}
+	})
+	t.Run("install enable nonzero prevents start", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "enable") {
+				return "Failed to enable", 1, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err == nil {
+			t.Fatal("install succeeded despite a failed enable")
+		}
+		if strings.Contains(strings.Join(fr.calls, "\n"), "start cortex.service") {
+			t.Fatal("start ran after a failed enable")
+		}
+	})
+	t.Run("install start nonzero reports failure", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "start") {
+				return "Failed to start", 1, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err == nil {
+			t.Fatal("install succeeded despite a failed start")
+		}
+	})
+	t.Run("lifecycle start/stop/restart nonzero reports failure", func(t *testing.T) {
+		for _, verb := range []string{"start", "stop", "restart"} {
+			m, fr, _ := newFakeManager(t)
+			if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+				t.Fatal(err)
+			}
+			fr.calls = nil
+			fr.handler = func(name string, args ...string) (string, int, error) {
+				if fr.contains(args, verb) {
+					return "Failed", 1, nil
+				}
+				return "", 0, nil
+			}
+			if err := m.action(verb, os.Stderr); err == nil {
+				t.Fatalf("%s succeeded despite a nonzero exit", verb)
+			}
+		}
+	})
+	t.Run("uninstall stop nonzero preserves the unit", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.calls = nil
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "active", 0, nil
+			case fr.contains(args, "stop"):
+				return "Failed to stop", 1, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.uninstall(os.Stderr); err == nil {
+			t.Fatal("uninstall succeeded despite a failed stop")
+		}
+		if _, err := os.Stat(m.unitPath); err != nil {
+			t.Fatalf("unit removed despite stop failure: %v", err)
+		}
+		joined := strings.Join(fr.calls, "\n")
+		if strings.Contains(joined, "disable cortex.service") || strings.Contains(joined, "daemon-reload") {
+			t.Fatalf("disable/reload ran after a failed stop: %s", joined)
+		}
+	})
+	t.Run("uninstall disable nonzero preserves the unit", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.calls = nil
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "inactive", 3, nil
+			case fr.contains(args, "is-enabled"):
+				return "enabled", 0, nil
+			case fr.contains(args, "disable"):
+				return "Failed to disable", 1, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.uninstall(os.Stderr); err == nil {
+			t.Fatal("uninstall succeeded despite a failed disable")
+		}
+		if _, err := os.Stat(m.unitPath); err != nil {
+			t.Fatalf("unit removed despite disable failure: %v", err)
+		}
+		if strings.Contains(strings.Join(fr.calls, "\n"), "daemon-reload") {
+			t.Fatal("daemon-reload ran after a failed disable")
+		}
+	})
+	t.Run("final daemon-reload nonzero is reported", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.calls = nil
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "inactive", 3, nil
+			case fr.contains(args, "is-enabled"):
+				return "disabled", 1, nil
+			case fr.contains(args, "daemon-reload"):
+				return "Failed to reload", 1, nil
+			}
+			return "", 0, nil
+		}
+		err := m.uninstall(os.Stderr)
+		if err == nil {
+			t.Fatal("uninstall did not report the daemon-reload failure")
+		}
+		if !strings.Contains(err.Error(), "reloading systemd") {
+			t.Fatalf("daemon-reload failure not reported accurately: %v", err)
+		}
+	})
+	t.Run("logs reports nonzero journalctl", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if name == "journalctl" {
+				return "no journal found", 1, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.logs(false, os.Stderr); err == nil {
+			t.Fatal("logs ignored a nonzero journalctl exit")
+		}
+	})
+}
+
+func stateTestManager(t *testing.T, activeOut string, activeCode int, enabledOut string, enabledCode int) (*serviceManager, *fakeRunner) {
+	t.Helper()
+	m, fr, _ := newFakeManager(t)
+	fr.handler = func(name string, args ...string) (string, int, error) {
+		switch {
+		case fr.contains(args, "is-active"):
+			return activeOut, activeCode, nil
+		case fr.contains(args, "is-enabled"):
+			return enabledOut, enabledCode, nil
+		}
+		return "", 0, nil
+	}
+	return m, fr
+}
+
+func TestStateExitValidation(t *testing.T) {
+	valid := []struct {
+		verb, out string
+		code      int
+		want      svcState
+	}{
+		{"is-active", "active", 0, stateActive},
+		{"is-active", "inactive", 3, stateInactive},
+		{"is-active", "dead", 3, stateInactive},
+		{"is-active", "failed", 3, stateInactive},
+		{"is-active", "activating", 3, stateTransition},
+		{"is-active", "deactivating", 3, stateTransition},
+		{"is-active", "reloading", 3, stateTransition},
+		{"is-active", "unknown", 3, stateUnknown},
+		{"is-active", "not-found", 3, stateUnknown},
+		{"is-enabled", "enabled", 0, stateEnabled},
+		{"is-enabled", "disabled", 1, stateDisabled},
+		{"is-enabled", "static", 2, stateDisabled},
+		{"is-enabled", "not-found", 4, stateDisabled},
+	}
+	for _, tc := range valid {
+		m, _ := stateTestManager(t, tc.out, tc.code, tc.out, tc.code)
+		got, err := m.queryState(tc.verb)
+		if err != nil {
+			t.Fatalf("%s %q exit %d: unexpected error %v", tc.verb, tc.out, tc.code, err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s %q exit %d = %q want %q", tc.verb, tc.out, tc.code, got, tc.want)
+		}
+	}
+	invalid := []struct {
+		verb, out string
+		code      int
+	}{
+		{"is-active", "active", 3},
+		{"is-active", "inactive", 0},
+		{"is-active", "failed", 0},
+		{"is-enabled", "enabled", 1},
+		{"is-enabled", "disabled", 0},
+	}
+	for _, tc := range invalid {
+		m, _ := stateTestManager(t, tc.out, tc.code, tc.out, tc.code)
+		if _, err := m.queryState(tc.verb); err == nil {
+			t.Fatalf("%s %q exit %d should be rejected as inconsistent", tc.verb, tc.out, tc.code)
+		}
+	}
+}
+
+func TestTransitionalUninstall(t *testing.T) {
+	for _, state := range []string{"activating", "deactivating", "reloading"} {
+		t.Run(state, func(t *testing.T) {
+			m, fr, _ := newFakeManager(t)
+			if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+				t.Fatal(err)
+			}
+			fr.calls = nil
+			fr.handler = func(name string, args ...string) (string, int, error) {
+				switch {
+				case fr.contains(args, "is-active"):
+					if fr.saw("stop cortex.service") {
+						return "inactive", 3, nil
+					}
+					return state, 3, nil
+				case fr.contains(args, "is-enabled"):
+					return "disabled", 1, nil
+				}
+				return "", 0, nil
+			}
+			if err := m.uninstall(os.Stderr); err != nil {
+				t.Fatalf("uninstall of a %s service failed: %v", state, err)
+			}
+			if _, err := os.Stat(m.unitPath); !os.IsNotExist(err) {
+				t.Fatal("unit still present after uninstall")
+			}
+			joined := strings.Join(fr.calls, "\n")
+			if !strings.Contains(joined, "stop cortex.service") {
+				t.Fatalf("%s service was not stopped before removal: %s", state, joined)
+			}
+		})
+	}
+	t.Run("stop succeeds but service still active preserves unit", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.calls = nil
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "active", 0, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.uninstall(os.Stderr); err == nil {
+			t.Fatal("uninstall succeeded even though the service stayed active")
+		}
+		if _, err := os.Stat(m.unitPath); err != nil {
+			t.Fatalf("unit removed despite the service still being active: %v", err)
+		}
+		if strings.Contains(strings.Join(fr.calls, "\n"), "daemon-reload") {
+			t.Fatal("daemon-reload ran although the service was not safely stopped")
+		}
+	})
+	t.Run("disable succeeds but service still enabled preserves unit", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.calls = nil
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "inactive", 3, nil
+			case fr.contains(args, "is-enabled"):
+				return "enabled", 0, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.uninstall(os.Stderr); err == nil {
+			t.Fatal("uninstall succeeded even though the service stayed enabled")
+		}
+		if _, err := os.Stat(m.unitPath); err != nil {
+			t.Fatalf("unit removed despite the service still being enabled: %v", err)
+		}
+		if strings.Contains(strings.Join(fr.calls, "\n"), "daemon-reload") {
+			t.Fatal("daemon-reload ran although the service was not safely disabled")
+		}
+	})
 }
 
 func TestRunServiceDispatchErrors(t *testing.T) {
