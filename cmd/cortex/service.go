@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -107,69 +108,89 @@ func (m *serviceManager) systemctl(args ...string) (string, int, error) {
 	return m.run.Run("systemctl", append([]string{"--user"}, args...)...)
 }
 
-// svcState is a deliberately resolved systemd state category. It preserves
-// enough information to distinguish definitely-active, reloading,
-// transitional, safely-stopped, unknown, enabled, disabled and masked states
-// so uninstall can fail closed correctly.
+// svcState is a deliberately resolved systemd state category that separates
+// command-result validation from the lifecycle meaning uninstall needs:
+// definitely running, reloading, refreshing, transitioning, safely-stopped,
+// unknown, enabled, not-enabled and masked.
 type svcState string
 
 const (
 	stateActive     svcState = "active"
 	stateReloading  svcState = "reloading"
+	stateRefreshing svcState = "refreshing"
 	stateTransition svcState = "transitioning"
 	stateInactive   svcState = "inactive"
 	stateUnknown    svcState = "unknown"
 	stateEnabled    svcState = "enabled"
-	stateDisabled   svcState = "disabled"
+	stateNotEnabled svcState = "not-enabled"
 	stateMasked     svcState = "masked"
 )
 
 func stateName(s svcState) string { return string(s) }
 
-// classifyActive maps an is-active output word to a state category and whether
-// that state requires exit 0. This follows systemd's documented contract
-// (systemctl-is-active.c, v252): only active and reloading are considered
-// "active" (exit 0); every other state exits 3.
-func classifyActive(word string) (svcState, bool, bool) {
+// exitExpect describes how strongly an output word's exit code is fixed by the
+// systemd contract across the supported range (systemd 252 through current).
+type exitExpect int
+
+const (
+	exitZero     exitExpect = iota // the state must exit 0
+	exitNonzero                    // the state must exit nonzero
+	exitEither                     // the exit code varies across versions
+)
+
+// classifyActive maps an is-active output word to a lifecycle category and its
+// exit expectation. Per systemctl-is-active.c: only active and reloading are
+// exit 0 in systemd 252-256; refreshing joins them at exit 0 in systemd 257+.
+// Inactive, failed, activating, deactivating and maintenance exit 3; not-found
+// exits 3 (<=254) or 4 (>=255).
+func classifyActive(word string) (svcState, exitExpect, bool) {
 	switch word {
 	case "active":
-		return stateActive, true, true
+		return stateActive, exitZero, true
 	case "reloading":
-		return stateReloading, true, true
+		return stateReloading, exitZero, true
+	case "refreshing":
+		return stateRefreshing, exitEither, true
 	case "inactive", "dead", "failed":
-		return stateInactive, false, true
-	case "activating", "deactivating", "maintenance", "refreshing":
-		return stateTransition, false, true
-	case "unknown", "not-found":
-		return stateUnknown, false, true
+		return stateInactive, exitNonzero, true
+	case "activating", "deactivating", "maintenance":
+		return stateTransition, exitNonzero, true
+	case "not-found", "unknown":
+		// not-found exits 3 (<=254) or 4 (>=255); both are nonzero.
+		return stateUnknown, exitNonzero, true
 	}
-	return "", false, false
+	return "", 0, false
 }
 
-// classifyEnabled maps an is-enabled output word to a state category and
-// whether that state requires exit 0. This follows systemd's documented
-// contract (systemctl-is-enabled.c, v252): enabled, enabled-runtime, static,
-// alias, indirect and generated are considered "enabled" (exit 0); disabled,
-// linked, linked-runtime, transient and not-found are not enabled (exit 1);
-// masked and masked-runtime are distinct not-enabled states that cannot start.
-func classifyEnabled(word string) (svcState, bool, bool) {
+// classifyEnabled maps an is-enabled output word to a lifecycle category and
+// its exit expectation. Per systemctl-is-enabled.c, enabled, enabled-runtime,
+// static, alias, indirect and generated exit 0, but only enabled and
+// enabled-runtime have enablement links that `systemctl disable` removes; the
+// others are lifecycle not-enabled. Disabled, linked, linked-runtime,
+// transient, masked, masked-runtime and not-found exit nonzero (not-found 4).
+func classifyEnabled(word string) (svcState, exitExpect, bool) {
 	switch word {
-	case "enabled", "enabled-runtime", "static", "alias", "indirect", "generated":
-		return stateEnabled, true, true
-	case "disabled", "linked", "linked-runtime", "transient", "not-found":
-		return stateDisabled, false, true
+	case "enabled", "enabled-runtime":
+		return stateEnabled, exitZero, true
+	case "static", "alias", "indirect", "generated":
+		return stateNotEnabled, exitZero, true
+	case "disabled", "linked", "linked-runtime", "transient":
+		return stateNotEnabled, exitNonzero, true
 	case "masked", "masked-runtime":
-		return stateMasked, false, true
+		return stateMasked, exitNonzero, true
+	case "not-found":
+		return stateNotEnabled, exitNonzero, true
 	case "unknown":
-		return stateUnknown, false, true
+		return stateUnknown, exitNonzero, true
 	}
-	return "", false, false
+	return "", 0, false
 }
 
-// queryState resolves an is-active or is-enabled state and validates the
-// output/exit pair together: positive states require exit 0, negative states
-// require a documented nonzero exit, launch failures surface as errors, and
-// inconsistent or unrecognized pairs surface as errors.
+// queryState resolves an is-active or is-enabled state, validating the
+// output/exit pair against the supported systemd contract: exit-0 states must
+// exit 0, exit-nonzero states must exit nonzero, and version-varying states
+// accept either. Launch failures, unrecognized output and inconsistent pairs
+// surface as errors.
 func (m *serviceManager) queryState(verb string) (svcState, error) {
 	out, code, err := m.systemctl(verb, m.unitName)
 	if err != nil {
@@ -177,22 +198,26 @@ func (m *serviceManager) queryState(verb string) (svcState, error) {
 	}
 	word := strings.TrimSpace(out)
 	var st svcState
-	var needZero bool
+	var expect exitExpect
 	var ok bool
 	switch verb {
 	case "is-active":
-		st, needZero, ok = classifyActive(word)
+		st, expect, ok = classifyActive(word)
 	case "is-enabled":
-		st, needZero, ok = classifyEnabled(word)
+		st, expect, ok = classifyEnabled(word)
 	}
 	if !ok {
 		return "", fmt.Errorf("systemctl %s %s returned unrecognized state %q (exit %d)", verb, m.unitName, word, code)
 	}
-	if needZero && code != 0 {
-		return "", fmt.Errorf("systemctl %s %s reported %q but exited %d; inconsistent state result", verb, m.unitName, word, code)
-	}
-	if !needZero && code == 0 {
-		return "", fmt.Errorf("systemctl %s %s reported %q but exited 0; inconsistent state result", verb, m.unitName, word)
+	switch expect {
+	case exitZero:
+		if code != 0 {
+			return "", fmt.Errorf("systemctl %s %s reported %q but exited %d; inconsistent state result", verb, m.unitName, word, code)
+		}
+	case exitNonzero:
+		if code == 0 {
+			return "", fmt.Errorf("systemctl %s %s reported %q but exited 0; inconsistent state result", verb, m.unitName, word)
+		}
 	}
 	return st, nil
 }
@@ -593,44 +618,62 @@ func (m *serviceManager) logs(follow bool, out io.Writer) error {
 	return nil
 }
 
-// restoreUnitFile writes the original managed unit back after a failed final
-// daemon-reload. O_EXCL ensures a concurrently created replacement is never
-// overwritten; the original permissions are preserved.
-func restoreUnitFile(path string, data []byte, mode os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
-	if err != nil {
+func syncDir(dir string) {
+	if f, err := os.Open(dir); err == nil {
+		_ = f.Sync()
+		_ = f.Close()
+	}
+}
+
+func unitBackupSuffix() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// backupManagedUnit atomically renames the managed unit to a unique hidden
+// backup name in the same directory. The name never ends in ".service", so
+// systemd ignores it. The original inode is preserved by the rename.
+func backupManagedUnit(path string) (string, error) {
+	dir := filepath.Dir(path)
+	backup := filepath.Join(dir, "."+filepath.Base(path)+".unit-backup-"+unitBackupSuffix())
+	if err := os.Rename(path, backup); err != nil {
+		return "", err
+	}
+	syncDir(dir)
+	return backup, nil
+}
+
+// restoreFromBackup atomically restores the managed unit at its original path
+// after a failed final daemon-reload. It uses a hard link so a concurrently
+// created replacement is never overwritten; on conflict the backup is retained
+// at its recovery path and that path is reported.
+func restoreFromBackup(orig, backup string) error {
+	if err := os.Link(backup, orig); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("refusing to overwrite a concurrently created unit at %s", path)
+			return fmt.Errorf("refusing to overwrite a concurrently created unit at %s; the original unit is preserved at %s", orig, backup)
 		}
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
+	if err := os.Remove(backup); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return f.Close()
+	syncDir(filepath.Dir(orig))
+	return nil
 }
 
 func (m *serviceManager) uninstall(out io.Writer) error {
-	data, err := os.ReadFile(m.unitPath)
-	if err != nil {
+	if _, err := readManagedUnit(m.unitPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("%s is not installed", m.unitName)
 		}
-		return err
-	}
-	if _, err := readManagedUnit(m.unitPath); err != nil {
 		return fmt.Errorf("refusing to uninstall %s: %w", m.unitName, err)
-	}
-	info, err := os.Stat(m.unitPath)
-	if err != nil {
-		return err
 	}
 	active, err := m.queryState("is-active")
 	if err != nil {
 		return fmt.Errorf("cannot determine %s state before uninstall: %w", m.unitName, err)
 	}
-	if active == stateActive || active == stateReloading || active == stateTransition {
+	if active == stateActive || active == stateReloading || active == stateRefreshing || active == stateTransition {
 		if err := m.systemctlSuccess("stop", m.unitName); err != nil {
 			return fmt.Errorf("stop %s failed: %w", m.unitName, err)
 		}
@@ -658,24 +701,34 @@ func (m *serviceManager) uninstall(out io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("cannot verify %s disabled after disable: %w", m.unitName, err)
 		}
-		if after != stateDisabled && after != stateMasked {
+		if after != stateNotEnabled && after != stateMasked {
 			return fmt.Errorf("%s still reports %q after disable; not removing the unit", m.unitName, stateName(after))
 		}
-	} else if enabled == stateDisabled || enabled == stateMasked {
+	} else if enabled == stateNotEnabled || enabled == stateMasked {
 		fmt.Fprintf(out, "note: %s is %s; nothing to disable\n", m.unitName, stateName(enabled))
 	} else {
 		return fmt.Errorf("%s enablement is %q; cannot confirm it is disabled before uninstall", m.unitName, stateName(enabled))
 	}
-	if err := os.Remove(m.unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	// Move the managed unit aside, then reload: on failure the original inode
+	// is atomically restored, so no partial managed file can ever exist at the
+	// managed path.
+	backup, err := backupManagedUnit(m.unitPath)
+	if err != nil {
+		return fmt.Errorf("cannot move %s aside for uninstall: %w", m.unitName, err)
 	}
 	if err := m.systemctlSuccess("daemon-reload"); err != nil {
-		if restoreErr := restoreUnitFile(m.unitPath, data, info.Mode()); restoreErr != nil {
+		if restoreErr := restoreFromBackup(m.unitPath, backup); restoreErr != nil {
 			return fmt.Errorf("reloading systemd after removing %s: %w; additionally failed to restore the unit: %v", m.unitName, err, restoreErr)
 		}
-		_ = m.systemctlSuccess("daemon-reload") // best-effort reload after restoring the unit
+		if reloadErr := m.systemctlSuccess("daemon-reload"); reloadErr != nil {
+			return fmt.Errorf("reloading systemd after removing %s: %w; the managed unit was restored but the follow-up reload also failed: %v", m.unitName, err, reloadErr)
+		}
 		return fmt.Errorf("reloading systemd after removing %s: %w; the managed unit was restored", m.unitName, err)
 	}
+	if err := os.Remove(backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	syncDir(filepath.Dir(m.unitPath))
 	fmt.Fprintf(out, "Removed %s. Application configuration, conversations and data were preserved.\n", m.unitName)
 	return nil
 }

@@ -890,30 +890,35 @@ func TestStateExitValidation(t *testing.T) {
 		code      int
 		want      svcState
 	}{
-		// systemctl is-active (v252): only active and reloading are exit 0.
+		// is-active exit-0 states: active and reloading (v252-256), plus
+		// refreshing from v257; refreshing accepts either exit.
 		{"is-active", "active", 0, stateActive},
 		{"is-active", "reloading", 0, stateReloading},
+		{"is-active", "refreshing", 0, stateRefreshing},
+		{"is-active", "refreshing", 3, stateRefreshing},
 		{"is-active", "inactive", 3, stateInactive},
 		{"is-active", "dead", 3, stateInactive},
 		{"is-active", "failed", 3, stateInactive},
 		{"is-active", "activating", 3, stateTransition},
 		{"is-active", "deactivating", 3, stateTransition},
 		{"is-active", "maintenance", 3, stateTransition},
-		{"is-active", "refreshing", 3, stateTransition},
 		{"is-active", "unknown", 3, stateUnknown},
 		{"is-active", "not-found", 3, stateUnknown},
-		// systemctl is-enabled (v252): enabled-family states exit 0.
+		{"is-active", "not-found", 4, stateUnknown},
+		// is-enabled: only enabled/enabled-runtime are lifecycle enabled.
 		{"is-enabled", "enabled", 0, stateEnabled},
 		{"is-enabled", "enabled-runtime", 0, stateEnabled},
-		{"is-enabled", "static", 0, stateEnabled},
-		{"is-enabled", "alias", 0, stateEnabled},
-		{"is-enabled", "indirect", 0, stateEnabled},
-		{"is-enabled", "generated", 0, stateEnabled},
-		{"is-enabled", "disabled", 1, stateDisabled},
-		{"is-enabled", "linked", 1, stateDisabled},
-		{"is-enabled", "linked-runtime", 1, stateDisabled},
-		{"is-enabled", "transient", 1, stateDisabled},
-		{"is-enabled", "not-found", 4, stateDisabled},
+		// static/alias/indirect/generated exit 0 but are lifecycle not-enabled.
+		{"is-enabled", "static", 0, stateNotEnabled},
+		{"is-enabled", "alias", 0, stateNotEnabled},
+		{"is-enabled", "indirect", 0, stateNotEnabled},
+		{"is-enabled", "generated", 0, stateNotEnabled},
+		{"is-enabled", "disabled", 1, stateNotEnabled},
+		{"is-enabled", "linked", 1, stateNotEnabled},
+		{"is-enabled", "linked-runtime", 1, stateNotEnabled},
+		{"is-enabled", "transient", 1, stateNotEnabled},
+		{"is-enabled", "not-found", 4, stateNotEnabled},
+		{"is-enabled", "not-found", 1, stateNotEnabled},
 		{"is-enabled", "masked", 1, stateMasked},
 		{"is-enabled", "masked-runtime", 1, stateMasked},
 	}
@@ -937,12 +942,18 @@ func TestStateExitValidation(t *testing.T) {
 		{"is-active", "dead", 0},
 		{"is-active", "failed", 0},
 		{"is-active", "activating", 0},
+		{"is-active", "maintenance", 0},
 		{"is-active", "unknown", 0},
+		{"is-active", "not-found", 0},
 		{"is-enabled", "enabled", 1},
+		{"is-enabled", "enabled-runtime", 1},
 		{"is-enabled", "static", 1},
 		{"is-enabled", "alias", 1},
+		{"is-enabled", "indirect", 1},
+		{"is-enabled", "generated", 1},
 		{"is-enabled", "disabled", 0},
 		{"is-enabled", "linked", 0},
+		{"is-enabled", "transient", 0},
 		{"is-enabled", "masked", 0},
 	}
 	for _, tc := range invalid {
@@ -1080,8 +1091,116 @@ func TestDisableVerificationFailsClosed(t *testing.T) {
 	}
 }
 
+func TestIsEnabledUninstallPolicy(t *testing.T) {
+	cases := []struct {
+		state string
+		code  int
+		want  svcState
+	}{
+		{"enabled", 0, stateEnabled},
+		{"enabled-runtime", 0, stateEnabled},
+		{"static", 0, stateNotEnabled},
+		{"alias", 0, stateNotEnabled},
+		{"indirect", 0, stateNotEnabled},
+		{"generated", 0, stateNotEnabled},
+		{"disabled", 1, stateNotEnabled},
+		{"linked", 1, stateNotEnabled},
+		{"linked-runtime", 1, stateNotEnabled},
+		{"transient", 1, stateNotEnabled},
+		{"not-found", 4, stateNotEnabled},
+		{"masked", 1, stateMasked},
+		{"masked-runtime", 1, stateMasked},
+		{"unknown", 1, stateUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			m, fr, _ := newFakeManager(t)
+			if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+				t.Fatal(err)
+			}
+			fr.calls = nil
+			fr.handler = func(name string, args ...string) (string, int, error) {
+				switch {
+				case fr.contains(args, "is-active"):
+					return "inactive", 3, nil
+				case fr.contains(args, "is-enabled"):
+					if fr.saw("disable cortex.service") {
+						return "disabled", 1, nil
+					}
+					return tc.state, tc.code, nil
+				}
+				return "", 0, nil
+			}
+			err := m.uninstall(os.Stderr)
+			joined := strings.Join(fr.calls, "\n")
+			disabled := strings.Contains(joined, "disable cortex.service")
+			if tc.want == stateEnabled {
+				if !disabled {
+					t.Fatalf("%s should invoke disable", tc.state)
+				}
+			} else if disabled {
+				t.Fatalf("%s must not invoke disable", tc.state)
+			}
+			if tc.want == stateUnknown {
+				if err == nil {
+					t.Fatalf("%s should fail closed", tc.state)
+				}
+				if _, serr := os.Stat(m.unitPath); serr != nil {
+					t.Fatalf("unit removed for unknown enablement %s: %v", tc.state, serr)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("uninstall for %s failed: %v", tc.state, err)
+				}
+				if _, serr := os.Stat(m.unitPath); !os.IsNotExist(serr) {
+					t.Fatalf("unit not removed for %s", tc.state)
+				}
+			}
+		})
+	}
+}
+
 func TestUninstallRollback(t *testing.T) {
-	t.Run("reload failure restores the unit byte-for-byte", func(t *testing.T) {
+	backupFiles := func(dir string) []string {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return nil
+		}
+		var out []string
+		for _, e := range ents {
+			if strings.HasPrefix(e.Name(), ".cortex.service.unit-backup-") {
+				out = append(out, e.Name())
+			}
+		}
+		return out
+	}
+
+	t.Run("success removes the unit and leaves no backup artifacts", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "inactive", 3, nil
+			case fr.contains(args, "is-enabled"):
+				return "disabled", 1, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.uninstall(os.Stderr); err != nil {
+			t.Fatalf("uninstall: %v", err)
+		}
+		if _, err := os.Stat(m.unitPath); !os.IsNotExist(err) {
+			t.Fatal("unit still present after uninstall")
+		}
+		if len(backupFiles(filepath.Dir(m.unitPath))) != 0 {
+			t.Fatal("backup artifacts remain after a successful uninstall")
+		}
+	})
+
+	t.Run("reload failure restores the original unit and removes the backup", func(t *testing.T) {
 		m, fr, base := newFakeManager(t)
 		dataDir := filepath.Join(base, "data")
 		if err := os.MkdirAll(dataDir, 0700); err != nil {
@@ -1096,7 +1215,9 @@ func TestUninstallRollback(t *testing.T) {
 			t.Fatal(err)
 		}
 		orig, _ := os.ReadFile(m.unitPath)
+		origInfo, _ := os.Stat(m.unitPath)
 		fr.calls = nil
+		reloadCalls := 0
 		fr.handler = func(name string, args ...string) (string, int, error) {
 			switch {
 			case fr.contains(args, "is-active"):
@@ -1104,7 +1225,11 @@ func TestUninstallRollback(t *testing.T) {
 			case fr.contains(args, "is-enabled"):
 				return "disabled", 1, nil
 			case fr.contains(args, "daemon-reload"):
-				return "Failed to reload", 1, nil
+				reloadCalls++
+				if reloadCalls == 1 {
+					return "Failed to reload", 1, nil
+				}
+				return "", 0, nil // best-effort follow-up reload succeeds
 			}
 			return "", 0, nil
 		}
@@ -1119,15 +1244,24 @@ func TestUninstallRollback(t *testing.T) {
 		if string(got) != string(orig) {
 			t.Fatal("restored unit does not match the original byte-for-byte")
 		}
+		gotInfo, _ := os.Stat(m.unitPath)
+		if !os.SameFile(origInfo, gotInfo) {
+			t.Fatal("restored unit is not the original inode")
+		}
+		if len(backupFiles(filepath.Dir(m.unitPath))) != 0 {
+			t.Fatal("backup artifacts remain after restoration")
+		}
 		if _, err := os.Stat(filepath.Join(dataDir, "conversations.db")); err != nil {
 			t.Fatalf("data was lost during rollback: %v", err)
 		}
 	})
-	t.Run("restoration cannot overwrite a concurrently created file", func(t *testing.T) {
+
+	t.Run("concurrent replacement is preserved and the backup is recoverable", func(t *testing.T) {
 		m, fr, _ := newFakeManager(t)
 		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
 			t.Fatal(err)
 		}
+		orig, _ := os.ReadFile(m.unitPath)
 		fr.calls = nil
 		fr.handler = func(name string, args ...string) (string, int, error) {
 			switch {
@@ -1146,12 +1280,48 @@ func TestUninstallRollback(t *testing.T) {
 		if err == nil {
 			t.Fatal("uninstall did not report the reload failure")
 		}
-		if !strings.Contains(err.Error(), "additionally failed to restore") || !strings.Contains(err.Error(), "concurrently created") {
-			t.Fatalf("restoration failure not reported clearly: %v", err)
+		if !strings.Contains(err.Error(), "concurrently created") || !strings.Contains(err.Error(), "preserved at") {
+			t.Fatalf("restoration conflict not reported clearly: %v", err)
 		}
 		got, _ := os.ReadFile(m.unitPath)
 		if string(got) != "# replacement\n" {
 			t.Fatalf("concurrently created file was overwritten: %q", got)
+		}
+		backs := backupFiles(filepath.Dir(m.unitPath))
+		if len(backs) != 1 {
+			t.Fatalf("expected exactly one retained backup, got %v", backs)
+		}
+		recovered, _ := os.ReadFile(filepath.Join(filepath.Dir(m.unitPath), backs[0]))
+		if string(recovered) != string(orig) {
+			t.Fatal("retained backup does not contain the original unit")
+		}
+		if !strings.Contains(err.Error(), backs[0]) {
+			t.Fatalf("reported recovery path does not match the retained backup: %v", err)
+		}
+	})
+
+	t.Run("second reload failure is surfaced after restoration", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "inactive", 3, nil
+			case fr.contains(args, "is-enabled"):
+				return "disabled", 1, nil
+			case fr.contains(args, "daemon-reload"):
+				return "Failed to reload", 1, nil
+			}
+			return "", 0, nil
+		}
+		err := m.uninstall(os.Stderr)
+		if err == nil {
+			t.Fatal("uninstall did not report the reload failure")
+		}
+		if !strings.Contains(err.Error(), "follow-up reload also failed") {
+			t.Fatalf("second reload failure not surfaced: %v", err)
 		}
 	})
 }
