@@ -1326,6 +1326,85 @@ func TestUninstallRollback(t *testing.T) {
 	})
 }
 
+func TestBackupManagedUnitNoReplace(t *testing.T) {
+	dirEntries := func(dir string) []string {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return nil
+		}
+		var out []string
+		for _, e := range ents {
+			out = append(out, e.Name())
+		}
+		return out
+	}
+
+	t.Run("random source failure leaves the original intact", func(t *testing.T) {
+		orig := randomSuffix
+		randomSuffix = func() (string, error) { return "", errors.New("rand failed") }
+		t.Cleanup(func() { randomSuffix = orig })
+		dir := t.TempDir()
+		unit := filepath.Join(dir, "app.service")
+		if err := os.WriteFile(unit, []byte("unit"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := backupManagedUnit(unit); err == nil {
+			t.Fatal("random-source failure should error")
+		}
+		if got, _ := os.ReadFile(unit); string(got) != "unit" {
+			t.Fatalf("original changed: %q", got)
+		}
+		if entries := dirEntries(dir); len(entries) != 1 {
+			t.Fatalf("unexpected entries after failure: %v", entries)
+		}
+	})
+
+	t.Run("collision never overwrites a retained backup", func(t *testing.T) {
+		orig := randomSuffix
+		randomSuffix = func() (string, error) { return "aa", nil }
+		t.Cleanup(func() { randomSuffix = orig })
+		dir := t.TempDir()
+		unit := filepath.Join(dir, "app.service")
+		retained := filepath.Join(dir, ".app.service.unit-backup-aa")
+		if err := os.WriteFile(unit, []byte("unit"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(retained, []byte("retained"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := backupManagedUnit(unit); err == nil {
+			t.Fatal("all candidates collided; should error")
+		}
+		if got, _ := os.ReadFile(retained); string(got) != "retained" {
+			t.Fatalf("retained backup was overwritten: %q", got)
+		}
+		if got, _ := os.ReadFile(unit); string(got) != "unit" {
+			t.Fatalf("original changed: %q", got)
+		}
+	})
+
+	t.Run("unlink failure aborts and leaves no artifact", func(t *testing.T) {
+		origSuffix, origRemove := randomSuffix, removeFile
+		randomSuffix = func() (string, error) { return "bb", nil }
+		removeFile = func(p string) error { return errors.New("remove failed") }
+		t.Cleanup(func() { randomSuffix, removeFile = origSuffix, origRemove })
+		dir := t.TempDir()
+		unit := filepath.Join(dir, "app.service")
+		if err := os.WriteFile(unit, []byte("unit"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := backupManagedUnit(unit); err == nil {
+			t.Fatal("unlink failure should error")
+		}
+		if got, _ := os.ReadFile(unit); string(got) != "unit" {
+			t.Fatalf("original changed: %q", got)
+		}
+		if entries := dirEntries(dir); len(entries) != 1 {
+			t.Fatalf("backup artifact left after aborted transaction: %v", entries)
+		}
+	})
+}
+
 func TestRunServiceDispatchErrors(t *testing.T) {
 	if code := runService([]string{"--system", "install"}, version); code == 0 {
 		t.Fatal("--system mode should be rejected")

@@ -625,23 +625,45 @@ func syncDir(dir string) {
 	}
 }
 
-func unitBackupSuffix() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
+var (
+	linkFile = os.Link
+	removeFile = os.Remove
+	randomSuffix = func() (string, error) {
+		b := make([]byte, 8)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(b), nil
+	}
+)
 
-// backupManagedUnit atomically renames the managed unit to a unique hidden
-// backup name in the same directory. The name never ends in ".service", so
-// systemd ignores it. The original inode is preserved by the rename.
+// backupManagedUnit moves the managed unit aside to a unique hidden backup name
+// in the same directory. It uses an exclusive hard link so an existing retained
+// backup is never overwritten; the original is unlinked only after the backup
+// link exists, and on any failure the original stays intact with no backup
+// artifact left behind.
 func backupManagedUnit(path string) (string, error) {
 	dir := filepath.Dir(path)
-	backup := filepath.Join(dir, "."+filepath.Base(path)+".unit-backup-"+unitBackupSuffix())
-	if err := os.Rename(path, backup); err != nil {
-		return "", err
+	for i := 0; i < 32; i++ {
+		suffix, err := randomSuffix()
+		if err != nil {
+			return "", fmt.Errorf("cannot generate a backup name: %w", err)
+		}
+		backup := filepath.Join(dir, "."+filepath.Base(path)+".unit-backup-"+suffix)
+		if err := linkFile(path, backup); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue // candidate already exists; try another name
+			}
+			return "", err
+		}
+		if err := removeFile(path); err != nil {
+			_ = os.Remove(backup)
+			return "", fmt.Errorf("cannot remove the original after backing it up: %w", err)
+		}
+		syncDir(dir)
+		return backup, nil
 	}
-	syncDir(dir)
-	return backup, nil
+	return "", errors.New("could not allocate a unique backup name")
 }
 
 // restoreFromBackup atomically restores the managed unit at its original path
