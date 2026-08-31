@@ -33,11 +33,12 @@ function byClass(node,cls,out=[]){
 function flatText(node){
   const parts=[];
   const walk=n=>{
-    if(n._text!=='')parts.push(n._text);
+    const t=n.textContent;
+    if(t!=='')parts.push(t);
     for(const c of n.children||[])walk(c);
   };
   walk(node);
-  return parts.join('|');
+  return parts.join('');
 }
 const src=fs.readFileSync('content/assets/js/script.js','utf8');
 
@@ -61,22 +62,22 @@ const ctx=load(src,'function isToolEventText','function renderFeed');
   if(!flat.includes('foo_bar')||!flat.includes('my_var')||!flat.includes('__init__'))throw new Error('underscore identifiers not preserved');
 }
 
-// 3. Quoted-string highlighting (escaped-aware).
+// 3. Quoted-string highlighting (escaped-aware; single quotes need a preceding space).
 {
   const cases=[
     ['"this should be highlighted"','"this should be highlighted"'],
-    ["'as should this'","'as should this'"],
-    ["'that\\'s counted too'","'that\\'s counted too'"],
+    ["Value: 'as should this'","'as should this'"],
+    ["Value: 'that\\'s counted too'","'that\\'s counted too'"],
     ['"say \\"hello\\""','"say \\"hello\\""'],       // one double-quoted string with escaped quotes
-    ["'C:\\Users\\Nick'","'C:\\Users\\Nick'"],
-    ['"single quote \' inside double quotes"',"\"single quote ' inside double quotes\""],
-    ["'double quote \" inside single quotes'","'double quote \" inside single quotes'"],
+    ["Path: 'C:\\Users\\Nick'","'C:\\Users\\Nick'"],
+    ['"single quote \' inside double quotes"','"single quote \' inside double quotes"'],
+    ["Value: 'double quote \" inside single quotes'","'double quote \" inside single quotes'"],
   ];
-  for(const [text] of cases){
+  for(const [text,want] of cases){
     const row=new Node('div');
     ctx.renderMarkdown(row,text);
     const quotes=byClass(row,'md-quote');
-    if(quotes.length!==1||quotes[0].textContent!==text)throw new Error('quote mismatch for '+JSON.stringify(text)+' got '+quotes.length+' spans');
+    if(quotes.length!==1||quotes[0].textContent!==want)throw new Error('quote mismatch for '+JSON.stringify(text)+' got '+quotes.length+' spans');
   }
   // Unterminated strings stay unhighlighted.
   {
@@ -89,6 +90,31 @@ const ctx=load(src,'function isToolEventText','function renderFeed');
     const row=new Node('div');
     ctx.renderMarkdown(row,'adjacent "one" "two" and \'a\' \'b\'');
     if(byClass(row,'md-quote').length!==4)throw new Error('adjacent quote count wrong');
+  }
+  // Contractions, possessives and ordinary apostrophes must never be highlighted.
+  {
+    const prose=['this isn\'t a sentence we want highlighted just cause it\'s got single quotes',"Nick's project","can't match through another apostrophe later","rock'n'roll","foo'bar'"];
+    for(const text of prose){
+      const row=new Node('div');
+      ctx.renderMarkdown(row,text);
+      if(byClass(row,'md-quote').length)throw new Error('apostrophe prose was highlighted: '+text);
+    }
+  }
+  // A space-prefixed single-quoted block is highlighted and its leading space
+  // stays outside the highlighted element.
+  {
+    const row=new Node('div');
+    ctx.renderMarkdown(row,"Use 'this quoted block' here");
+    const quotes=byClass(row,'md-quote');
+    if(quotes.length!==1)throw new Error('space-prefixed quote not highlighted');
+    if(quotes[0].textContent!=="'this quoted block'")throw new Error('leading space leaked into the highlighted element: '+JSON.stringify(quotes[0].textContent));
+    if(!flatText(row).includes("Use 'this quoted block' here"))throw new Error('space was not preserved as plain text');
+  }
+  // A single quote at the start of a line is not highlighted.
+  {
+    const row=new Node('div');
+    ctx.renderMarkdown(row,"'as should this'");
+    if(byClass(row,'md-quote').length)throw new Error('line-start single quote was highlighted');
   }
 }
 

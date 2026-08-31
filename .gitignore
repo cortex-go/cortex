@@ -1,3 +1,4 @@
 /cortex
 *.log
 .DS_Store
+.nift/.ownership-gate

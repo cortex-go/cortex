@@ -76,8 +76,11 @@ function appendMarkdownInline(parent,text){
   // cannot inject HTML. Support only the Markdown that improves transcript scanning.
   // Underscore-delimited text is left literal because it matches ordinary identifiers.
   // Quoted strings support backslash escapes: the closing quote only terminates when
-  // preceded by an even number of consecutive backslashes.
-  const re=/(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g;
+  // preceded by an even number of consecutive backslashes. A single-quoted block is only
+  // recognized when its opening quote is immediately preceded by a space, so contractions
+  // and possessives are never joined into a quote span; the leading space is emitted as
+  // plain text and stays outside the highlighted element.
+  const re=/(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|"(?:\\.|[^"\\])*"| '(?:\\.|[^'\\])*'|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g;
   let at=0,m;
   while((m=re.exec(text))){
     if(m.index>at)parent.append(document.createTextNode(text.slice(at,m.index)));
@@ -85,7 +88,8 @@ function appendMarkdownInline(parent,text){
     if(token.startsWith('`')){const el=document.createElement('code');el.textContent=token;parent.append(el)}
     else if(token.startsWith('**')){const el=document.createElement('strong');el.textContent=token;parent.append(el)}
     else if(token.startsWith('*')){const el=document.createElement('em');el.textContent=token;parent.append(el)}
-    else if(token.startsWith('"')||token.startsWith("'")){const el=document.createElement('span');el.className='md-quote';el.textContent=token;parent.append(el)}
+    else if(token.startsWith('"')){const el=document.createElement('span');el.className='md-quote';el.textContent=token;parent.append(el)}
+    else if(token.startsWith(" '")){parent.append(document.createTextNode(' '));const el=document.createElement('span');el.className='md-quote';el.textContent=token.slice(1);parent.append(el)}
     else{
       const lm=token.match(/^\[([^\]]+)\]\((https?:\/\/[^)]+)\)$/),a=document.createElement('a');
       a.textContent=lm[1];a.href=lm[2];a.target='_blank';a.rel='noopener noreferrer';parent.append(a)

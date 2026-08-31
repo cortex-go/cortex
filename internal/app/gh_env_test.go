@@ -27,11 +27,25 @@ func TestGHConfigDirEnv(t *testing.T) {
 	writeFile(t, filepath.Join(tmp, "home", ".config", "gh", "hosts.yml"), "github.com:\n")
 	mkdir(t, filepath.Join(tmp, "home2", ".config", "gh"))
 
-	t.Run("respects explicit GH_CONFIG_DIR", func(t *testing.T) {
-		env := []string{"GH_CONFIG_DIR=" + filepath.Join(tmp, "custom")}
+	t.Run("respects explicit GH_CONFIG_DIR with hosts.yml", func(t *testing.T) {
+		explicit := filepath.Join(tmp, "custom")
+		mkdir(t, explicit)
+		writeFile(t, filepath.Join(explicit, "hosts.yml"), "github.com:\n")
+		env := []string{"GH_CONFIG_DIR=" + explicit}
 		got := ghConfigDirEnv(env)
-		if v := envValue(got, "GH_CONFIG_DIR"); v != filepath.Join(tmp, "custom") {
+		if v := envValue(got, "GH_CONFIG_DIR"); v != explicit {
 			t.Fatalf("explicit GH_CONFIG_DIR changed to %q", v)
+		}
+	})
+
+	t.Run("drops explicit GH_CONFIG_DIR without hosts.yml", func(t *testing.T) {
+		t.Setenv("HOME", filepath.Join(tmp, "nohome"))
+		explicit := filepath.Join(tmp, "custom-empty")
+		mkdir(t, explicit)
+		env := []string{"GH_CONFIG_DIR=" + explicit}
+		got := ghConfigDirEnv(env)
+		if v := envValue(got, "GH_CONFIG_DIR"); v != "" {
+			t.Fatalf("GH_CONFIG_DIR=%q passed without hosts.yml", v)
 		}
 	})
 

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,21 +12,31 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
 
-// cortexUnitMarker marks unit files written by `cortex service`. Unmanaged or
-// hand-modified units are never overwritten or removed silently.
+// cortexUnitMarker marks unit files written by `cortex service`.
 const cortexUnitMarker = "# Managed by cortex. Do not edit manually."
+
+// cortexManagedPrefix introduces the versioned integrity header. The header is
+// followed by a SHA-256 of everything below it (managed metadata plus the unit
+// body), so any hand edit is detected on the next write, action or uninstall.
+const cortexManagedPrefix = "# cortex-managed: "
+
+const cortexHealthPath = "/api/status"
+
+var (
+	errNotManaged = errors.New("not a managed unit")
+	errMalformed  = errors.New("malformed managed unit header")
+	errModified   = errors.New("managed unit body no longer matches its recorded checksum")
+)
 
 // serviceRunner abstracts systemctl/journalctl so the CLI is testable without
 // touching a real systemd user manager.
 type serviceRunner interface {
-	// Run executes a command with captured combined output.
 	Run(name string, args ...string) (string, error)
-	// Stream executes a command with inherited stdout/stderr and returns its
-	// exit code (used for journalctl --follow).
 	Stream(name string, args ...string) (int, error)
 }
 
@@ -55,6 +68,20 @@ type serviceManager struct {
 	unitPath string
 	exe      string
 	run      serviceRunner
+}
+
+type unitMeta struct {
+	listen string
+	health string
+}
+
+type serviceOptions struct {
+	listen       string
+	root         string
+	data         string
+	publicOrigin string
+	trustProxy   bool
+	ghDir        string
 }
 
 func userUnitPath(unitName string) string {
@@ -111,9 +138,9 @@ func hostGHConfigDir() string {
 	return ""
 }
 
-func renderCortexUnit(exe, listen, root, data, publicOrigin string, trustProxy bool, ghDir string) string {
+// renderCortexUnitBody renders the systemd directives (no managed header).
+func renderCortexUnitBody(exe string, opts serviceOptions) string {
 	var b strings.Builder
-	b.WriteString(cortexUnitMarker + "\n")
 	b.WriteString("[Unit]\n")
 	b.WriteString("Description=Cortex coding agent\n")
 	b.WriteString("After=network-online.target\n")
@@ -121,33 +148,90 @@ func renderCortexUnit(exe, listen, root, data, publicOrigin string, trustProxy b
 	b.WriteString("[Service]\n")
 	b.WriteString("Type=simple\n")
 	b.WriteString("ExecStart=" + systemdQuote(exe))
-	b.WriteString(" " + systemdQuote("--listen") + " " + systemdQuote(listen))
-	b.WriteString(" " + systemdQuote("--root") + " " + systemdQuote(root))
-	b.WriteString(" " + systemdQuote("--data") + " " + systemdQuote(data))
-	if publicOrigin != "" {
-		b.WriteString(" " + systemdQuote("--public-origin") + " " + systemdQuote(publicOrigin))
+	b.WriteString(" " + systemdQuote("--listen") + " " + systemdQuote(opts.listen))
+	b.WriteString(" " + systemdQuote("--root") + " " + systemdQuote(opts.root))
+	b.WriteString(" " + systemdQuote("--data") + " " + systemdQuote(opts.data))
+	if opts.publicOrigin != "" {
+		b.WriteString(" " + systemdQuote("--public-origin") + " " + systemdQuote(opts.publicOrigin))
 	}
-	if trustProxy {
+	if opts.trustProxy {
 		b.WriteString(" " + systemdQuote("--trust-proxy"))
 	}
 	b.WriteString("\n")
 	b.WriteString("WorkingDirectory=" + systemdQuote(filepath.Dir(exe)) + "\n")
 	b.WriteString("Restart=on-failure\n")
 	b.WriteString("Environment=HOME=%h\n")
-	if ghDir != "" {
-		b.WriteString("Environment=GH_CONFIG_DIR=" + systemdQuote(ghDir) + "\n")
+	if opts.ghDir != "" {
+		b.WriteString("Environment=GH_CONFIG_DIR=" + systemdQuote(opts.ghDir) + "\n")
 	}
 	b.WriteString("\n[Install]\n")
 	b.WriteString("WantedBy=default.target\n")
 	return b.String()
 }
 
-// writeManagedUnit writes a unit atomically, refusing to touch an existing
-// file that lacks the managed marker.
+// buildCortexUnit renders the full managed unit: a marker line, a versioned
+// integrity header carrying the SHA-256 of the managed content below it, the
+// runtime metadata (listen/health) used by `service status`, and the body.
+func buildCortexUnit(exe string, opts serviceOptions) string {
+	content := "# cortex-listen: " + opts.listen + "\n# cortex-health: " + cortexHealthPath + "\n" + renderCortexUnitBody(exe, opts)
+	sum := sha256.Sum256([]byte(content))
+	header := cortexUnitMarker + "\n" + cortexManagedPrefix + "v1 sha256=" + hex.EncodeToString(sum[:]) + "\n"
+	return header + content
+}
+
+// readManagedUnit validates a unit's managed integrity and returns its runtime
+// metadata. It returns errNotManaged when the marker is absent, errMalformed
+// for duplicate/malformed headers or metadata, and errModified when the body
+// below the header no longer matches the recorded checksum.
+func readManagedUnit(path string) (unitMeta, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return unitMeta{}, err
+	}
+	lines := strings.Split(string(data), "\n")
+	if len(lines) < 3 || lines[0] != cortexUnitMarker {
+		return unitMeta{}, errNotManaged
+	}
+	count := 0
+	for _, ln := range lines {
+		if strings.HasPrefix(ln, cortexManagedPrefix) {
+			count++
+		}
+	}
+	if count != 1 || !strings.HasPrefix(lines[1], cortexManagedPrefix) {
+		return unitMeta{}, errMalformed
+	}
+	sm := regexp.MustCompile(`^# cortex-managed: v1 sha256=([0-9a-f]{64})$`).FindStringSubmatch(lines[1])
+	if sm == nil {
+		return unitMeta{}, errMalformed
+	}
+	content := strings.Join(lines[2:], "\n")
+	sum := sha256.Sum256([]byte(content))
+	if hex.EncodeToString(sum[:]) != sm[1] {
+		return unitMeta{}, errModified
+	}
+	meta := unitMeta{}
+	for _, ln := range lines[2:] {
+		switch {
+		case strings.HasPrefix(ln, "# cortex-listen: "):
+			meta.listen = strings.TrimSpace(strings.TrimPrefix(ln, "# cortex-listen: "))
+		case strings.HasPrefix(ln, "# cortex-health: "):
+			meta.health = strings.TrimSpace(strings.TrimPrefix(ln, "# cortex-health: "))
+		}
+	}
+	if meta.listen == "" || meta.health == "" {
+		return unitMeta{}, errMalformed
+	}
+	return meta, nil
+}
+
+// writeManagedUnit writes a unit atomically. An existing file is only replaced
+// when it is a valid unmodified managed unit; hand-edited or foreign units are
+// refused rather than silently overwritten.
 func writeManagedUnit(path, content string) error {
-	if existing, err := os.ReadFile(path); err == nil {
-		if !strings.Contains(string(existing), cortexUnitMarker) {
-			return fmt.Errorf("refusing to overwrite %s: not a managed unit", path)
+	if _, err := os.Stat(path); err == nil {
+		if _, err := readManagedUnit(path); err != nil {
+			return fmt.Errorf("refusing to overwrite %s: %w", path, err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -185,21 +269,17 @@ func writeManagedUnit(path, content string) error {
 	return nil
 }
 
-// resolveExecutable validates the executable path used in a unit. Relative,
-// empty or obviously transient (build-cache, temp) paths are rejected so we
-// never install a broken or ephemeral unit.
+// resolveExecutable validates the executable path used in a unit. The supplied
+// path must already be absolute; empty, relative or transient (build-cache,
+// temp) paths are rejected so we never install a broken or ephemeral unit.
 func resolveExecutable(exe string) (string, error) {
 	if strings.TrimSpace(exe) == "" {
 		return "", errors.New("empty executable path")
 	}
-	abs, err := filepath.Abs(exe)
-	if err != nil {
-		return "", err
+	if !filepath.IsAbs(exe) {
+		return "", fmt.Errorf("executable path %q is not absolute", exe)
 	}
-	abs = filepath.Clean(abs)
-	if !filepath.IsAbs(abs) {
-		return "", fmt.Errorf("executable path %q is not absolute", abs)
-	}
+	abs := filepath.Clean(exe)
 	if strings.HasPrefix(abs, os.TempDir()) {
 		return "", fmt.Errorf("executable path %q is transient; install cortex somewhere stable first", abs)
 	}
@@ -212,6 +292,7 @@ func resolveExecutable(exe string) (string, error) {
 	return abs, nil
 }
 
+// healthCheck requires a 2xx JSON object response from the expected endpoint.
 func healthCheck(url string) error {
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(url)
@@ -219,14 +300,37 @@ func healthCheck(url string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 500 {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("expected 2xx, got HTTP %d", resp.StatusCode)
+	}
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") {
+		return fmt.Errorf("expected a JSON response, got %q", resp.Header.Get("Content-Type"))
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	var v map[string]any
+	if err := json.Unmarshal(body, &v); err != nil {
+		return fmt.Errorf("expected a JSON object response: %v", err)
+	}
+	return nil
+}
+
+// requireManaged verifies the unit file at the expected path is a valid
+// unmodified managed unit before any lifecycle operation.
+func (m *serviceManager) requireManaged(verb string) error {
+	if _, err := readManagedUnit(m.unitPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("refusing to %s %s: unit is not installed", verb, m.unitName)
+		}
+		return fmt.Errorf("refusing to %s %s: %w", verb, m.unitName, err)
 	}
 	return nil
 }
 
 func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
-	unit := renderCortexUnit(m.exe, opts.listen, opts.root, opts.data, opts.publicOrigin, opts.trustProxy, opts.ghDir)
+	unit := buildCortexUnit(m.exe, opts)
 	if err := writeManagedUnit(m.unitPath, unit); err != nil {
 		return err
 	}
@@ -252,6 +356,9 @@ func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
 }
 
 func (m *serviceManager) action(verb string, out io.Writer) error {
+	if err := m.requireManaged(verb); err != nil {
+		return err
+	}
 	o, err := m.systemctl(verb, m.unitName)
 	if out != nil && strings.TrimSpace(o) != "" {
 		fmt.Fprintln(out, strings.TrimSpace(o))
@@ -262,9 +369,13 @@ func (m *serviceManager) action(verb string, out io.Writer) error {
 	return nil
 }
 
-func (m *serviceManager) status(out io.Writer, version, listen, healthPath string) error {
-	if _, err := os.Stat(m.unitPath); err != nil {
-		return fmt.Errorf("%s is not installed (no unit at %s)", m.unitName, m.unitPath)
+func (m *serviceManager) status(out io.Writer, version string) error {
+	meta, err := readManagedUnit(m.unitPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%s is not installed (no unit at %s)", m.unitName, m.unitPath)
+		}
+		return fmt.Errorf("%s unit is not valid: %w", m.unitName, err)
 	}
 	enabled, _ := m.systemctl("is-enabled", m.unitName)
 	active, _ := m.systemctl("is-active", m.unitName)
@@ -275,24 +386,23 @@ func (m *serviceManager) status(out io.Writer, version, listen, healthPath strin
 	fmt.Fprintf(out, "active:  %s\n", strings.TrimSpace(active))
 	fmt.Fprintf(out, "pid:     %s\n", strings.TrimSpace(pid))
 	fmt.Fprintf(out, "version: %s\n", version)
+	listen := meta.listen
 	fmt.Fprintf(out, "listen:  %s\n", listen)
-	state := strings.TrimSpace(active)
-	switch state {
-	case "active":
-		if err := healthCheck("http://" + listen + healthPath); err != nil {
-			fmt.Fprintf(out, "health:  unreachable (%v)\n", err)
-			return fmt.Errorf("service is active but its health check failed: %v", err)
-		}
-		fmt.Fprintln(out, "health:  ok")
-		return nil
-	case "failed":
-		return fmt.Errorf("%s is in a failed state; run '%s service logs'", m.unitName, "cortex")
-	default:
-		return nil
+	if state := strings.TrimSpace(active); state != "active" {
+		return fmt.Errorf("%s is %q; expected active", m.unitName, state)
 	}
+	if err := healthCheck("http://" + listen + meta.health); err != nil {
+		fmt.Fprintf(out, "health:  unreachable (%v)\n", err)
+		return fmt.Errorf("service is active but its health check failed: %v", err)
+	}
+	fmt.Fprintln(out, "health:  ok")
+	return nil
 }
 
 func (m *serviceManager) logs(follow bool, out io.Writer) error {
+	if err := m.requireManaged("view logs for"); err != nil {
+		return err
+	}
 	args := []string{"--user-unit", m.unitName}
 	if follow {
 		args = append(args, "-f")
@@ -314,18 +424,28 @@ func (m *serviceManager) logs(follow bool, out io.Writer) error {
 }
 
 func (m *serviceManager) uninstall(out io.Writer) error {
-	existing, err := os.ReadFile(m.unitPath)
-	if err != nil {
+	if _, err := readManagedUnit(m.unitPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("%s is not installed", m.unitName)
 		}
-		return err
+		return fmt.Errorf("refusing to uninstall %s: %w", m.unitName, err)
 	}
-	if !strings.Contains(string(existing), cortexUnitMarker) {
-		return fmt.Errorf("refusing to remove %s: not a managed unit", m.unitPath)
+	active, _ := m.systemctl("is-active", m.unitName)
+	if strings.TrimSpace(active) == "active" {
+		if o, err := m.systemctl("stop", m.unitName); err != nil {
+			return fmt.Errorf("stop %s failed: %w: %s", m.unitName, err, strings.TrimSpace(o))
+		}
+	} else {
+		fmt.Fprintf(out, "note: %s is already inactive; nothing to stop\n", m.unitName)
 	}
-	_, _ = m.systemctl("stop", m.unitName)
-	_, _ = m.systemctl("disable", m.unitName)
+	enabled, _ := m.systemctl("is-enabled", m.unitName)
+	if strings.TrimSpace(enabled) == "enabled" {
+		if o, err := m.systemctl("disable", m.unitName); err != nil {
+			return fmt.Errorf("disable %s failed: %w: %s", m.unitName, err, strings.TrimSpace(o))
+		}
+	} else {
+		fmt.Fprintf(out, "note: %s is already disabled; nothing to disable\n", m.unitName)
+	}
 	if err := os.Remove(m.unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -334,15 +454,6 @@ func (m *serviceManager) uninstall(out io.Writer) error {
 	}
 	fmt.Fprintf(out, "Removed %s. Application configuration, conversations and data were preserved.\n", m.unitName)
 	return nil
-}
-
-type serviceOptions struct {
-	listen       string
-	root         string
-	data         string
-	publicOrigin string
-	trustProxy   bool
-	ghDir        string
 }
 
 func runService(args []string, version string) int {
@@ -423,7 +534,7 @@ func runService(args []string, version string) int {
 		}
 		return 0
 	case "status":
-		if err := m.status(os.Stdout, version, *listen, "/api/status"); err != nil {
+		if err := m.status(os.Stdout, version); err != nil {
 			fmt.Fprintln(os.Stderr, "cortex:", err)
 			return 1
 		}

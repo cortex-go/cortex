@@ -556,6 +556,16 @@ func setEnv(env []string, name, value string) []string {
 	}
 	return append(out, prefix+value)
 }
+func removeEnv(env []string, name string) []string {
+	prefix := name + "="
+	out := env[:0]
+	for _, v := range env {
+		if !strings.HasPrefix(v, prefix) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
 func envValue(env []string, name string) string {
 	prefix := name + "="
 	for _, v := range env {
@@ -569,23 +579,25 @@ func envValue(env []string, name string) string {
 // ghConfigDirEnv inherits the host GitHub CLI configuration directory into a
 // subprocess environment when one exists, without copying any file or token.
 // It must be called before XDG_CONFIG_HOME is redirected to the isolated run
-// directory, so the host value is still visible. An explicit GH_CONFIG_DIR in
-// the inherited environment is always respected.
+// directory, so the host value is still visible. GH_CONFIG_DIR is only passed
+// when the directory actually contains hosts.yml; an explicitly inherited
+// value is validated and removed when it does not, so behavior stays
+// predictable.
 func ghConfigDirEnv(env []string) []string {
-	if v := strings.TrimSpace(envValue(env, "GH_CONFIG_DIR")); v != "" {
-		return env
-	}
-	dir := ""
-	if v := strings.TrimSpace(envValue(env, "XDG_CONFIG_HOME")); v != "" {
-		dir = filepath.Join(v, "gh")
-	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
-		dir = filepath.Join(home, ".config", "gh")
+	explicit := strings.TrimSpace(envValue(env, "GH_CONFIG_DIR"))
+	dir := explicit
+	if dir == "" {
+		if v := strings.TrimSpace(envValue(env, "XDG_CONFIG_HOME")); v != "" {
+			dir = filepath.Join(v, "gh")
+		} else if home, err := os.UserHomeDir(); err == nil && home != "" {
+			dir = filepath.Join(home, ".config", "gh")
+		}
 	}
 	if dir == "" {
-		return env
+		return removeEnv(env, "GH_CONFIG_DIR")
 	}
 	if st, err := os.Stat(filepath.Join(dir, "hosts.yml")); err != nil || st.IsDir() {
-		return env
+		return removeEnv(env, "GH_CONFIG_DIR")
 	}
 	return setEnv(env, "GH_CONFIG_DIR", dir)
 }
