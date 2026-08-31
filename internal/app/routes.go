@@ -43,6 +43,7 @@ func (a *App) apiRoutes() []registeredRoute {
 		public("/api/auth/google/start", get, a.googleStart),
 		public("/api/auth/google/callback", get, a.googleCallback),
 		session("/api/status", get, a.status),
+		public("/api/health", get, a.health),
 		session("/api/settings", []string{http.MethodGet, http.MethodPost}, a.settingsAPI),
 		session("/api/files", get, a.filesAPI),
 		session("/api/file", get, a.fileAPI),

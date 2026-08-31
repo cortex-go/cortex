@@ -25,7 +25,9 @@ const cortexUnitMarker = "# Managed by cortex. Do not edit manually."
 // body), so any hand edit is detected on the next write, action or uninstall.
 const cortexManagedPrefix = "# cortex-managed: "
 
-const cortexHealthPath = "/api/status"
+// cortexHealthPath is the public, read-only liveness endpoint the service
+// health check targets. /api/status is intentionally session-protected.
+const cortexHealthPath = "/api/health"
 
 var (
 	errNotManaged = errors.New("not a managed unit")
@@ -34,18 +36,27 @@ var (
 )
 
 // serviceRunner abstracts systemctl/journalctl so the CLI is testable without
-// touching a real systemd user manager.
+// touching a real systemd user manager. Run returns the captured combined
+// output, the process exit code (0 on success, -1 when the command could not
+// be launched) and a launch error only.
 type serviceRunner interface {
-	Run(name string, args ...string) (string, error)
+	Run(name string, args ...string) (string, int, error)
 	Stream(name string, args ...string) (int, error)
 }
 
 type execRunner struct{}
 
-func (execRunner) Run(name string, args ...string) (string, error) {
+func (execRunner) Run(name string, args ...string) (string, int, error) {
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
-	return string(out), err
+	if err == nil {
+		return string(out), 0, nil
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return string(out), ee.ExitCode(), nil
+	}
+	return string(out), -1, err
 }
 
 func (execRunner) Stream(name string, args ...string) (int, error) {
@@ -92,8 +103,64 @@ func userUnitPath(unitName string) string {
 	return filepath.Join(base, "systemd", "user", unitName)
 }
 
-func (m *serviceManager) systemctl(args ...string) (string, error) {
+func (m *serviceManager) systemctl(args ...string) (string, int, error) {
 	return m.run.Run("systemctl", append([]string{"--user"}, args...)...)
+}
+
+// svcState is a recognized, deliberately resolved systemd state word.
+type svcState string
+
+const (
+	stateActive   svcState = "active"
+	stateInactive svcState = "inactive"
+	stateEnabled  svcState = "enabled"
+	stateDisabled svcState = "disabled"
+)
+
+var inactiveStates = map[string]bool{"inactive": true, "failed": true, "dead": true, "unknown": true, "activating": true, "deactivating": true, "reloading": true}
+var disabledStates = map[string]bool{"disabled": true, "static": true, "indirect": true, "generated": true, "transient": true, "not-found": true}
+
+// queryState resolves an is-active or is-enabled state from systemctl output.
+// systemctl exits nonzero for inactive/disabled states, which the runner
+// reports as an exit code with nil error; a real launch failure (e.g. the
+// user manager bus is unreachable) is surfaced as an error, and any output
+// that is not a recognized state word is surfaced as an error too, so
+// infrastructure failures are never mistaken for an inactive or disabled unit.
+func (m *serviceManager) queryState(verb string) (svcState, error) {
+	out, code, err := m.systemctl(verb, m.unitName)
+	if err != nil {
+		return "", fmt.Errorf("cannot run systemctl %s %s: %w", verb, m.unitName, err)
+	}
+	state := strings.TrimSpace(out)
+	switch verb {
+	case "is-active":
+		if state == "active" {
+			return stateActive, nil
+		}
+		if inactiveStates[state] {
+			return stateInactive, nil
+		}
+	case "is-enabled":
+		if state == "enabled" {
+			return stateEnabled, nil
+		}
+		if disabledStates[state] {
+			return stateDisabled, nil
+		}
+	}
+	return "", fmt.Errorf("systemctl %s %s returned unrecognized state %q (exit %d)", verb, m.unitName, state, code)
+}
+
+// validateNoControl rejects CR, LF, NUL and other control characters so no
+// user-supplied value can inject directives into a systemd unit or confuse
+// status metadata.
+func validateNoControl(v, what string) error {
+	for i := 0; i < len(v); i++ {
+		if v[i] < 0x20 || v[i] == 0x7f {
+			return fmt.Errorf("%s %q contains a control character", what, v)
+		}
+	}
+	return nil
 }
 
 // systemdQuote escapes a value for a systemd ExecStart/Environment directive.
@@ -182,7 +249,9 @@ func buildCortexUnit(exe string, opts serviceOptions) string {
 // readManagedUnit validates a unit's managed integrity and returns its runtime
 // metadata. It returns errNotManaged when the marker is absent, errMalformed
 // for duplicate/malformed headers or metadata, and errModified when the body
-// below the header no longer matches the recorded checksum.
+// below the header no longer matches the recorded checksum. Metadata must
+// appear exactly once, contain no control characters, and the health path must
+// be the application-owned health endpoint.
 func readManagedUnit(path string) (unitMeta, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -211,15 +280,30 @@ func readManagedUnit(path string) (unitMeta, error) {
 		return unitMeta{}, errModified
 	}
 	meta := unitMeta{}
+	listenSeen, healthSeen := 0, 0
 	for _, ln := range lines[2:] {
 		switch {
 		case strings.HasPrefix(ln, "# cortex-listen: "):
+			listenSeen++
+			if listenSeen > 1 {
+				return unitMeta{}, errMalformed
+			}
 			meta.listen = strings.TrimSpace(strings.TrimPrefix(ln, "# cortex-listen: "))
 		case strings.HasPrefix(ln, "# cortex-health: "):
+			healthSeen++
+			if healthSeen > 1 {
+				return unitMeta{}, errMalformed
+			}
 			meta.health = strings.TrimSpace(strings.TrimPrefix(ln, "# cortex-health: "))
 		}
 	}
-	if meta.listen == "" || meta.health == "" {
+	if listenSeen != 1 || healthSeen != 1 || meta.listen == "" || meta.health == "" {
+		return unitMeta{}, errMalformed
+	}
+	if meta.health != cortexHealthPath {
+		return unitMeta{}, errMalformed
+	}
+	if err := validateNoControl(meta.listen, "listen"); err != nil {
 		return unitMeta{}, errMalformed
 	}
 	return meta, nil
@@ -330,6 +414,13 @@ func (m *serviceManager) requireManaged(verb string) error {
 }
 
 func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
+	for _, v := range []struct{ val, name string }{
+		{opts.listen, "listen"}, {opts.root, "root"}, {opts.data, "data"}, {opts.publicOrigin, "public-origin"}, {opts.ghDir, "gh config dir"},
+	} {
+		if err := validateNoControl(v.val, v.name); err != nil {
+			return err
+		}
+	}
 	unit := buildCortexUnit(m.exe, opts)
 	if err := writeManagedUnit(m.unitPath, unit); err != nil {
 		return err
@@ -342,12 +433,12 @@ func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
 		{"enabling", []string{"enable", m.unitName}},
 		{"starting", []string{"start", m.unitName}},
 	} {
-		o, err := m.systemctl(step.args...)
+		o, _, err := m.systemctl(step.args...)
 		if err != nil {
 			return fmt.Errorf("%s %s: %w: %s", step.verb, m.unitName, err, strings.TrimSpace(o))
 		}
 	}
-	active, _ := m.systemctl("is-active", m.unitName)
+	active, _, _ := m.systemctl("is-active", m.unitName)
 	fmt.Fprintf(out, "unit:   %s\n", m.unitName)
 	fmt.Fprintf(out, "file:   %s\n", m.unitPath)
 	fmt.Fprintf(out, "state:  %s\n", strings.TrimSpace(active))
@@ -359,7 +450,7 @@ func (m *serviceManager) action(verb string, out io.Writer) error {
 	if err := m.requireManaged(verb); err != nil {
 		return err
 	}
-	o, err := m.systemctl(verb, m.unitName)
+	o, _, err := m.systemctl(verb, m.unitName)
 	if out != nil && strings.TrimSpace(o) != "" {
 		fmt.Fprintln(out, strings.TrimSpace(o))
 	}
@@ -377,21 +468,26 @@ func (m *serviceManager) status(out io.Writer, version string) error {
 		}
 		return fmt.Errorf("%s unit is not valid: %w", m.unitName, err)
 	}
-	enabled, _ := m.systemctl("is-enabled", m.unitName)
-	active, _ := m.systemctl("is-active", m.unitName)
-	pid, _ := m.systemctl("show", "-p", "MainPID", "--value", m.unitName)
+	enabled, err := m.queryState("is-enabled")
+	if err != nil {
+		return fmt.Errorf("cannot determine %s enablement state: %w", m.unitName, err)
+	}
+	active, err := m.queryState("is-active")
+	if err != nil {
+		return fmt.Errorf("cannot determine %s service state: %w", m.unitName, err)
+	}
+	pid, _, _ := m.systemctl("show", "-p", "MainPID", "--value", m.unitName)
 	fmt.Fprintf(out, "unit:    %s\n", m.unitName)
 	fmt.Fprintf(out, "file:    %s\n", m.unitPath)
-	fmt.Fprintf(out, "enabled: %s\n", strings.TrimSpace(enabled))
-	fmt.Fprintf(out, "active:  %s\n", strings.TrimSpace(active))
+	fmt.Fprintf(out, "enabled: %s\n", enabled)
+	fmt.Fprintf(out, "active:  %s\n", active)
 	fmt.Fprintf(out, "pid:     %s\n", strings.TrimSpace(pid))
 	fmt.Fprintf(out, "version: %s\n", version)
-	listen := meta.listen
-	fmt.Fprintf(out, "listen:  %s\n", listen)
-	if state := strings.TrimSpace(active); state != "active" {
-		return fmt.Errorf("%s is %q; expected active", m.unitName, state)
+	fmt.Fprintf(out, "listen:  %s\n", meta.listen)
+	if active != stateActive {
+		return fmt.Errorf("%s is %q; expected active", m.unitName, active)
 	}
-	if err := healthCheck("http://" + listen + meta.health); err != nil {
+	if err := healthCheck("http://" + meta.listen + meta.health); err != nil {
 		fmt.Fprintf(out, "health:  unreachable (%v)\n", err)
 		return fmt.Errorf("service is active but its health check failed: %v", err)
 	}
@@ -415,7 +511,7 @@ func (m *serviceManager) logs(follow bool, out io.Writer) error {
 		}
 		return nil
 	}
-	o, err := m.run.Run("journalctl", args...)
+	o, _, err := m.run.Run("journalctl", args...)
 	if err != nil {
 		return fmt.Errorf("journalctl: %w: %s", err, strings.TrimSpace(o))
 	}
@@ -430,26 +526,32 @@ func (m *serviceManager) uninstall(out io.Writer) error {
 		}
 		return fmt.Errorf("refusing to uninstall %s: %w", m.unitName, err)
 	}
-	active, _ := m.systemctl("is-active", m.unitName)
-	if strings.TrimSpace(active) == "active" {
-		if o, err := m.systemctl("stop", m.unitName); err != nil {
+	active, err := m.queryState("is-active")
+	if err != nil {
+		return fmt.Errorf("cannot determine %s state before uninstall: %w", m.unitName, err)
+	}
+	if active == stateActive {
+		if o, _, err := m.systemctl("stop", m.unitName); err != nil {
 			return fmt.Errorf("stop %s failed: %w: %s", m.unitName, err, strings.TrimSpace(o))
 		}
 	} else {
-		fmt.Fprintf(out, "note: %s is already inactive; nothing to stop\n", m.unitName)
+		fmt.Fprintf(out, "note: %s is %s; nothing to stop\n", m.unitName, active)
 	}
-	enabled, _ := m.systemctl("is-enabled", m.unitName)
-	if strings.TrimSpace(enabled) == "enabled" {
-		if o, err := m.systemctl("disable", m.unitName); err != nil {
+	enabled, err := m.queryState("is-enabled")
+	if err != nil {
+		return fmt.Errorf("cannot determine %s enablement before uninstall: %w", m.unitName, err)
+	}
+	if enabled == stateEnabled {
+		if o, _, err := m.systemctl("disable", m.unitName); err != nil {
 			return fmt.Errorf("disable %s failed: %w: %s", m.unitName, err, strings.TrimSpace(o))
 		}
 	} else {
-		fmt.Fprintf(out, "note: %s is already disabled; nothing to disable\n", m.unitName)
+		fmt.Fprintf(out, "note: %s is %s; nothing to disable\n", m.unitName, enabled)
 	}
 	if err := os.Remove(m.unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if _, err := m.systemctl("daemon-reload"); err != nil {
+	if _, _, err := m.systemctl("daemon-reload"); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "Removed %s. Application configuration, conversations and data were preserved.\n", m.unitName)
@@ -521,7 +623,20 @@ func runService(args []string, version string) int {
 			return 1
 		}
 		m.exe = exe
-		opts := serviceOptions{listen: *listen, root: *root, data: *data, publicOrigin: *publicOrigin, trustProxy: *trustProxy, ghDir: hostGHConfigDir()}
+		for _, v := range []struct{ val, name string }{
+			{*listen, "listen"}, {*root, "root"}, {*data, "data"}, {*publicOrigin, "public-origin"},
+		} {
+			if err := validateNoControl(v.val, v.name); err != nil {
+				fmt.Fprintln(os.Stderr, "cortex:", err)
+				return 2
+			}
+		}
+		ghDir := hostGHConfigDir()
+		if err := validateNoControl(ghDir, "gh config dir"); err != nil {
+			fmt.Fprintln(os.Stderr, "cortex:", err)
+			return 2
+		}
+		opts := serviceOptions{listen: *listen, root: *root, data: *data, publicOrigin: *publicOrigin, trustProxy: *trustProxy, ghDir: ghDir}
 		if err := m.install(opts, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "cortex:", err)
 			return 1

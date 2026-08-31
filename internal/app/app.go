@@ -128,6 +128,11 @@ func (a *App) httpServer() *http.Server {
 		MaxHeaderBytes:    1 << 20,
 	}
 }
+
+// Handler returns the full HTTP handler chain (overload, security, recovery,
+// HTTP boundary, host policy and authentication) so clients and tests can
+// exercise the exact same stack the server serves.
+func (a *App) Handler() http.Handler { return a.httpServer().Handler }
 func (a *App) overload(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
@@ -406,6 +411,12 @@ func (a *App) configuredModel(providerID string) string {
 }
 func (a *App) status(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, map[string]any{"root": a.root, "settings": a.publicSettings()})
+}
+
+// health is a public, read-only liveness endpoint for service monitoring. It
+// exposes no workspace path, settings, credentials or account information.
+func (a *App) health(w http.ResponseWriter, r *http.Request) {
+	jsonOut(w, map[string]any{"ok": true})
 }
 func (a *App) resolve(p string) (string, error) {
 	p = strings.TrimSpace(p)

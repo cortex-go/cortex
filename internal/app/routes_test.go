@@ -5,8 +5,8 @@ import "testing"
 func TestEveryAPIRouteHasACompletePolicy(t *testing.T) {
 	a := &App{}
 	routes := a.apiRoutes()
-	if len(routes) != 22 {
-		t.Fatalf("route inventory has %d entries, want 22", len(routes))
+	if len(routes) != 23 {
+		t.Fatalf("route inventory has %d entries, want 23", len(routes))
 	}
 	seen := map[string]bool{}
 	for _, route := range routes {
@@ -32,6 +32,7 @@ func TestOnlyDeliberateRoutesArePublic(t *testing.T) {
 	want := map[string]bool{
 		"/api/auth/state": true, "/api/auth/setup": true, "/api/auth/login": true,
 		"/api/auth/google/start": true, "/api/auth/google/callback": true,
+		"/api/health": true,
 	}
 	for _, route := range a.apiRoutes() {
 		if got := route.Policy.Boundary == boundaryPublic; got != want[route.Policy.Path] {

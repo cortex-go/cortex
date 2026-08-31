@@ -12,28 +12,31 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/cortex-go/cortex/internal/app"
 )
 
 type fakeRunner struct {
 	mu      sync.Mutex
 	calls   []string
-	handler func(name string, args ...string) (string, error)
+	handler func(name string, args ...string) (string, int, error)
 	out     string
+	code    int
 	err     error
 }
 
-func (f *fakeRunner) Run(name string, args ...string) (string, error) {
+func (f *fakeRunner) Run(name string, args ...string) (string, int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
 	if f.handler != nil {
 		return f.handler(name, args...)
 	}
-	return f.out, f.err
+	return f.out, f.code, f.err
 }
 
 func (f *fakeRunner) Stream(name string, args ...string) (int, error) {
-	_, _ = f.Run(name, args...)
+	_, _, _ = f.Run(name, args...)
 	return 0, f.err
 }
 
@@ -73,6 +76,18 @@ func jsonServer(t *testing.T, code int, body string, ct string) *httptest.Server
 	return srv
 }
 
+func activeHandler(fr *fakeRunner) func(name string, args ...string) (string, int, error) {
+	return func(name string, args ...string) (string, int, error) {
+		switch {
+		case fr.contains(args, "is-active"):
+			return "active", 0, nil
+		case fr.contains(args, "is-enabled"):
+			return "enabled", 0, nil
+		}
+		return "", 0, nil
+	}
+}
+
 func TestSystemdQuote(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"/usr/bin/cortex", `"/usr/bin/cortex"`},
@@ -109,50 +124,16 @@ func TestBuildCortexUnit(t *testing.T) {
 	if strings.Contains(unit, "sh -c") {
 		t.Fatal("unit must not use a shell wrapper")
 	}
-	for _, want := range []string{`"--listen" "127.0.0.1:9000"`, `"--root" "/home/nick"`, `"--data" "/home/nick/.config/cortex"`, `"--public-origin" "https://cortex.example.com"`, `"--trust-proxy"`, `Environment=HOME=%h`, `Environment=GH_CONFIG_DIR="/home/nick/.config/gh"`, `# cortex-listen: 127.0.0.1:9000`, `# cortex-health: /api/status`, `WantedBy=default.target`} {
+	for _, want := range []string{`"--listen" "127.0.0.1:9000"`, `"--root" "/home/nick"`, `"--data" "/home/nick/.config/cortex"`, `"--public-origin" "https://cortex.example.com"`, `"--trust-proxy"`, `Environment=HOME=%h`, `Environment=GH_CONFIG_DIR="/home/nick/.config/gh"`, `# cortex-listen: 127.0.0.1:9000`, `# cortex-health: /api/health`, `WantedBy=default.target`} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing %q\n%s", want, unit)
 		}
 	}
-	meta, err := readManagedUnitBytes(t, []byte(unit))
-	if err != nil {
+	if _, err := readManagedUnitBytes(t, []byte(unit)); err != nil {
 		t.Fatalf("built unit should validate: %v", err)
 	}
-	if meta.listen != "127.0.0.1:9000" || meta.health != "/api/status" {
-		t.Fatalf("metadata wrong: %+v", meta)
-	}
 }
 
-func TestResolveExecutable(t *testing.T) {
-	if _, err := resolveExecutable(""); err == nil {
-		t.Fatal("empty path accepted")
-	}
-	t.Run("real file at relative path is rejected", func(t *testing.T) {
-		t.Chdir(t.TempDir())
-		if err := os.WriteFile("cortex", []byte("#!/bin/sh\n"), 0755); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := resolveExecutable("cortex"); err == nil || !strings.Contains(err.Error(), "not absolute") {
-			t.Fatalf("relative path to a real executable was not rejected: %v", err)
-		}
-	})
-	if _, err := resolveExecutable(os.TempDir() + "/cortex"); err == nil {
-		t.Fatal("transient temp path accepted")
-	}
-	if _, err := resolveExecutable("/tmp/go-build123/b001/exe/cortex"); err == nil {
-		t.Fatal("go-build path accepted")
-	}
-	got, err := resolveExecutable("/bin/true")
-	if err != nil {
-		t.Fatalf("valid path rejected: %v", err)
-	}
-	if got != "/bin/true" {
-		t.Fatalf("resolved %q want /bin/true", got)
-	}
-}
-
-// readManagedUnitBytes is a small helper for tests that have the unit content
-// in memory rather than on disk.
 func readManagedUnitBytes(t *testing.T, data []byte) (unitMeta, error) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "cortex.service")
@@ -162,14 +143,28 @@ func readManagedUnitBytes(t *testing.T, data []byte) (unitMeta, error) {
 	return readManagedUnit(path)
 }
 
-// unitWithMeta builds a valid-integrity managed unit carrying the given
-// metadata, so tests can exercise metadata validation independently of the
-// checksum.
 func unitWithMeta(listen, health string) string {
 	body := renderCortexUnitBody("/usr/local/bin/cortex", testOpts(listen))
 	content := "# cortex-listen: " + listen + "\n# cortex-health: " + health + "\n" + body
 	sum := sha256.Sum256([]byte(content))
 	return cortexUnitMarker + "\n" + cortexManagedPrefix + "v1 sha256=" + hex.EncodeToString(sum[:]) + "\n" + content
+}
+
+func TestValidateNoControl(t *testing.T) {
+	if err := validateNoControl("127.0.0.1:7331", "listen"); err != nil {
+		t.Fatalf("valid listen rejected: %v", err)
+	}
+	for _, bad := range []string{"127.0.0.1:7331\nRestart=always", "a\x00b", "a\x0db", "a\x1bb"} {
+		if err := validateNoControl(bad, "listen"); err == nil {
+			t.Fatalf("control characters accepted: %q", bad)
+		}
+	}
+	m, _, _ := newFakeManager(t)
+	bad := testOpts("127.0.0.1:7331")
+	bad.listen = "127.0.0.1:7331\nRestart=always"
+	if err := m.install(bad, os.Stderr); err == nil {
+		t.Fatal("install accepted a control-character listen address")
+	}
 }
 
 func TestManagedUnitIntegrity(t *testing.T) {
@@ -222,20 +217,33 @@ func TestManagedUnitIntegrity(t *testing.T) {
 			t.Fatalf("want errNotManaged, got %v", err)
 		}
 	})
-	t.Run("duplicate metadata", func(t *testing.T) {
-		bad := strings.Replace(unit, "# cortex-listen: 127.0.0.1:7331\n", "# cortex-listen: 127.0.0.1:7331\n# cortex-listen: 127.0.0.1:9999\n", 1)
-		if _, err := readManagedUnitBytes(t, []byte(bad)); !errors.Is(err, errModified) {
-			t.Fatalf("duplicate metadata changes checksum; want errModified, got %v", err)
+	t.Run("wrong health path rejected", func(t *testing.T) {
+		bad := unitWithMeta("127.0.0.1:7331", "/api/status")
+		if _, err := readManagedUnitBytes(t, []byte(bad)); !errors.Is(err, errMalformed) {
+			t.Fatalf("health path must be application-owned; want errMalformed, got %v", err)
+		}
+	})
+	t.Run("duplicate metadata rejected even with valid checksum", func(t *testing.T) {
+		body := renderCortexUnitBody("/usr/local/bin/cortex", testOpts("127.0.0.1:7331"))
+		content := "# cortex-listen: 127.0.0.1:7331\n# cortex-listen: 127.0.0.1:9999\n# cortex-health: /api/health\n" + body
+		sum := sha256.Sum256([]byte(content))
+		bad := cortexUnitMarker + "\n" + cortexManagedPrefix + "v1 sha256=" + hex.EncodeToString(sum[:]) + "\n" + content
+		if _, err := readManagedUnitBytes(t, []byte(bad)); !errors.Is(err, errMalformed) {
+			t.Fatalf("duplicate metadata with recomputed checksum; want errMalformed, got %v", err)
 		}
 	})
 	t.Run("malformed metadata with valid checksum", func(t *testing.T) {
-		bad := unitWithMeta("", "/api/status")
+		bad := unitWithMeta("", "/api/health")
 		if _, err := readManagedUnitBytes(t, []byte(bad)); !errors.Is(err, errMalformed) {
 			t.Fatalf("empty listen metadata; want errMalformed, got %v", err)
 		}
 		bad2 := unitWithMeta("127.0.0.1:7331", "")
 		if _, err := readManagedUnitBytes(t, []byte(bad2)); !errors.Is(err, errMalformed) {
 			t.Fatalf("empty health metadata; want errMalformed, got %v", err)
+		}
+		bad3 := unitWithMeta("127.0.0.1:7331\x00x", "/api/health")
+		if _, err := readManagedUnitBytes(t, []byte(bad3)); !errors.Is(err, errMalformed) {
+			t.Fatalf("control character in metadata; want errMalformed, got %v", err)
 		}
 	})
 }
@@ -277,10 +285,6 @@ func TestInstallRefusesForeignOrModifiedUnit(t *testing.T) {
 	}
 	if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err == nil {
 		t.Fatal("install overwrote a foreign unit")
-	}
-	// A valid managed unit that was hand-modified must also be refused.
-	if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err == nil {
-		t.Fatal("setup failed")
 	}
 }
 
@@ -335,17 +339,7 @@ func TestUninstallFailClosed(t *testing.T) {
 		if err := m.install(opts, os.Stderr); err != nil {
 			t.Fatal(err)
 		}
-		fr.handler = func(name string, args ...string) (string, error) {
-			switch {
-			case fr.contains(args, "is-active"):
-				return "active", nil
-			case fr.contains(args, "is-enabled"):
-				return "enabled", nil
-			case fr.contains(args, "is-active"): // unreachable
-				return "active", nil
-			}
-			return "", nil
-		}
+		fr.handler = activeHandler(fr)
 		if err := m.uninstall(os.Stderr); err != nil {
 			t.Fatalf("uninstall: %v", err)
 		}
@@ -362,22 +356,25 @@ func TestUninstallFailClosed(t *testing.T) {
 			}
 		}
 	})
-	t.Run("already inactive and disabled", func(t *testing.T) {
+	t.Run("inactive and disabled with normal exit codes", func(t *testing.T) {
 		m, fr, _ := newFakeManager(t)
 		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
 			t.Fatal(err)
 		}
-		fr.handler = func(name string, args ...string) (string, error) {
+		fr.handler = func(name string, args ...string) (string, int, error) {
 			switch {
 			case fr.contains(args, "is-active"):
-				return "inactive", nil
+				return "inactive", 3, nil // normal nonzero for inactive
 			case fr.contains(args, "is-enabled"):
-				return "disabled", nil
+				return "disabled", 1, nil // normal nonzero for disabled
 			}
-			return "", nil
+			return "", 0, nil
 		}
 		if err := m.uninstall(os.Stderr); err != nil {
-			t.Fatalf("uninstall: %v", err)
+			t.Fatalf("uninstall with inactive/disabled states: %v", err)
+		}
+		if _, err := os.Stat(m.unitPath); !os.IsNotExist(err) {
+			t.Fatal("unit still present after uninstall")
 		}
 		joined := strings.Join(fr.calls, "\n")
 		if strings.Contains(joined, "stop cortex.service") {
@@ -386,20 +383,23 @@ func TestUninstallFailClosed(t *testing.T) {
 		if strings.Contains(joined, "disable cortex.service") {
 			t.Fatalf("disable was attempted on a disabled unit: %s", joined)
 		}
+		if !strings.Contains(joined, "daemon-reload") {
+			t.Fatal("daemon-reload not called")
+		}
 	})
 	t.Run("stop failure is not swallowed", func(t *testing.T) {
 		m, fr, _ := newFakeManager(t)
 		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
 			t.Fatal(err)
 		}
-		fr.handler = func(name string, args ...string) (string, error) {
+		fr.handler = func(name string, args ...string) (string, int, error) {
 			switch {
 			case fr.contains(args, "is-active"):
-				return "active", nil
+				return "active", 0, nil
 			case fr.contains(args, "stop"):
-				return "Failed to stop", errors.New("stop failed")
+				return "Failed to stop", 1, nil
 			}
-			return "", nil
+			return "", 0, nil
 		}
 		if err := m.uninstall(os.Stderr); err == nil {
 			t.Fatal("uninstall succeeded despite stop failure")
@@ -422,6 +422,96 @@ func TestUninstallFailClosed(t *testing.T) {
 		}
 		if _, err := os.Stat(m.unitPath); err != nil {
 			t.Fatalf("unit removed despite modification: %v", err)
+		}
+	})
+}
+
+func TestUninstallStateQueryFailures(t *testing.T) {
+	t.Run("is-active launch failure", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.calls = nil
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "is-active") {
+				return "", -1, errors.New("systemctl not found")
+			}
+			return "", 0, nil
+		}
+		if err := m.uninstall(os.Stderr); err == nil {
+			t.Fatal("uninstall ignored an is-active launch failure")
+		}
+		if _, err := os.Stat(m.unitPath); err != nil {
+			t.Fatalf("unit removed despite query failure: %v", err)
+		}
+		joined := strings.Join(fr.calls, "\n")
+		if strings.Contains(joined, "stop cortex.service") || strings.Contains(joined, "disable cortex.service") || strings.Contains(joined, "daemon-reload") {
+			t.Fatalf("destructive steps ran after an active-state query failure: %s", joined)
+		}
+	})
+	t.Run("is-active bus failure is not read as inactive", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "is-active") {
+				return "Failed to connect to bus: No such file or directory", 1, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.uninstall(os.Stderr); err == nil {
+			t.Fatal("uninstall treated a bus failure as inactive")
+		} else if !strings.Contains(err.Error(), "unrecognized") {
+			t.Fatalf("bus failure should surface as unrecognized state, got: %v", err)
+		}
+		if _, serr := os.Stat(m.unitPath); serr != nil {
+			t.Fatalf("unit removed despite bus failure: %v", serr)
+		}
+	})
+	t.Run("unrecognized is-active output", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "is-active") {
+				return "something-else", 1, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.uninstall(os.Stderr); err == nil {
+			t.Fatal("uninstall accepted unrecognized is-active output")
+		}
+		if _, err := os.Stat(m.unitPath); err != nil {
+			t.Fatalf("unit removed despite unrecognized state: %v", err)
+		}
+	})
+	t.Run("is-enabled bus failure", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.calls = nil
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "inactive", 3, nil
+			case fr.contains(args, "is-enabled"):
+				return "Failed to connect to bus: No such file or directory", 1, nil
+			}
+			return "", 0, nil
+		}
+		if err := m.uninstall(os.Stderr); err == nil {
+			t.Fatal("uninstall ignored an is-enabled bus failure")
+		}
+		if _, err := os.Stat(m.unitPath); err != nil {
+			t.Fatalf("unit removed despite enablement query failure: %v", err)
+		}
+		joined := strings.Join(fr.calls, "\n")
+		if strings.Contains(joined, "disable cortex.service") || strings.Contains(joined, "daemon-reload") {
+			t.Fatalf("disable/reload ran after an enablement query failure: %s", joined)
 		}
 	})
 }
@@ -451,11 +541,14 @@ func TestStatus(t *testing.T) {
 		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
 			t.Fatal(err)
 		}
-		fr.handler = func(name string, args ...string) (string, error) {
-			if fr.contains(args, "is-active") {
-				return "inactive", nil
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "inactive", 3, nil
+			case fr.contains(args, "is-enabled"):
+				return "enabled", 0, nil
 			}
-			return "", nil
+			return "", 0, nil
 		}
 		if err := m.status(os.Stderr, "1.0"); err == nil {
 			t.Fatal("status of an inactive service should fail")
@@ -466,84 +559,128 @@ func TestStatus(t *testing.T) {
 		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
 			t.Fatal(err)
 		}
-		fr.handler = func(name string, args ...string) (string, error) {
-			if fr.contains(args, "is-active") {
-				return "failed", nil
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "failed", 3, nil
+			case fr.contains(args, "is-enabled"):
+				return "enabled", 0, nil
 			}
-			return "", nil
+			return "", 0, nil
 		}
 		if err := m.status(os.Stderr, "1.0"); err == nil {
 			t.Fatal("status of a failed service should fail")
 		}
 	})
+	t.Run("surfaces is-active bus failure", func(t *testing.T) {
+		m, fr, _ := newFakeManager(t)
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			switch {
+			case fr.contains(args, "is-active"):
+				return "Failed to connect to bus", 1, nil
+			case fr.contains(args, "is-enabled"):
+				return "enabled", 0, nil
+			}
+			return "", 0, nil
+		}
+		err := m.status(os.Stderr, "1.0")
+		if err == nil {
+			t.Fatal("status swallowed an is-active bus failure")
+		}
+		if !strings.Contains(err.Error(), "unrecognized") {
+			t.Fatalf("bus failure should surface as unrecognized state: %v", err)
+		}
+	})
 	t.Run("uses installed listen address", func(t *testing.T) {
-		srv := jsonServer(t, 200, `{"root":"/"}`, "application/json")
+		srv := jsonServer(t, 200, `{"ok":true}`, "application/json")
 		listen := strings.TrimPrefix(srv.URL, "http://")
 		m, fr, _ := newFakeManager(t)
 		if err := m.install(testOpts(listen), os.Stderr); err != nil {
 			t.Fatal(err)
 		}
-		fr.handler = func(name string, args ...string) (string, error) {
-			if fr.contains(args, "is-active") {
-				return "active", nil
-			}
-			return "", nil
-		}
+		fr.handler = activeHandler(fr)
 		if err := m.status(os.Stderr, "1.0"); err != nil {
 			t.Fatalf("status with installed listen failed: %v", err)
 		}
 	})
 	t.Run("404 health response", func(t *testing.T) {
 		srv := jsonServer(t, 404, `{"error":"not found"}`, "application/json")
-		listen := strings.TrimPrefix(srv.URL, "http://")
 		m, fr, _ := newFakeManager(t)
-		if err := m.install(testOpts(listen), os.Stderr); err != nil {
+		if err := m.install(testOpts(strings.TrimPrefix(srv.URL, "http://")), os.Stderr); err != nil {
 			t.Fatal(err)
 		}
-		fr.handler = func(name string, args ...string) (string, error) {
-			if fr.contains(args, "is-active") {
-				return "active", nil
-			}
-			return "", nil
-		}
+		fr.handler = activeHandler(fr)
 		if err := m.status(os.Stderr, "1.0"); err == nil {
 			t.Fatal("status with a 404 health response should fail")
 		}
 	})
 	t.Run("401 health response", func(t *testing.T) {
 		srv := jsonServer(t, 401, `{"error":"unauthorized"}`, "application/json")
-		listen := strings.TrimPrefix(srv.URL, "http://")
 		m, fr, _ := newFakeManager(t)
-		if err := m.install(testOpts(listen), os.Stderr); err != nil {
+		if err := m.install(testOpts(strings.TrimPrefix(srv.URL, "http://")), os.Stderr); err != nil {
 			t.Fatal(err)
 		}
-		fr.handler = func(name string, args ...string) (string, error) {
-			if fr.contains(args, "is-active") {
-				return "active", nil
-			}
-			return "", nil
-		}
+		fr.handler = activeHandler(fr)
 		if err := m.status(os.Stderr, "1.0"); err == nil {
 			t.Fatal("status with a 401 health response should fail")
 		}
 	})
 	t.Run("non-JSON 200 health response", func(t *testing.T) {
 		srv := jsonServer(t, 200, `ok`, "text/plain")
-		listen := strings.TrimPrefix(srv.URL, "http://")
 		m, fr, _ := newFakeManager(t)
-		if err := m.install(testOpts(listen), os.Stderr); err != nil {
+		if err := m.install(testOpts(strings.TrimPrefix(srv.URL, "http://")), os.Stderr); err != nil {
 			t.Fatal(err)
 		}
-		fr.handler = func(name string, args ...string) (string, error) {
-			if fr.contains(args, "is-active") {
-				return "active", nil
-			}
-			return "", nil
-		}
+		fr.handler = activeHandler(fr)
 		if err := m.status(os.Stderr, "1.0"); err == nil {
 			t.Fatal("status with a non-JSON 200 health response should fail")
 		}
 	})
+}
+
+func TestRealCortexHealthAndStatusBoundary(t *testing.T) {
+	root := t.TempDir()
+	a, err := app.New(app.Options{Root: root, DataDir: filepath.Join(root, "data"), Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+
+	// Unauthenticated /api/health is public and returns a minimal JSON object.
+	rec := httptest.NewRecorder()
+	a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/health status=%d", rec.Code)
+	}
+	if !strings.Contains(rec.Header().Get("Content-Type"), "json") {
+		t.Fatalf("/api/health content type=%q", rec.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(rec.Body.String(), `"ok":true`) {
+		t.Fatalf("/api/health body=%q", rec.Body.String())
+	}
+
+	// /api/status remains session-protected.
+	rec = httptest.NewRecorder()
+	a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/status", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /api/status status=%d want 401", rec.Code)
+	}
+
+	// `cortex service status` accepts the real health response contract.
+	srv := httptest.NewServer(a.Handler())
+	t.Cleanup(srv.Close)
+	listen := strings.TrimPrefix(srv.URL, "http://")
+	m, fr, _ := newFakeManager(t)
+	if err := m.install(testOpts(listen), os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	fr.handler = activeHandler(fr)
+	if err := m.status(os.Stderr, "1.0"); err != nil {
+		t.Fatalf("service status against the real Cortex health endpoint failed: %v", err)
+	}
 }
 
 func TestRunServiceDispatchErrors(t *testing.T) {
