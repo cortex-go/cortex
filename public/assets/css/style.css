@@ -62,6 +62,8 @@ main{display:block;min-height:0;overflow:hidden;background:#151716;padding:22px}
 .composer-resize::after{content:"";position:absolute;left:50%;top:2px;width:42px;height:2px;border-radius:99px;background:#3e4742;transform:translateX(-50%)}
 .composer-resize:hover::after,.resizing-composer .composer-resize::after{background:#66736c}
 .resizing-composer,.resizing-composer *{cursor:ns-resize!important;user-select:none!important}
+.ws-unavailable{color:var(--amber);background:#2a2417;border:1px solid #5c4d22;border-radius:6px;padding:8px 11px;font-size:11px;line-height:1.45;margin-bottom:8px}
+.migration-notice{color:var(--amber);background:#2a2417;border:1px solid #5c4d22;border-radius:6px;padding:8px 11px;font-size:11px;line-height:1.45;margin-bottom:8px}
 .agent-card .compose-row{margin-top:8px}
 
 /* Authentication and security settings. */
@@ -140,3 +142,4 @@ main{display:block;min-height:0;overflow:hidden;background:#151716;padding:22px}
 .event.image figure{margin:0;display:grid;gap:4px}
 .event.image img{display:block;max-width:min(340px,100%);max-height:260px;border:1px solid var(--line2);border-radius:8px}
 .event.image figcaption{font-size:9px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tech-details{width:min(900px,94%);margin-top:2px;padding:6px 12px;border:1px dashed var(--line2);border-radius:7px;background:#141715;color:var(--muted);font:12px/1.5 var(--mono)}.tech-details summary{cursor:pointer;color:var(--muted)}.tech-details[open] summary{margin-bottom:6px}.tech-body{white-space:pre-wrap;overflow-wrap:anywhere;max-height:240px;overflow:auto;color:var(--muted)}

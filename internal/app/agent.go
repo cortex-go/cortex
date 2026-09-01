@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -185,16 +186,32 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	runID := randomToken(18)
+	run := &activeRun{cancel: cancel, state: newRunState()}
+
+	// Durable run creation happens before the process starts so an untracked
+	// OpenCode process is never launched if persistence fails. Once the
+	// durable row exists, every later failure finalizes it to a truthful state.
+	if err := a.startAgentRun(runID, clientSession, q.Prompt, workspace, providerID, modelID); err != nil {
+		http.Error(w, "persist agent run: "+err.Error(), 500)
+		return
+	}
+	// Register the active run before cmd.Start so request cancellation or
+	// service shutdown between start and registry insertion is never an
+	// unclassified signal. The run ID is not exposed to the browser until the
+	// process actually started.
 	a.runMu.Lock()
-	a.activeRuns[runID] = cancel
+	a.activeRuns[runID] = run
 	a.runMu.Unlock()
 	defer func() { a.runMu.Lock(); delete(a.activeRuns, runID); a.runMu.Unlock() }()
+
 	imageFiles := []string{}
 	imageDir := ""
 	if len(q.Images) > 0 {
 		var err error
 		imageDir, imageFiles, err = writeImageAttachments(q.Images)
 		if err != nil {
+			run.state.recordCause(causeRequestCanceled)
+			_ = a.finishAgentRunErr(runID, clientSession, "failed", "", "invalid image: "+err.Error(), 0, 0, 0, "")
 			http.Error(w, "invalid image: "+err.Error(), 400)
 			return
 		}
@@ -217,11 +234,15 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	cmd.Env = env
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		run.state.recordCause(causeRequestCanceled)
+		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", "stdout pipe: "+err.Error(), 0, 0, 0, "")
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		run.state.recordCause(causeRequestCanceled)
+		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", "stderr pipe: "+err.Error(), 0, 0, 0, "")
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -229,38 +250,58 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		run.state.recordCause(causeRequestCanceled)
+		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", "streaming unavailable", 0, 0, 0, "")
 		http.Error(w, "streaming unavailable", 500)
 		return
 	}
 	if err := cmd.Start(); err != nil {
-		writeEvent(w, flusher, "error", map[string]any{"message": err.Error()})
+		run.state.seal()
+		diag, summary := a.runDiagnostics(outcomeFailed, run.state.snapshot(), "", false, processExitStatus(cmd), nil, "", false, 0, true, nil, map[string]string{"result": "not_attempted"})
+		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", summary, 0, 0, 0, diag)
+		_ = writeEvent(w, flusher, "error", map[string]any{"message": summary})
 		return
 	}
-	writeEvent(w, flusher, "run", map[string]any{"runID": runID})
-	if err := a.startAgentRun(runID, clientSession, q.Prompt, workspace, providerID, modelID); err != nil {
+
+	// Start succeeded: expose the run ID before any assistant event.
+	var deliveryErr error
+	if err := writeEvent(w, flusher, "run", map[string]any{"runID": runID}); err != nil {
+		deliveryErr = err
+	}
+
+	// Record request/browser disconnection as a cancellation cause. It is
+	// only accepted while no stronger cause exists and the run is not sealed.
+	requestDone := r.Context().Done()
+	go func() {
+		<-requestDone
+		run.state.recordCause(causeRequestCanceled)
 		cancel()
-		_ = cmd.Wait()
-		writeEvent(w, flusher, "error", map[string]any{"message": "persist agent run: " + err.Error()})
-		return
-	}
-	errCh := make(chan string, 1)
-	go func() { b, _ := readLimit(stderr, 256<<10); errCh <- string(b) }()
+	}()
+
+	tail := captureTail(stderr, 64<<10)
 	var input, output uint64
 	var cost float64
 	sessionID := ""
 	sawText := false
+	var stdoutErrMsg string
+	stdoutErr := false
+	lastStopReason := ""
+	validStop := false
 	scan := bufio.NewScanner(stdout)
 	scan.Buffer(make([]byte, 64<<10), maxProviderLine)
 	streamBytes, streamEvents := 0, 0
+	var stdoutScanErr error
 	truncated := false
+	seq := int64(0)
 	for scan.Scan() {
 		line := append([]byte(nil), scan.Bytes()...)
 		streamBytes += len(line)
 		streamEvents++
 		if streamBytes > maxProviderBytes || streamEvents > maxProviderEvents {
 			truncated = true
+			run.state.recordCause(causeOutputLimit)
 			cancel()
-			writeEvent(w, flusher, "truncated", map[string]any{"message": "Provider output limit reached; the run was stopped."})
+			_ = writeEvent(w, flusher, "truncated", map[string]any{"message": "Provider output limit reached; the run was stopped."})
 			break
 		}
 		var raw map[string]any
@@ -272,27 +313,75 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			if eventText(raw) != "" {
 				sawText = true
 			}
+			// An authoritative stdout error forces failure regardless of any
+			// later stop, unless a stronger local cause preceded it.
+			if typ, _ := raw["type"].(string); typ == "error" {
+				stdoutErr = true
+				run.state.observeError()
+				stdoutErrMsg = a.redactSecrets(errorEventText(raw))
+			}
+			if typ, _ := raw["type"].(string); typ == "step_finish" {
+				if reason, _ := raw["part"].(map[string]any)["reason"].(string); reason != "" {
+					lastStopReason = reason
+					validStop = lastStopReason == "stop"
+				}
+			}
 			rewriteImageURLs(raw, clientSession)
-			writeEvent(w, flusher, "opencode", raw)
+			if err := writeEvent(w, flusher, "opencode", raw); err != nil {
+				deliveryErr = err
+			}
 		} else {
-			writeEvent(w, flusher, "output", map[string]any{"text": string(line)})
+			if err := writeEvent(w, flusher, "output", map[string]any{"text": string(line)}); err != nil {
+				deliveryErr = err
+			}
+		}
+		seq++
+	}
+	if err := scan.Err(); err != nil {
+		stdoutScanErr = err
+		if !truncated {
+			cancel()
 		}
 	}
 	waitErr := cmd.Wait()
-	stderrText := <-errCh
-	if scan.Err() != nil && waitErr == nil {
-		waitErr = scan.Err()
+	// Seal the cause machine before any late disconnect/Stop can rewrite it.
+	run.state.seal()
+	tail.wait()
+	stderrText := tail.String()
+	stderrTrunc := tail.truncated()
+	if stdoutScanErr != nil && waitErr == nil {
+		waitErr = stdoutScanErr
 	}
-	if truncated {
-		waitErr = errors.New("provider output limit reached")
-	}
-	if waitErr == nil && sessionID != "" {
-		if recovered, images, ri, ro, rc, e := recoverSession(ctx, binary, sessionID, workspace, clientSession, env); e == nil {
+	exit := processExitStatus(cmd)
+	snap := run.state.snapshot()
+	outcome := classifyRun(snap, stdoutErr, validStop, exit)
+	// stdout errors observed before any local cause always force failure; the
+	// classifier already encodes that ordering, so reflect it in the message.
+	recoverEligible := (outcome == outcomeFailed || outcome == outcomeCompletedWError) && !truncated && snap.cause != causeRequestCanceled && snap.cause != causeUserStop && snap.cause != causeOutputLimit
+	recoveryResult := ""
+	if recoverEligible && sessionID != "" {
+		// Recovery runs under a fresh bounded context: the request context may
+		// already be cancelled and must not be reused.
+		recCtx, recCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		recovered, images, ri, ro, rc, recErr := recoverSession(recCtx, binary, sessionID, workspace, clientSession, env)
+		recCancel()
+		if recErr != nil {
+			recoveryResult = "failed"
+		} else {
+			recoveryResult = "ok"
+			_ = a.persistAgentRunEvent(runID, "assistant", recovered, "", seq, time.Now().UnixMilli())
+			seq++
 			if !sawText && strings.TrimSpace(recovered) != "" {
-				writeEvent(w, flusher, "recovered", map[string]any{"text": recovered, "sessionID": sessionID})
+				if err := writeEvent(w, flusher, "recovered", map[string]any{"text": recovered, "sessionID": sessionID}); err != nil {
+					deliveryErr = err
+				}
 			}
 			if len(images) > 0 {
-				writeEvent(w, flusher, "recovered-images", map[string]any{"images": images, "sessionID": sessionID})
+				_ = a.persistAgentRunEvent(runID, "image", images[0]["url"], "recovered", seq, time.Now().UnixMilli())
+				seq++
+				if err := writeEvent(w, flusher, "recovered-images", map[string]any{"images": images, "sessionID": sessionID}); err != nil {
+					deliveryErr = err
+				}
 			}
 			if ri > input {
 				input = ri
@@ -305,17 +394,196 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if waitErr != nil {
-		msg := a.redactSecrets(strings.TrimSpace(stderrText))
-		if msg == "" {
-			msg = waitErr.Error()
+
+	// Persist the server-owned run events (user prompt + terminal) before the
+	// terminal event is attempted for delivery.
+	_ = a.persistAgentRunEvent(runID, "user", q.Prompt, "", seq, time.Now().UnixMilli())
+	seq++
+	diag, summary := a.runDiagnostics(outcome, snap, stdoutErrMsg, validStop, exit, parsedStderr(stderrText), a.redactSecrets(stderrText), stderrTrunc, seq, deliveryErr == nil, stdoutScanErr, map[string]string{"result": recoveryResult})
+	_ = a.persistAgentRunEvent(runID, terminalKind(outcome), summary, "", seq, time.Now().UnixMilli())
+	a.finishAgentRun(runID, clientSession, string(outcome), sessionID, summary, input, output, cost, diag)
+	if deliveryErr == nil {
+		switch outcome {
+		case outcomeCompleted:
+			_ = writeEvent(w, flusher, "done", map[string]any{"inputTokens": input, "outputTokens": output, "estimatedCostUsd": cost, "sessionID": sessionID})
+		case outcomeCompletedWError, outcomeFailed:
+			_ = writeEvent(w, flusher, "error", map[string]any{"message": summary, "exitCode": exit.exitCode, "signal": exit.signal})
+		case outcomeCancelled:
+			_ = writeEvent(w, flusher, "cancelled", map[string]any{"message": "Agent stopped."})
+		case outcomeTruncated:
+			_ = writeEvent(w, flusher, "truncated", map[string]any{"message": "Provider output limit reached; the run was stopped."})
+		case outcomeInterrupted:
+			_ = writeEvent(w, flusher, "cancelled", map[string]any{"message": "The agent was interrupted."})
 		}
-		a.finishAgentRun(runID, clientSession, "failed", sessionID, msg, input, output, cost)
-		writeEvent(w, flusher, "error", map[string]any{"message": msg})
-		return
 	}
-	a.finishAgentRun(runID, clientSession, "completed", sessionID, "", input, output, cost)
-	writeEvent(w, flusher, "done", map[string]any{"inputTokens": input, "outputTokens": output, "estimatedCostUsd": cost, "sessionID": sessionID})
+}
+
+// finishAgentRunErr is the error-returning form of finishAgentRun used when
+// the run fails before the streaming tail exists.
+func (a *App) finishAgentRunErr(id, conversationID, state, sessionID, message string, input, output uint64, cost float64, diag string) error {
+	a.finishAgentRun(id, conversationID, state, sessionID, message, input, output, cost, diag)
+	return nil
+}
+
+// runDiagnostics builds the bounded, redacted diagnostic record and the
+// user-facing summary for a run outcome.
+func (a *App) runDiagnostics(outcome runOutcome, snap runStateSnapshot, stdoutErrMsg string, validStop bool, exit exitStatus, stderrErrors []string, stderrTail string, stderrTrunc bool, seq int64, delivered bool, scannerErr error, recovery map[string]string) (string, string) {
+	d := diagnostics{
+		Outcome:              string(outcome),
+		ExitCode:             exit.exitCode,
+		Signal:               exit.signal,
+		Cause:                string(snap.cause),
+		StdoutError:          stdoutErrMsg,
+		Errors:               boundedStrings(stderrErrors, 8),
+		StderrTail:           boundedTail(stderrTail, 8<<10),
+		StderrTruncated:      stderrTrunc,
+		TerminalEventDeliver: delivered,
+		OpenCodeVersion:      openCodeVersion(),
+	}
+	if snap.cause == causeUserStop {
+		d.Category = "user_stop"
+		d.Summary = "Agent stopped."
+	} else if snap.cause == causeRequestCanceled {
+		d.Category = "request_cancelled"
+		d.Summary = "Agent connection closed; the run was stopped."
+	} else if snap.cause == causeOutputLimit {
+		d.Category = "output_limit"
+		d.Summary = "Provider output limit reached; the run was stopped."
+	} else if snap.cause == causeServiceShutdown {
+		d.Category = "service_shutdown"
+		d.Summary = "The agent was interrupted by a service shutdown."
+	} else if outcome == outcomeFailed && stdoutErrMsg != "" {
+		d.Category = "opencode_error"
+		d.Summary = stdoutErrMsg
+	} else if exit.signaled {
+		d.Category = "signal"
+		d.Summary = "OpenCode was terminated by signal " + exit.signal + "."
+	} else if outcome == outcomeCompletedWError {
+		d.Category = "opencode_exit"
+		d.Summary = "OpenCode exited with status " + strconv.Itoa(exit.exitCode) + " after completing."
+	} else if outcome == outcomeFailed {
+		d.Category = "opencode_exit"
+		d.Summary = "OpenCode exited with status " + strconv.Itoa(exit.exitCode) + "."
+		if scannerErr != nil {
+			d.Summary = "The provider output stream failed: " + scannerErr.Error()
+		}
+	} else {
+		d.Category = "completed"
+		d.Summary = ""
+	}
+	if d.Category != "completed" && d.Summary == "" {
+		d.Summary = "Agent failed."
+	}
+	if len(d.Errors) > 0 && strings.TrimSpace(d.Summary) != "" && d.Category != "opencode_error" {
+		d.Summary = d.Summary + " Details: " + strings.Join(d.Errors, "; ")
+	}
+	b, _ := json.Marshal(d)
+	return string(b), d.Summary
+}
+
+// summaryFor computes the concise user-facing message from the outcome and the
+// diagnostic precedence rules.
+func (a *App) summaryFor(outcome runOutcome, snap runStateSnapshot, stdoutErrMsg string, exit exitStatus, stderrErrors []string) string {
+	switch snap.cause {
+	case causeUserStop:
+		return "Agent stopped."
+	case causeRequestCanceled:
+		return "Agent connection closed; the run was stopped."
+	case causeOutputLimit:
+		return "Provider output limit reached; the run was stopped."
+	case causeServiceShutdown:
+		return "The agent was interrupted by a service shutdown."
+	}
+	if stdoutErrMsg != "" {
+		return stdoutErrMsg
+	}
+	if exit.signaled {
+		return "OpenCode was terminated by signal " + exit.signal + "."
+	}
+	switch outcome {
+	case outcomeCompleted:
+		return ""
+	case outcomeCompletedWError:
+		return "OpenCode exited with status " + strconv.Itoa(exit.exitCode) + " after completing."
+	case outcomeCancelled:
+		return "Agent stopped."
+	case outcomeTruncated:
+		return "Provider output limit reached; the run was stopped."
+	case outcomeInterrupted:
+		return "The agent was interrupted."
+	default:
+		return "Agent failed."
+	}
+}
+
+func errorEventText(raw map[string]any) string {
+	// The run command emits {"type":"error","error":{"name":..,"data":{"message":..}}}.
+	if e, ok := raw["error"].(map[string]any); ok {
+		if data, ok := e["data"].(map[string]any); ok {
+			if msg, _ := data["message"].(string); msg != "" {
+				return msg
+			}
+		}
+		if name, _ := e["name"].(string); name != "" {
+			return name
+		}
+	}
+	if msg, _ := raw["message"].(string); msg != "" {
+		return msg
+	}
+	return "OpenCode reported a provider error."
+}
+
+func terminalKind(outcome runOutcome) string {
+	switch outcome {
+	case outcomeCompleted:
+		return "done"
+	case outcomeCompletedWError, outcomeFailed:
+		return "error"
+	case outcomeCancelled, outcomeInterrupted:
+		return "cancelled"
+	case outcomeTruncated:
+		return "truncated"
+	}
+	return "error"
+}
+
+// parsedStderr extracts bounded ERROR and WARN messages from mixed-format
+// stderr output, tolerating unstructured lines.
+func parsedStderr(text string) []string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		if len(out) >= 8 {
+			break
+		}
+		level := stderrLevel(line)
+		if level != "ERROR" && level != "WARN" {
+			continue
+		}
+		msg := strings.TrimSpace(line)
+		if msg == "" {
+			continue
+		}
+		if len(msg) > 600 {
+			msg = msg[:600]
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
+func boundedStrings(v []string, n int) []string {
+	if len(v) > n {
+		v = v[:n]
+	}
+	return v
+}
+
+func boundedTail(s string, n int) string {
+	if len(s) > n {
+		s = s[len(s)-n:]
+	}
+	return s
 }
 
 func (a *App) agentCancel(w http.ResponseWriter, r *http.Request) {
@@ -330,14 +598,52 @@ func (a *App) agentCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.runMu.Lock()
-	cancel := a.activeRuns[q.RunID]
+	run := a.activeRuns[q.RunID]
 	a.runMu.Unlock()
-	if cancel == nil {
+	if run == nil {
 		http.Error(w, "run not found", http.StatusNotFound)
 		return
 	}
-	cancel()
+	// Record the explicit user stop before invoking cancel so the outcome is
+	// classified as a user cancellation rather than a disconnect or signal.
+	if !run.state.recordCause(causeUserStop) {
+		// The run may already be stopping (duplicate Stop is idempotent) or
+		// sealed (already finished). A finished run cannot be stopped again.
+		snap := run.state.snapshot()
+		if snap.sealed {
+			http.Error(w, "run already finished", http.StatusGone)
+			return
+		}
+	}
+	run.cancel()
 	jsonOut(w, map[string]bool{"cancelled": true})
+}
+
+// agentRunDiagnostics serves the bounded, redacted technical-detail record for
+// a finished run to the authenticated owner. Raw stderr is never returned in
+// conversation list responses; it is only available here.
+func (a *App) agentRunDiagnostics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "method", 405)
+		return
+	}
+	runID := strings.TrimSpace(r.URL.Query().Get("runID"))
+	if !validRecordID(runID) {
+		http.Error(w, "invalid run id", 400)
+		return
+	}
+	var diag string
+	err := a.db.QueryRow("SELECT diagnostics FROM agent_runs WHERE id = ?", runID).Scan(&diag)
+	if err != nil {
+		http.Error(w, "run not found", http.StatusNotFound)
+		return
+	}
+	if diag == "" {
+		http.Error(w, "no diagnostics available", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(diag))
 }
 
 // agentImage serves a generated image from an isolated session's OpenCode data
@@ -572,8 +878,11 @@ func parseModelLines(out []byte, providerID string) []string {
 // agentRunArgs builds the opencode run argv. The prompt must follow the "--"
 // separator: "--file" is an array option in opencode run, so bare words placed
 // after it would otherwise be consumed as further file paths.
+//
+// Production runs at WARN so routine INFO lifecycle logs do not flood stderr;
+// INFO diagnostics remain available through an opt-in debug setting.
 func agentRunArgs(workspace, modelRef, session string, files []string, prompt string) []string {
-	args := []string{"--print-logs", "--log-level", "INFO", "run", "--format", "json", "--auto", "--dir", workspace, "--model", modelRef}
+	args := []string{"--print-logs", "--log-level", "WARN", "run", "--format", "json", "--auto", "--dir", workspace, "--model", modelRef}
 	if s := strings.TrimSpace(session); s != "" {
 		args = append(args, "--session", s)
 	}
@@ -582,6 +891,24 @@ func agentRunArgs(workspace, modelRef, session string, files []string, prompt st
 	}
 	return append(args, "--", prompt)
 }
+
+// openCodeVersion returns the installed OpenCode version captured at first
+// use, or the empty string when it cannot be determined.
+var openCodeVersion = func() func() string {
+	version := ""
+	var once sync.Once
+	return func() string {
+		once.Do(func() {
+			if b, err := exec.Command("opencode", "--version").Output(); err == nil {
+				version = strings.TrimSpace(string(b))
+				if len(version) > 64 {
+					version = version[:64]
+				}
+			}
+		})
+		return version
+	}
+}()
 
 func writeImageAttachments(imgs []imageUpload) (dir string, paths []string, err error) {
 	dir, err = os.MkdirTemp("", "cortex-images-")
@@ -817,19 +1144,27 @@ func recoverSession(ctx context.Context, binary, id, workspace, clientSession st
 	cmd := exec.CommandContext(ctx, binary, "export", id)
 	cmd.Dir = workspace
 	cmd.Env = env
-	out, err := cmd.Output()
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return "", nil, 0, 0, 0, errors.New(strings.TrimSpace(string(ee.Stderr)))
-		}
-		return "", nil, 0, 0, 0, err
+	stdout := &boundedCommandOutput{limit: 8 << 20}
+	stderrOut := &boundedCommandOutput{limit: 256 << 10}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderrOut
+	err := cmd.Run()
+	if stdout.truncated || stderrOut.truncated {
+		return "", nil, 0, 0, 0, errors.New("session export exceeded output limit")
 	}
-	start := strings.IndexByte(string(out), '{')
+	if err != nil {
+		msg := strings.TrimSpace(stderrOut.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", nil, 0, 0, 0, errors.New(msg)
+	}
+	start := strings.IndexByte(stdout.String(), '{')
 	if start < 0 {
 		return "", nil, 0, 0, 0, errors.New("session export did not contain JSON")
 	}
 	var v any
-	if err := json.Unmarshal(out[start:], &v); err != nil {
+	if err := json.Unmarshal([]byte(stdout.String())[start:], &v); err != nil {
 		return "", nil, 0, 0, 0, err
 	}
 	rewriteImageURLs(v, clientSession)
@@ -839,6 +1174,39 @@ func recoverSession(ctx context.Context, binary, id, workspace, clientSession st
 	var c float64
 	collectUsage(v, &i, &o, &c)
 	return strings.Join(texts, "\n\n"), images, i, o, c, nil
+}
+
+// boundedCommandOutput retains only the first limit bytes written to it and
+// records whether anything was discarded. Used to bound recovery subprocess
+// output without unbounded buffering.
+type boundedCommandOutput struct {
+	mu        sync.Mutex
+	buf       []byte
+	limit     int
+	truncated bool
+}
+
+func (w *boundedCommandOutput) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := len(p)
+	remaining := w.limit - len(w.buf)
+	if remaining > 0 {
+		if remaining > len(p) {
+			remaining = len(p)
+		}
+		w.buf = append(w.buf, p[:remaining]...)
+	}
+	if remaining < len(p) {
+		w.truncated = true
+	}
+	return n, nil
+}
+
+func (w *boundedCommandOutput) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(w.buf)
 }
 func assistantImages(v any) []map[string]string {
 	out := []map[string]string{}

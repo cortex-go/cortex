@@ -38,10 +38,18 @@ type App struct {
 	pendingTOTP           map[string]pendingTOTP
 	usedTOTP              map[string]time.Time
 	runMu                 sync.Mutex
-	activeRuns            map[string]context.CancelFunc
+	activeRuns            map[string]*activeRun
 	runSlots              chan struct{}
 	requestSlots          chan struct{}
 	settings              Settings
+}
+
+// activeRun tracks a live OpenCode process and its synchronized cancellation
+// cause machine. The cancel function stops the process group; state records
+// the first accepted cause and orders stdout errors against it.
+type activeRun struct {
+	cancel context.CancelFunc
+	state  *runState
 }
 type Provider struct {
 	ID, Label, Hint, OpenCodeID, DefaultModel, AuthMode string
@@ -93,7 +101,7 @@ func New(o Options) (*App, error) {
 			return nil, errors.New("public origin must be an http(s) origin without a path")
 		}
 	}
-	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, trustProxy: o.TrustProxy, publicOrigin: publicOrigin, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, loginFailures: map[string][]time.Time{}, oauthStates: map[string]oauthState{}, pendingTOTP: map[string]pendingTOTP{}, usedTOTP: map[string]time.Time{}, activeRuns: map[string]context.CancelFunc{}, runSlots: make(chan struct{}, 4), requestSlots: make(chan struct{}, 128)}
+	a := &App{listen: o.Listen, root: root, dataDir: o.DataDir, trustProxy: o.TrustProxy, publicOrigin: publicOrigin, db: db, mux: http.NewServeMux(), settings: Settings{ActiveProvider: "opencode", Keys: map[string]string{}, Models: map[string]string{}}, sessions: map[string]sessionInfo{}, loginFailures: map[string][]time.Time{}, oauthStates: map[string]oauthState{}, pendingTOTP: map[string]pendingTOTP{}, usedTOTP: map[string]time.Time{}, activeRuns: map[string]*activeRun{}, runSlots: make(chan struct{}, 4), requestSlots: make(chan struct{}, 128)}
 	if err := a.loadSettings(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("load settings: %w", err)
@@ -112,7 +120,24 @@ func New(o Options) (*App, error) {
 	_, _ = a.db.Exec("UPDATE conversations SET state='interrupted',updated_at=? WHERE state='running'", now)
 	return a, nil
 }
-func (a *App) Close() error { return a.db.Close() }
+
+// stopActiveRuns records a service-shutdown cause for every live run and
+// cancels it. Called during shutdown so active runs are classified
+// `interrupted` rather than an unexplained signal.
+func (a *App) stopActiveRuns() {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	for _, run := range a.activeRuns {
+		run.state.recordCause(causeServiceShutdown)
+		if run.cancel != nil {
+			run.cancel()
+		}
+	}
+}
+func (a *App) Close() error {
+	a.stopActiveRuns()
+	return a.db.Close()
+}
 func (a *App) Root() string { return a.root }
 func (a *App) ListenAndServe() error {
 	return a.httpServer().ListenAndServe()
@@ -552,9 +577,16 @@ func relDisplay(root, p string) string {
 	}
 	return filepath.ToSlash(r)
 }
-func writeEvent(w http.ResponseWriter, f http.Flusher, t string, data any) {
-	json.NewEncoder(w).Encode(map[string]any{"type": t, "data": data})
+
+// writeEvent encodes one NDJSON event and flushes it, returning any write
+// failure so the runner can record a delivery outcome separately from the
+// execution outcome.
+func writeEvent(w http.ResponseWriter, f http.Flusher, t string, data any) error {
+	if err := json.NewEncoder(w).Encode(map[string]any{"type": t, "data": data}); err != nil {
+		return err
+	}
 	f.Flush()
+	return nil
 }
 func readLimit(r io.Reader, n int64) ([]byte, error) { return io.ReadAll(io.LimitReader(r, n)) }
 func setEnv(env []string, name, value string) []string {

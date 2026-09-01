@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -212,6 +213,11 @@ func (a *App) saveConversationTx(tx *sql.Tx, c *conversation) error {
 		c.CreatedAt = now
 	}
 	c.UpdatedAt = now
+	// The client never controls conversation state. The server owns the
+	// running and terminal transitions, so a stale or manipulated browser
+	// save can never rewrite `running`, `completed`, `failed`, `cancelled`,
+	// `truncated` or `interrupted` back to `idle` or `running`. State is only
+	// written for brand-new records (idle).
 	if c.State == "" {
 		c.State = "idle"
 	}
@@ -223,8 +229,8 @@ func (a *App) saveConversationTx(tx *sql.Tx, c *conversation) error {
 		VALUES(?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET title=excluded.title, workspace=excluded.workspace,
 		provider=excluded.provider, model=excluded.model, opencode_session_id=excluded.opencode_session_id,
-		state=excluded.state, updated_at=excluded.updated_at, archived_at=excluded.archived_at`,
-		c.ID, strings.TrimSpace(c.Title), c.Workspace, c.Provider, c.Model, c.OpenCodeSession, c.State, c.CreatedAt, c.UpdatedAt, archived)
+		state=conversations.state, updated_at=excluded.updated_at, archived_at=excluded.archived_at`,
+		c.ID, strings.TrimSpace(c.Title), c.Workspace, c.Provider, c.Model, c.OpenCodeSession, "idle", c.CreatedAt, c.UpdatedAt, archived)
 	if err != nil {
 		return err
 	}
@@ -271,7 +277,7 @@ func (a *App) loadConversations(query string) ([]conversation, error) {
 			c.ArchivedAt = archived.Int64
 		}
 		c.WorkspaceStatus = a.workspaceStatus(c.Workspace)
-		events, err := a.loadConversationEvents(c.ID)
+		events, err := a.loadConversationMerged(c.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -301,6 +307,61 @@ func (a *App) loadConversationEvents(id string) ([]conversationEvent, error) {
 	return events, rows.Err()
 }
 
+// loadConversationMerged returns the conversation transcript as the union of
+// server-owned run events (authoritative) and client-authored events,
+// deduplicated by signature. Server events win: a client save that mirrored
+// the streamed run cannot duplicate them, and a stale client PUT can never
+// erase them because they live in a separate table.
+func (a *App) loadConversationMerged(id string) ([]conversationEvent, error) {
+	server, err := a.loadAgentRunEvents(id)
+	if err != nil {
+		return nil, err
+	}
+	client, err := a.loadConversationEvents(id)
+	if err != nil {
+		return nil, err
+	}
+	return mergeConversationEvents(server, client), nil
+}
+
+func eventSignature(e conversationEvent) string {
+	return e.Kind + "\x00" + e.Text + "\x00" + e.Name
+}
+
+// mergeConversationEvents interleaves server-owned and client-authored events
+// by creation time. Occurrence-aware deduplication removes client copies of
+// server events while preserving legitimately repeated identical messages:
+// a client event is dropped only when an equal server event is still unmatched.
+func mergeConversationEvents(server, client []conversationEvent) []conversationEvent {
+	available := map[string]int{}
+	serverSig := map[string]bool{}
+	for _, e := range server {
+		available[eventSignature(e)]++
+		serverSig[eventSignature(e)] = true
+	}
+	out := append([]conversationEvent{}, server...)
+	for _, e := range client {
+		sig := eventSignature(e)
+		if available[sig] > 0 {
+			available[sig]--
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].CreatedAt != out[j].CreatedAt {
+			return out[i].CreatedAt < out[j].CreatedAt
+		}
+		// Server events precede client events on timestamp ties so the
+		// authoritative copy is not shadowed by its duplicate.
+		return serverSig[eventSignature(out[i])] && !serverSig[eventSignature(out[j])]
+	})
+	return out
+}
+
+// startAgentRun creates the durable running record and marks the conversation
+// as running under this run's identity. Only the runner may write the running
+// and terminal states; client PUTs never transition conversation state.
 func (a *App) startAgentRun(id, conversationID, prompt, workspace, provider, model string) error {
 	now := time.Now().UnixMilli()
 	tx, err := a.db.Begin()
@@ -308,10 +369,10 @@ func (a *App) startAgentRun(id, conversationID, prompt, workspace, provider, mod
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`INSERT INTO conversations(id,title,workspace,provider,model,state,created_at,updated_at)
-		VALUES(?,?,?,?,?,'running',?,?)
+	if _, err = tx.Exec(`INSERT INTO conversations(id,title,workspace,provider,model,state,created_at,updated_at,current_run_id)
+		VALUES(?,?,?,?,?,'running',?,?,?)
 		ON CONFLICT(id) DO UPDATE SET workspace=excluded.workspace, provider=excluded.provider,
-		model=excluded.model, state='running', updated_at=excluded.updated_at`, conversationID, "", workspace, provider, model, now, now); err != nil {
+		model=excluded.model, state='running', current_run_id=excluded.current_run_id, updated_at=excluded.updated_at`, conversationID, "", workspace, provider, model, now, now, id); err != nil {
 		return err
 	}
 	if _, err = tx.Exec("INSERT INTO agent_runs(id,conversation_id,state,prompt,started_at) VALUES(?,?,'running',?,?)", id, conversationID, prompt, now); err != nil {
@@ -320,18 +381,53 @@ func (a *App) startAgentRun(id, conversationID, prompt, workspace, provider, mod
 	return tx.Commit()
 }
 
-func (a *App) finishAgentRun(id, conversationID, state, sessionID, message string, input, output uint64, cost float64) {
+// finishAgentRun finalizes a run and its conversation. The conversation
+// terminal state is only written when this run is still the conversation's
+// current run, so a stale old-run finalization can never overwrite the state
+// of a newer run. The execution outcome and delivery outcome are recorded
+// separately; diagnostics holds the bounded structured detail.
+func (a *App) finishAgentRun(id, conversationID, state, sessionID, message string, input, output uint64, cost float64, diag string) {
 	now := time.Now().UnixMilli()
 	tx, err := a.db.Begin()
 	if err != nil {
 		return
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`UPDATE agent_runs SET state=?,finished_at=?,error=?,input_tokens=?,output_tokens=?,estimated_cost_usd=? WHERE id=?`, state, now, message, input, output, cost, id); err != nil {
+	if _, err = tx.Exec(`UPDATE agent_runs SET state=?,finished_at=?,error=?,input_tokens=?,output_tokens=?,estimated_cost_usd=?,diagnostics=? WHERE id=?`, state, now, message, input, output, cost, diag, id); err != nil {
 		return
 	}
-	_, err = tx.Exec(`UPDATE conversations SET state=?,opencode_session_id=CASE WHEN ?='' THEN opencode_session_id ELSE ? END,updated_at=? WHERE id=?`, state, sessionID, sessionID, now, conversationID)
+	_, err = tx.Exec(`UPDATE conversations SET state=?,opencode_session_id=CASE WHEN ?='' THEN opencode_session_id ELSE ? END,updated_at=? WHERE id=? AND current_run_id=?`, state, sessionID, sessionID, now, conversationID, id)
 	if err == nil {
 		_ = tx.Commit()
 	}
+}
+
+// persistAgentRunEvent records one server-owned run event before it is
+// attempted for delivery to the browser. Events are keyed by run ID and a
+// monotonically increasing sequence so reloads can merge without duplication.
+func (a *App) persistAgentRunEvent(runID, kind, text, name string, sequence, createdAt int64) error {
+	_, err := a.db.Exec(`INSERT INTO agent_run_events(run_id,sequence,kind,text,name,created_at) VALUES(?,?,?,?,?,?)`, runID, sequence, kind, text, name, createdAt)
+	return err
+}
+
+// loadAgentRunEvents returns the server-owned events for a conversation,
+// ordered by creation time then sequence. These are authoritative: a client
+// conversation PUT never touches this table.
+func (a *App) loadAgentRunEvents(conversationID string) ([]conversationEvent, error) {
+	rows, err := a.db.Query(`SELECT e.kind,e.text,e.name,e.created_at
+		FROM agent_run_events e JOIN agent_runs r ON r.id = e.run_id
+		WHERE r.conversation_id = ? ORDER BY e.created_at, e.sequence`, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	events := []conversationEvent{}
+	for rows.Next() {
+		var event conversationEvent
+		if err := rows.Scan(&event.Kind, &event.Text, &event.Name, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }

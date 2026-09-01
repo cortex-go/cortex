@@ -8,14 +8,14 @@ import (
 func TestAgentRunRegistryCancellationAndCleanup(t *testing.T) {
 	a := hardeningTestApp(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	a.activeRuns["run1"] = cancel
+	a.activeRuns["run1"] = &activeRun{cancel: cancel, state: newRunState()}
 	a.runMu.Lock()
 	got := a.activeRuns["run1"]
 	a.runMu.Unlock()
 	if got == nil {
 		t.Fatal("run not registered")
 	}
-	got()
+	got.cancel()
 	select {
 	case <-ctx.Done():
 	default:
