@@ -273,11 +273,13 @@ const reconcilePolls=new Map();
 const RECONCILE_MAX_WAIT_MS=30000;
 async function reconcileRunState(id){
   if(!sessions[id]||reconcilePolls.has(id))return;
-  const token=setTimeout(()=>{},0);
-  reconcilePolls.set(id,token);
+  reconcilePolls.set(id,true);
   try{
     const start=Date.now();
     const delay=ms=>new Promise(r=>setTimeout(r,ms));
+    // Capture the run being reconciled separately so the session's mutable
+    // currentRunId is never mistaken for the reconciliation target.
+    const targetRunId=sessions[id].currentRunId||sessions[id].runID||'';
     while(Date.now()-start<RECONCILE_MAX_WAIT_MS){
       const s=sessions[id];
       if(!s)return; // session removed
@@ -285,13 +287,24 @@ async function reconcileRunState(id){
         const all=await api('/api/conversations');
         const rec=all.find(c=>c.id===id);
         if(rec){
-          const terminal=rec.state!=='running'&&rec.state!=='idle'&&rec.state!=='';
+          const authoritativeRunId=rec.currentRunId||'';
+          const authoritativeRunning=rec.state==='running';
+          const authoritativeTerminal=rec.state!=='running'&&rec.state!=='idle'&&rec.state!=='';
           s.state=rec.state||s.state;
-          // Stop when a newer run replaced the one being reconciled.
-          if(rec.currentRunId&&rec.currentRunId!==s.currentRunId&&s.currentRunId&&s.busy){s.currentRunId=rec.currentRunId;s.busy=false;persistLocalState();saveSessionToServer(id);if(activeId===id)renderAll();return}
-          s.currentRunId=rec.currentRunId||'';
-          if(rec.state==='running'){s.busy=true}
-          else if(terminal){s.busy=false;persistLocalState();saveSessionToServer(id);if(activeId===id)renderAll();return}
+          // A newer run superseded the reconciled run. Apply the authoritative
+          // state of the newer run: running keeps the spinner; terminal clears
+          // it; idle/unknown follows the explicit contract below.
+          if(authoritativeRunId&&authoritativeRunId!==targetRunId){
+            s.currentRunId=authoritativeRunId;
+            if(authoritativeRunning){s.busy=true;persistLocalState();saveSessionToServer(id);if(activeId===id)renderAll();return}
+            if(authoritativeTerminal){s.busy=false;persistLocalState();saveSessionToServer(id);if(activeId===id)renderAll();return}
+            // idle/unknown newer run: keep polling the authoritative state.
+            await delay(1000);
+            continue;
+          }
+          s.currentRunId=authoritativeRunId||s.currentRunId;
+          if(authoritativeRunning){s.busy=true}
+          else if(authoritativeTerminal){s.busy=false;persistLocalState();saveSessionToServer(id);if(activeId===id)renderAll();return}
         }
       }catch{}
       if(sessions[id]&&!sessions[id].busy)return; // became terminal meanwhile
@@ -304,7 +317,13 @@ async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace||wo
 // stopAgent performs a server-side, authenticated Stop for the active run. The
 // streaming request is left open; only if the cancellation request fails or
 // exceeds a short timeout does the client fall back to aborting the fetch.
-async function stopAgent(){const s=active();if(!s)return;await stopAgentFor(s)}
+async function stopAgent(){
+  const s=active();if(!s)return;
+  const res=await stopAgentFor(s);
+  if(res&&res.rejected)toast('Could not stop the running agent.');
+  else if(res&&res.draining)toast('Stop accepted; the agent is still winding down.');
+  else toast('Agent stopped.');
+}
 // stopAgentFor submits the server-side stop and waits for the run to reach a
 // durable terminal state via bounded reconciliation. It resolves to
 // {ok:true} when the run became terminal, {ok:false,rejected:true} when the

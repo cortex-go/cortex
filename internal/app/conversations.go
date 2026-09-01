@@ -27,6 +27,11 @@ type conversationEvent struct {
 	Text      string `json:"text"`
 	Name      string `json:"name,omitempty"`
 	CreatedAt int64  `json:"createdAt,omitempty"`
+	// RunID is a private server-only field carrying the owning run for
+	// server-owned events. It is excluded from JSON and used internally for
+	// run-scoped supersession so a replacement never removes assistant content
+	// from an unrelated run.
+	RunID string `json:"-"`
 }
 
 type conversation struct {
@@ -374,15 +379,24 @@ func replRunID(name string) string {
 }
 
 // supersedeAssistantPrefixes removes earlier streamed assistant events that
-// are fragments of a recovery-replacement event. A replacement (e.g.
-// "hello world") supersedes its streamed fragment ("world" was a suffix of the
-// recovered response, so appending would be misordered), leaving the full
-// recovered response as the only assistant content for that answer.
+// are fragments of a recovery-replacement event *from the same run*. A
+// replacement (e.g. "hello world") supersedes its own run's streamed fragment
+// ("world" was a suffix of the recovered response, so appending would be
+// misordered), leaving the full recovered response as the only assistant
+// content for that answer. Text containment is never applied across runs:
+// ordinary assistant events from other runs, and client-authored events, are
+// preserved verbatim.
 func supersedeAssistantPrefixes(events []conversationEvent) []conversationEvent {
-	replacements := []conversationEvent{}
+	type replacement struct {
+		text string
+		run  string
+	}
+	replacements := []replacement{}
 	for _, e := range events {
-		if e.Kind == "assistant" && replRunID(e.Name) != "" {
-			replacements = append(replacements, e)
+		if e.Kind == "assistant" {
+			if id := replRunID(e.Name); id != "" {
+				replacements = append(replacements, replacement{text: strings.TrimSpace(e.Text), run: id})
+			}
 		}
 	}
 	if len(replacements) == 0 {
@@ -390,7 +404,8 @@ func supersedeAssistantPrefixes(events []conversationEvent) []conversationEvent 
 	}
 	drop := map[int]bool{}
 	for i, e := range events {
-		if e.Kind != "assistant" || replRunID(e.Name) != "" {
+		if e.Kind != "assistant" || replRunID(e.Name) != "" || e.RunID == "" {
+			// Skip replacements and client-authored events (no run identity).
 			continue
 		}
 		et := strings.TrimSpace(e.Text)
@@ -398,8 +413,7 @@ func supersedeAssistantPrefixes(events []conversationEvent) []conversationEvent 
 			continue
 		}
 		for _, r := range replacements {
-			rt := strings.TrimSpace(r.Text)
-			if rt != et && strings.Contains(rt, et) {
+			if r.run == e.RunID && r.text != et && strings.Contains(r.text, et) {
 				drop[i] = true
 				break
 			}
@@ -530,9 +544,10 @@ func (a *App) persistAgentRunEvent(runID, kind, text, name string, sequence, cre
 
 // loadAgentRunEvents returns the server-owned events for a conversation,
 // ordered by creation time then sequence. These are authoritative: a client
-// conversation PUT never touches this table.
+// conversation PUT never touches this table. Each event carries its owning run
+// ID in a private field for run-scoped supersession.
 func (a *App) loadAgentRunEvents(conversationID string) ([]conversationEvent, error) {
-	rows, err := a.db.Query(`SELECT e.kind,e.text,e.name,e.created_at
+	rows, err := a.db.Query(`SELECT e.kind,e.text,e.name,e.created_at,e.run_id
 		FROM agent_run_events e JOIN agent_runs r ON r.id = e.run_id
 		WHERE r.conversation_id = ? ORDER BY e.created_at, e.sequence`, conversationID)
 	if err != nil {
@@ -542,7 +557,7 @@ func (a *App) loadAgentRunEvents(conversationID string) ([]conversationEvent, er
 	events := []conversationEvent{}
 	for rows.Next() {
 		var event conversationEvent
-		if err := rows.Scan(&event.Kind, &event.Text, &event.Name, &event.CreatedAt); err != nil {
+		if err := rows.Scan(&event.Kind, &event.Text, &event.Name, &event.CreatedAt, &event.RunID); err != nil {
 			return nil, err
 		}
 		events = append(events, event)

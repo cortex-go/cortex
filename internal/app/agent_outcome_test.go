@@ -89,7 +89,12 @@ func agentTestApp(t *testing.T, fake *fakeOpenCode) *App {
 // events emitted plus the persisted run state.
 func runAgentRequest(t *testing.T, a *App, workspace string, fake *fakeOpenCode) []map[string]any {
 	t.Helper()
-	body, _ := json.Marshal(map[string]any{"workspace": workspace, "prompt": "test", "clientSession": "conv1"})
+	return runAgentRequestSession(t, a, workspace, fake, "conv1")
+}
+
+func runAgentRequestSession(t *testing.T, a *App, workspace string, fake *fakeOpenCode, clientSession string) []map[string]any {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{"workspace": workspace, "prompt": "test", "clientSession": clientSession})
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/agent/run", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1704,5 +1709,133 @@ func TestAgentRunStorageFailureMarkerInsertStillFailsClosed(t *testing.T) {
 	d := runDiagnosticsFromDB(t, a, runID)
 	if d.Category != "storage_failure" {
 		t.Fatalf("diagnostics category = %q want storage_failure", d.Category)
+	}
+}
+
+// TestReplacementSupersessionIsRunScoped verifies that a recovery replacement
+// only removes assistant fragments from its own run, never from an earlier run
+// in the same conversation that happens to contain the same text.
+func TestReplacementSupersessionIsRunScoped(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+
+	// Run 1 completes normally, producing assistant text "world".
+	stdout1 := "{\"type\":\"text\",\"sessionID\":\"ses1\",\"part\":{\"type\":\"text\",\"text\":\"world\"}}\n{\"type\":\"step_finish\",\"sessionID\":\"ses1\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout1, "", 0, `{"info":{"id":"ses1"},"messages":[]}`)
+	runAgentRequestSession(t, a, ws, fake, "convX")
+
+	// Run 2 streams "world" (non-JSON output), then fails and recovers the
+	// full response "hello world" as a replacement.
+	stdout2 := "world\n{\"type\":\"step_finish\",\"sessionID\":\"ses2\",\"part\":{\"reason\":\"stop\"}}\n"
+	export2 := `{"info":{"id":"ses2"},"messages":[{"info":{"role":"assistant","finish":"stop"},"parts":[{"type":"text","text":"hello world"}]}]}`
+	fake.invoke(t, stdout2, "", 1, export2)
+	runAgentRequestSession(t, a, ws, fake, "convX")
+
+	merged, err := a.loadConversationMerged("convX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Run 1's "world" must be preserved verbatim; run 2's "world" fragment is
+	// replaced by "hello world". So the assistant transcript is exactly
+	// ["world", "hello world"].
+	assistant := []string{}
+	for _, ev := range merged {
+		if ev.Kind == "assistant" {
+			assistant = append(assistant, strings.TrimSpace(ev.Text))
+		}
+	}
+	want := []string{"world", "hello world"}
+	if len(assistant) != len(want) {
+		t.Fatalf("assistant transcript = %+v want %+v", assistant, want)
+	}
+	for i := range want {
+		if assistant[i] != want[i] {
+			t.Fatalf("line %d = %q want %q (full: %+v)", i, assistant[i], want[i], assistant)
+		}
+	}
+}
+
+// TestMultipleReplacementsSeparateRuns verifies two replacement recoveries in
+// separate runs each supersede only their own run's fragments.
+func TestMultipleReplacementsSeparateRuns(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+
+	// Run 1: streams "lpha" (a suffix), fails, replaces with "alpha".
+	fake.invoke(t, "{\"type\":\"text\",\"sessionID\":\"s1\",\"part\":{\"type\":\"text\",\"text\":\"lpha\"}}\n{\"type\":\"step_finish\",\"sessionID\":\"s1\",\"part\":{\"reason\":\"stop\"}}\n", "", 1,
+		`{"info":{"id":"s1"},"messages":[{"info":{"role":"assistant","finish":"stop"},"parts":[{"type":"text","text":"alpha"}]}]}`)
+	runAgentRequestSession(t, a, ws, fake, "convY")
+
+	// Run 2: streams "eta" (a suffix), fails, replaces with "beta".
+	fake.invoke(t, "{\"type\":\"text\",\"sessionID\":\"s2\",\"part\":{\"type\":\"text\",\"text\":\"eta\"}}\n{\"type\":\"step_finish\",\"sessionID\":\"s2\",\"part\":{\"reason\":\"stop\"}}\n", "", 1,
+		`{"info":{"id":"s2"},"messages":[{"info":{"role":"assistant","finish":"stop"},"parts":[{"type":"text","text":"beta"}]}]}`)
+	runAgentRequestSession(t, a, ws, fake, "convY")
+
+	merged, err := a.loadConversationMerged("convY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistant := []string{}
+	for _, ev := range merged {
+		if ev.Kind == "assistant" {
+			assistant = append(assistant, strings.TrimSpace(ev.Text))
+		}
+	}
+	want := []string{"alpha", "beta"}
+	if len(assistant) != len(want) {
+		t.Fatalf("assistant transcript = %+v want %+v", assistant, want)
+	}
+	for i := range want {
+		if assistant[i] != want[i] {
+			t.Fatalf("line %d = %q want %q", i, assistant[i], want[i])
+		}
+	}
+}
+
+// TestReplacementDoesNotRemoveClientAuthoredText verifies a client-authored
+// assistant event containing the replacement text is never dropped.
+func TestReplacementDoesNotRemoveClientAuthoredText(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+
+	// A run streams "world", fails, and replaces with "hello world".
+	fake.invoke(t, "world\n{\"type\":\"step_finish\",\"sessionID\":\"s1\",\"part\":{\"reason\":\"stop\"}}\n", "", 1,
+		`{"info":{"id":"s1"},"messages":[{"info":{"role":"assistant","finish":"stop"},"parts":[{"type":"text","text":"hello world"}]}]}`)
+	runAgentRequestSession(t, a, ws, fake, "convZ")
+
+	// A stale client tab writes a client-authored assistant event "world".
+	c := conversation{ID: "convZ", Workspace: ws, Events: []conversationEvent{
+		{Kind: "assistant", Text: "wor", CreatedAt: 1},
+	}}
+	if err := a.saveConversation(&c); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := a.loadConversationMerged("convZ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistant := []string{}
+	for _, ev := range merged {
+		if ev.Kind == "assistant" {
+			assistant = append(assistant, strings.TrimSpace(ev.Text))
+		}
+	}
+	// The client-authored "world" is preserved; only the server-owned run
+	// fragment was replaced.
+	foundWor := false
+	foundHello := false
+	for _, a := range assistant {
+		if a == "wor" {
+			foundWor = true
+		}
+		if a == "hello world" {
+			foundHello = true
+		}
+	}
+	if !foundWor || !foundHello {
+		t.Fatalf("assistant transcript = %+v should contain both client 'wor' and 'hello world'", assistant)
 	}
 }

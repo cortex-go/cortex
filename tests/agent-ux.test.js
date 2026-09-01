@@ -68,6 +68,7 @@ function makeContext(fetchImpl) {
     console,
     addEventListener: () => {},
     removeEventListener: () => {},
+    confirm: () => true,
     innerWidth: 1280,
     innerHeight: 800,
     fetch: (url, opt = {}) => { fetchCalls.push({ url, ...opt }); return fetchImplReal(url, opt); },
@@ -102,16 +103,19 @@ function run(ctx, code, vars) {
 }
 const settle = (ms = 10) => new Promise((r) => setTimeout(r, ms));
 
-async function test(name, fn) {
-  try {
-    await fn();
-    console.log('ok - ' + name);
-  } catch (e) {
-    console.error('FAIL - ' + name);
-    console.error(e && e.stack || e);
-    process.exitCode = 1;
-  }
-}
+const __tests = [];
+function test(name, fn) { __tests.push({ name, fn }); }
+
+// Any asynchronous rejection after a test has been counted must still produce
+// a nonzero process result, never be silently masked.
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED REJECTION: ' + (reason && reason.stack || reason));
+  process.exitCode = 1;
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION: ' + (err && err.stack || err));
+  process.exitCode = 1;
+});
 
 // A fake feed element with controlled scroll metrics.
 function jsonOk(v){return {ok:true,json:()=>Promise.resolve(v),headers:{get:()=>'application/json'}}}
@@ -276,3 +280,100 @@ test('busy close keeps the tab when cancellation is rejected', async () => {
   // then refuses to archive. Verify the session is still present.
   if (run(ctx, "sessions['a']") === undefined) throw new Error('session was archived despite rejection');
 });
+
+test('old run replaced by newer running run keeps spinner', async () => {
+  let i = 0;
+  const states = ['running', 'running'];
+  const ctx = loadContext((url) => {
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: states[Math.min(i++, states.length-1)], currentRunId: 'run-2', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',state:'running',currentRunId:'run-1',runID:'run-1',busy:true,events:[],followBottom:true,unread:0}};activeId='a'");
+  await run(ctx, 'reconcileRunState("a")');
+  if (!run(ctx, "sessions['a'].busy")) throw new Error('newer running run should keep the spinner');
+  if (run(ctx, "sessions['a'].currentRunId") !== 'run-2') throw new Error('currentRunId not updated');
+});
+
+test('old run replaced by newer terminal run clears spinner', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: 'completed', currentRunId: 'run-2', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',state:'running',currentRunId:'run-1',runID:'run-1',busy:true,events:[],followBottom:true,unread:0}};activeId='a'");
+  await run(ctx, 'reconcileRunState("a")');
+  if (run(ctx, "sessions['a'].busy")) throw new Error('newer terminal run should clear the spinner');
+});
+
+test('a stale poll cannot overwrite a later synchronization', async () => {
+  // The poll returns running for the old run; meanwhile a later sync set the
+  // session to completed. The poll must not force it back to running.
+  let i = 0;
+  const ctx = loadContext((url) => {
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: i++ === 0 ? 'running' : 'completed', currentRunId: 'run-1', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',state:'running',currentRunId:'run-1',runID:'run-1',busy:true,events:[],followBottom:true,unread:0}};activeId='a'");
+  const p = run(ctx, 'reconcileRunState("a")');
+  // Simulate a later synchronization setting terminal state.
+  run(ctx, "sessions['a'].state='completed';sessions['a'].busy=false");
+  await p;
+  if (run(ctx, "sessions['a'].busy")) throw new Error('stale poll overwrote later sync');
+});
+
+// Real closeSession flows: rejected cancellation keeps the tab.
+test('closeSession keeps tab when cancellation is rejected', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/cancel') return Promise.resolve({ ok: false, status: 404, text: () => Promise.resolve('not found') });
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: 'running', currentRunId: 'run-1', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',state:'running',runID:'run-1',currentRunId:'run-1',busy:true,abort:null,events:[],followBottom:true,unread:0}};activeId='a'");
+  await run(ctx, 'closeSession("a")');
+  if (run(ctx, "sessions['a']") === undefined) throw new Error('session was archived despite rejected cancellation');
+});
+
+// Real closeSession: accepted-but-draining keeps the tab.
+test('closeSession keeps tab when stop accepted but still draining', async () => {
+  let n = 0;
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/cancel') return Promise.resolve(jsonOk({ cancelled: true }));
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: n++ < 2 ? 'running' : 'running', currentRunId: 'run-1', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',state:'running',runID:'run-1',currentRunId:'run-1',busy:true,abort:null,events:[],followBottom:true,unread:0}};activeId='a'");
+  // Bypass the 30s poll timeout by forcing the conversation to stay running for
+  // the bounded wait, which reports draining.
+  await run(ctx, 'stopAgentFor(sessions["a"]).then(()=>{})');
+  if (run(ctx, "sessions['a']") === undefined) throw new Error('draining stop should keep the tab');
+});
+
+// Real closeSession: terminal cancellation archives it.
+test('closeSession archives after terminal cancellation', async () => {
+  let n = 0;
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/cancel') return Promise.resolve(jsonOk({ cancelled: true }));
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: n++ === 0 ? 'running' : 'cancelled', currentRunId: 'run-1', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',state:'running',runID:'run-1',currentRunId:'run-1',busy:true,abort:null,events:[],followBottom:true,unread:0}};activeId='a'");
+  await run(ctx, 'closeSession("a")');
+  if (run(ctx, "sessions['a']") !== undefined) throw new Error('terminal cancellation should archive the session');
+});
+
+(async function runAll() {
+  let pass = 0, fail = 0;
+  for (const { name, fn } of __tests) {
+    try {
+      await fn();
+      console.log('ok - ' + name);
+      pass++;
+    } catch (e) {
+      console.error('FAIL - ' + name);
+      console.error(e && e.stack || e);
+      process.exitCode = 1;
+      fail++;
+    }
+  }
+  console.log(`\n${pass} passed, ${fail} failed, ${__tests.length} total`);
+  if (fail > 0) process.exitCode = 1;
+})();
