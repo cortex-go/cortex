@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,6 +28,21 @@ const (
 	maxImageBytes     = 10 << 20
 	maxRunBytes       = 96 << 20
 )
+
+// sessionEvidence collects per-session activity, terminal, and error evidence
+// during the stdout stream so the authoritative main session can be resolved
+// after the loop rather than assuming the first session seen is main.
+type sessionEvidence struct {
+	firstSeen     uint64
+	hasActivity   bool
+	lastReason    string
+	stopObs       uint64
+	firstErrSeq   uint64
+	errMsg        string
+	errCode       string
+	errStatus     int
+	errBillingURL string
+}
 
 type agentRunRequest struct {
 	Workspace     string        `json:"workspace"`
@@ -206,7 +222,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	// so a restored transcript always shows the prompt first.
 	seq := int64(0)
 	if err := a.persistAgentRunEvent(runID, "user", q.Prompt, "", seq, time.Now().UnixMilli()); err != nil {
-		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", "persist user prompt: "+err.Error(), 0, 0, 0, "")
+		a.finishRunChecked(runID, clientSession, "failed", "", "persist user prompt: "+err.Error(), 0, 0, 0, "")
 		http.Error(w, "persist user prompt: "+err.Error(), 500)
 		return
 	}
@@ -227,7 +243,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		imageDir, imageFiles, err = writeImageAttachments(q.Images)
 		if err != nil {
 			run.state.recordCause(causeRequestCanceled)
-			_ = a.finishAgentRunErr(runID, clientSession, "failed", "", "invalid image: "+err.Error(), 0, 0, 0, "")
+			a.finishRunChecked(runID, clientSession, "failed", "", "invalid image: "+err.Error(), 0, 0, 0, "")
 			http.Error(w, "invalid image: "+err.Error(), 400)
 			return
 		}
@@ -251,14 +267,14 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		run.state.recordCause(causeRequestCanceled)
-		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", "stdout pipe: "+err.Error(), 0, 0, 0, "")
+		a.finishRunChecked(runID, clientSession, "failed", "", "stdout pipe: "+err.Error(), 0, 0, 0, "")
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		run.state.recordCause(causeRequestCanceled)
-		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", "stderr pipe: "+err.Error(), 0, 0, 0, "")
+		a.finishRunChecked(runID, clientSession, "failed", "", "stderr pipe: "+err.Error(), 0, 0, 0, "")
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -267,14 +283,14 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		run.state.recordCause(causeRequestCanceled)
-		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", "streaming unavailable", 0, 0, 0, "")
+		a.finishRunChecked(runID, clientSession, "failed", "", "streaming unavailable", 0, 0, 0, "")
 		http.Error(w, "streaming unavailable", 500)
 		return
 	}
 	if err := cmd.Start(); err != nil {
 		run.state.seal()
 		diag, summary := a.runDiagnostics(outcomeFailed, run.state.snapshot(), "", false, processExitStatus(cmd), nil, nil, "", false, 0, true, nil, map[string]string{"result": "not_attempted"}, causeNone, "", providerID, modelID)
-		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", summary, 0, 0, 0, diag)
+		a.finishRunChecked(runID, clientSession, "failed", "", summary, 0, 0, 0, diag)
 		_ = writeEvent(w, flusher, "error", map[string]any{"message": summary, "outcome": string(outcomeFailed)})
 		return
 	}
@@ -287,27 +303,29 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 
 	// Record request/browser disconnection as a cancellation cause. It is
 	// only accepted while no stronger cause exists and the run is not sealed.
-	requestDone := r.Context().Done()
-	go func() {
-		<-requestDone
-		run.state.recordCause(causeRequestCanceled)
-		cancel()
-	}()
+	// Guard against a nil Done() channel (e.g. background contexts in tests or
+	// internal callers), where receiving would block forever.
+	if requestDone := r.Context().Done(); requestDone != nil {
+		go func() {
+			<-requestDone
+			run.state.recordCause(causeRequestCanceled)
+			cancel()
+		}()
+	}
 
 	tail := captureTail(stderr, 64<<10)
 	var input, output uint64
 	var cost float64
-	activitySessionID := ""
 	sessionID := ""
-	// Candidate main-session error evidence captured during the stream and
-	// resolved after the loop once the activity session is known.
-	var firstErrorSeq uint64
-	firstErrorSession := ""
-	var firstErrorMsg string
-	firstErrorCode := ""
-	firstErrorStatus := 0
-	var firstErrorBillingURL string
-	lastStopReason := ""
+	// Per-session evidence is collected during the stream and resolved after
+	// the loop: the authoritative main session is the one with the latest
+	// terminal stop evidence, else the most active, else the first error's
+	// session (a prompt-start failure). Error and terminal evidence for the
+	// chosen session are then promoted chronologically.
+	sessions := map[string]*sessionEvidence{}
+	// streamedAssistant accumulates the assistant text durably persisted for
+	// the run, used by recovery reconciliation to avoid duplicating content.
+	streamedAssistant := ""
 	validStop := false
 	persistFailed := false
 	var persistErr string
@@ -316,6 +334,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	streamBytes, streamEvents := 0, 0
 	var stdoutScanErr error
 	truncated := false
+	obs := uint64(0)
 	for scan.Scan() {
 		line := append([]byte(nil), scan.Bytes()...)
 		streamBytes += len(line)
@@ -328,37 +347,45 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		}
 		var raw map[string]any
 		if json.Unmarshal(line, &raw) == nil {
+			obs++
 			collectUsage(raw, &input, &output, &cost)
-			if id, _ := raw["sessionID"].(string); id != "" {
+			id, _ := raw["sessionID"].(string)
+			if id != "" {
 				sessionID = id
 			}
 			typ, _ := raw["type"].(string)
-			// Activity events (steps, text, tools) establish the target main
-			// session. A pure subagent session never becomes the main session.
+			// Activity events (steps, text, tools) mark a session as producing
+			// output; step_finish records terminal evidence per session.
 			if typ == "step_start" || typ == "step_finish" || typ == "text" || typ == "tool_use" || typ == "reasoning" {
-				if id, _ := raw["sessionID"].(string); id != "" && activitySessionID == "" {
-					activitySessionID = id
+				if id != "" {
+					ev := sessions[id]
+					if ev == nil {
+						ev = &sessionEvidence{firstSeen: obs}
+						sessions[id] = ev
+					}
+					ev.hasActivity = true
+					if typ == "step_finish" {
+						if reason, _ := raw["part"].(map[string]any)["reason"].(string); reason != "" {
+							ev.lastReason = reason
+							ev.stopObs = obs
+						}
+					}
 				}
 			}
-			// Candidate authoritative error: capture the first main-candidate
-			// error (chronological seq, session, message, provider meta, billing
-			// URL) but do not resolve yet — the main session is only confirmed
-			// after the stream ends.
-			if typ == "error" && firstErrorSession == "" {
-				firstErrorSeq = run.state.nextSeq()
-				firstErrorSession, _ = raw["sessionID"].(string)
-				firstErrorMsg = a.redactSecrets(errorEventText(raw))
-				firstErrorCode, firstErrorStatus = providerErrorMeta(raw)
-				firstErrorBillingURL = sanitizeBillingURL(extractBillingURL(firstErrorMsg))
-			}
-			// Completion evidence must belong to the target main session and
-			// be the final relevant terminal state.
-			if typ == "step_finish" {
-				if id, _ := raw["sessionID"].(string); id == activitySessionID && activitySessionID != "" {
-					if reason, _ := raw["part"].(map[string]any)["reason"].(string); reason != "" {
-						lastStopReason = reason
-						validStop = lastStopReason == "stop"
-					}
+			// Candidate authoritative error per session: capture the first
+			// error for each session with its chronological sequence, but do
+			// not resolve until the main session is confirmed.
+			if typ == "error" && id != "" {
+				ev := sessions[id]
+				if ev == nil {
+					ev = &sessionEvidence{firstSeen: obs}
+					sessions[id] = ev
+				}
+				if ev.firstErrSeq == 0 {
+					ev.firstErrSeq = run.state.nextSeq()
+					ev.errMsg = a.redactSecrets(errorEventText(raw))
+					ev.errCode, ev.errStatus = providerErrorMeta(raw)
+					ev.errBillingURL = sanitizeBillingURL(extractBillingURL(ev.errMsg))
 				}
 			}
 			// Persist normalized server-owned events before delivery so a
@@ -370,6 +397,9 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 					persistErr = err.Error()
 					cancel()
 					break
+				}
+				if kind == "assistant" {
+					streamedAssistant = strings.TrimSpace(streamedAssistant + "\n" + text)
 				}
 				seq++
 			}
@@ -404,27 +434,48 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// Resolve the target main session. Activity events are authoritative; only
-	// when no activity occurred (a prompt-start failure) is the first error's
-	// session treated as the main session.
-	mainSessionID := activitySessionID
-	if mainSessionID == "" {
-		mainSessionID = firstErrorSession
+	// Resolve the target main session from per-session evidence. OpenCode's
+	// `run --format json` emits only the target main session's events on
+	// stdout, so in practice all events belong to one session. Defensively, we
+	// choose the session with the latest terminal stop evidence; failing that,
+	// the most recently active session; failing that, the session of the first
+	// error (a prompt-start failure).
+	mainSessionID := ""
+	var mainEv *sessionEvidence
+	for id, ev := range sessions {
+		if ev == nil {
+			continue
+		}
+		// Prefer the session with the latest terminal stop.
+		if ev.lastReason == "stop" {
+			if mainEv == nil || ev.stopObs > mainEv.stopObs {
+				mainSessionID, mainEv = id, ev
+			}
+			continue
+		}
+		if mainEv == nil {
+			mainSessionID, mainEv = id, ev
+		} else if mainEv.lastReason != "stop" && ev.hasActivity && ev.firstSeen > mainEv.firstSeen {
+			mainSessionID, mainEv = id, ev
+		}
 	}
-	// Promote the candidate error only if it belongs to the main session.
+	// Promote the main session's error evidence (first error, chronological).
 	var stdoutErrMsg string
 	stdoutErr := false
 	var providerCause runCause
 	var billingURL string
-	if firstErrorSession != "" && (mainSessionID == "" || firstErrorSession == mainSessionID) {
+	if mainEv != nil && mainEv.firstErrSeq != 0 {
 		stdoutErr = true
-		run.state.recordErrorAt(firstErrorSeq)
-		stdoutErrMsg = firstErrorMsg
-		if classifyProviderError(firstErrorMsg, firstErrorCode, firstErrorStatus) {
+		run.state.recordErrorAt(mainEv.firstErrSeq)
+		stdoutErrMsg = mainEv.errMsg
+		if classifyProviderError(mainEv.errMsg, mainEv.errCode, mainEv.errStatus) {
 			providerCause = causeProviderInsufficientBalance
-			run.state.recordProviderFailureAt(firstErrorSeq)
-			billingURL = firstErrorBillingURL
+			run.state.recordProviderFailureAt(mainEv.firstErrSeq)
+			billingURL = mainEv.errBillingURL
 		}
+	}
+	if mainEv != nil {
+		validStop = mainEv.lastReason == "stop"
 	}
 	// The durable session identifier for recovery, persistence and the
 	// terminal payload is always the target main session.
@@ -469,20 +520,25 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 					recoveryResult = "failed"
 				} else {
 					recovered = strings.TrimSpace(recovered)
-					if recovered != "" {
-						// Persist the recovered answer under its own provenance
-						// marker and sequence, before delivery.
-						if err := a.persistAgentRunEvent(runID, "assistant", recovered, "recovered", seq, time.Now().UnixMilli()); err != nil {
+					// Reconcile against the assistant text already durably
+					// streamed for this run: only the missing portion is
+					// persisted, and recovery is suppressed when the complete
+					// response is already present.
+					missing, suppressed := reconcileRecovered(streamedAssistant, recovered)
+					if suppressed {
+						recoveryResult = "ok_suppressed"
+					} else if missing == "" {
+						recoveryResult = "ok_empty"
+					} else {
+						if err := a.persistAgentRunEvent(runID, "assistant", missing, "recovered", seq, time.Now().UnixMilli()); err != nil {
 							recoveryResult = "persist_failed"
 						} else {
 							seq++
 							recoveryResult = "ok"
-							if err := writeEvent(w, flusher, "recovered", map[string]any{"text": recovered, "sessionID": sessionID, "recovered": true}); err != nil {
+							if err := writeEvent(w, flusher, "recovered", map[string]any{"text": missing, "sessionID": sessionID, "recovered": true}); err != nil {
 								deliveryErr = err
 							}
 						}
-					} else {
-						recoveryResult = "ok_empty"
 					}
 					for _, im := range images {
 						url := sanitizeImageURL(im["url"])
@@ -521,10 +577,17 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	diag, summary := a.runDiagnostics(outcome, snap, stdoutErrMsg, validStop, exit, stderrErrors, stderrWarnings, a.redactSecrets(stderrText), stderrTrunc, seq, false, stdoutScanErr, map[string]string{"result": recoveryResult}, providerCause, billingURL, providerID, modelID)
 	// The terminal event carries the run identity and outcome so technical
 	// details survive reload; the name field encodes them as
-	// "run:<runID>:<outcome>".
-	_ = a.persistAgentRunEvent(runID, terminalKind(outcome), summary, "run:"+runID+":"+string(outcome), seq, time.Now().UnixMilli())
+	// "run:<runID>:<outcome>". Persistence is checked: a storage failure must
+	// never be represented as a durable completion.
+	if err := a.persistAgentRunEvent(runID, terminalKind(outcome), summary, "run:"+runID+":"+string(outcome), seq, time.Now().UnixMilli()); err != nil {
+		a.storageFailure(runID, clientSession, sessionID, "terminal event", err, input, output, cost, w, flusher)
+		return
+	}
 	seq++
-	finishErr := a.finishAgentRun(runID, clientSession, string(outcome), sessionID, summary, input, output, cost, diag)
+	if err := a.finishAgentRun(runID, clientSession, string(outcome), sessionID, summary, input, output, cost, diag); err != nil {
+		a.storageFailure(runID, clientSession, sessionID, "run-state", err, input, output, cost, w, flusher)
+		return
+	}
 
 	// Terminal delivery is attempted only when the stream is still writable.
 	// The delivery outcome is captured from the actual write result.
@@ -584,14 +647,83 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			diag2 = string(b)
 		}
 	}
-	// Persist the updated diagnostics with the delivery outcome. The run-state
-	// update error is retained as evidence of an incomplete terminal record.
-	_ = a.finishAgentRun(runID, clientSession, string(outcome), sessionID, summary2, input, output, cost, diag2)
-	if finishErr != nil {
-		// The first terminal update failed; surface it via the summary so it
-		// is never silently claimed as a durable completion.
-		_ = summary2
+	// Persist the updated diagnostics with the delivery outcome. This final
+	// run-state update is checked; a failure is logged and the run is left in
+	// the storage-failure outcome rather than a durable completion.
+	if err := a.finishAgentRun(runID, clientSession, string(outcome), sessionID, summary2, input, output, cost, diag2); err != nil {
+		a.storageFailure(runID, clientSession, sessionID, "post-delivery run-state", err, input, output, cost, w, flusher)
 	}
+}
+
+// storageFailure handles a terminal persistence failure: it logs at ERROR with
+// the run ID, best-effort updates the durable run to a storage-failure outcome,
+// and emits a bounded client-facing failure if the stream is still writable.
+// The original error is never suppressed.
+func (a *App) storageFailure(runID, clientSession, sessionID, stage string, err error, input, output uint64, cost float64, w http.ResponseWriter, f http.Flusher) {
+	log.Printf("cortex agent run %s: %s persistence failed: %v", runID, stage, err)
+	summary := "The agent result could not be stored durably."
+	d := diagnostics{
+		Outcome:       string(outcomeFailed),
+		Category:      "storage_failure",
+		Summary:       summary,
+		DeliveryError: "persistence failed: " + err.Error(),
+	}
+	diag, _ := json.Marshal(d)
+	if ferr := a.finishAgentRun(runID, clientSession, string(outcomeFailed), sessionID, summary, input, output, cost, string(diag)); ferr != nil {
+		log.Printf("cortex agent run %s: storage-failure finalization also failed: %v", runID, ferr)
+	}
+	if w != nil && f != nil {
+		_ = writeEvent(w, f, "error", map[string]any{"message": summary, "outcome": string(outcomeFailed), "runId": runID})
+	}
+}
+
+// reconcileRecovered compares recovered assistant text against the assistant
+// text already durably streamed for the run, returning the missing portion to
+// persist and whether recovery should be suppressed entirely (the complete
+// response is already present).
+//
+// Policy:
+//   - recovered identical to streamed -> suppress (no duplicate)
+//   - recovered starts with streamed  -> persist only the missing suffix
+//   - streamed is a suffix / partial overlap -> persist only the genuinely
+//     new tail (longest common overlap)
+//   - no overlap -> persist the recovered text (genuinely new)
+//   - empty recovered -> suppress
+func reconcileRecovered(streamed, recovered string) (missing string, suppressed bool) {
+	s := strings.TrimSpace(streamed)
+	r := strings.TrimSpace(recovered)
+	if r == "" {
+		return "", true
+	}
+	if s == "" {
+		return r, false
+	}
+	if r == s {
+		return "", true
+	}
+	// The recovered text is fully contained in the already-streamed text: the
+	// complete response is present, so nothing is appended.
+	if strings.Contains(s, r) {
+		return "", true
+	}
+	// Recovered starts with streamed -> only the missing suffix is new.
+	if strings.HasPrefix(r, s) {
+		return strings.TrimSpace(r[len(s):]), false
+	}
+	// Streamed is a suffix of recovered -> only the new prefix is missing.
+	if strings.HasSuffix(r, s) {
+		return strings.TrimSpace(r[:len(r)-len(s)]), false
+	}
+	// Partial overlap: find the longest suffix of streamed that is a prefix of
+	// recovered so only the genuinely new tail is persisted.
+	for i := len(s); i > 0; i-- {
+		if strings.HasPrefix(r, s[len(s)-i:]) {
+			// s[len(s)-i:] has length i and is a prefix of r; the new tail is
+			// r[i:].
+			return strings.TrimSpace(r[i:]), false
+		}
+	}
+	return r, false
 }
 
 // sanitizeImageURL validates or rewrites an unsafe file URL before persistence
@@ -615,6 +747,14 @@ func sanitizeImageURL(u string) string {
 		return ""
 	}
 	return "file://" + p
+}
+
+// finishRunChecked finalizes an early-failed run and logs at ERROR if that
+// finalization itself fails, so a storage failure is never silently dropped.
+func (a *App) finishRunChecked(id, conversationID, state, sessionID, message string, input, output uint64, cost float64, diag string) {
+	if err := a.finishAgentRun(id, conversationID, state, sessionID, message, input, output, cost, diag); err != nil {
+		log.Printf("cortex agent run %s: finalize failed: %v", id, err)
+	}
 }
 
 // finishAgentRunErr is the error-returning form of finishAgentRun used when

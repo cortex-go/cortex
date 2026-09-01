@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1113,5 +1114,369 @@ func TestTaskSnapshotValidation(t *testing.T) {
 	malformed := map[string]any{"type": "tool_use", "part": map[string]any{"tool": "todowrite", "state": map[string]any{"input": map[string]any{"todos": "nope"}}}}
 	if got := taskSnapshot(malformed); got != "" {
 		t.Fatal("malformed todowrite produced a snapshot")
+	}
+}
+
+// --- fault-injection: terminal persistence must fail closed ---
+
+func TestAgentRunTerminalEventInsertFailureFailsClosed(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
+	// Fail any terminal-event insert ("done"/"error"/"cancelled"/"truncated").
+	a.failAgentRunEvent = func(runID, kind string) error {
+		switch kind {
+		case "done", "error", "cancelled", "truncated":
+			return errors.New("injected terminal insert failure")
+		}
+		return nil
+	}
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	var terminal map[string]any
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+		if t, _ := ev["type"].(string); t == "error" {
+			terminal = ev["data"].(map[string]any)
+		}
+	}
+	if runID == "" {
+		t.Fatal("no run id")
+	}
+	// The run must be failed (storage failure), never durably completed.
+	if state := runStateFromDB(t, a, runID); state != string(outcomeFailed) {
+		t.Fatalf("state = %q want failed (storage failure)", state)
+	}
+	// A bounded client-facing failure must be emitted.
+	if terminal == nil || terminal["outcome"] != string(outcomeFailed) {
+		t.Fatalf("terminal event missing failure outcome: %+v", terminal)
+	}
+	if msg, _ := terminal["message"].(string); !strings.Contains(msg, "stored durably") {
+		t.Fatalf("terminal message should be bounded storage failure: %q", msg)
+	}
+}
+
+func TestAgentRunPostDeliveryFinalizeFailureFailsClosed(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
+	// Fail only the final (post-delivery) run-state update. The first
+	// finishAgentRun succeeds, so the run reaches its real outcome; the second
+	// update (with delivery diagnostics) fails and must be logged + left in
+	// the storage-failure outcome.
+	fail := true
+	a.failFinishAgentRun = func(runID string) error {
+		if fail {
+			fail = false
+			return errors.New("injected finalize failure")
+		}
+		return nil
+	}
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if runID == "" {
+		t.Fatal("no run id")
+	}
+	// The storage-failure path finalizes as failed.
+	if state := runStateFromDB(t, a, runID); state != string(outcomeFailed) {
+		t.Fatalf("state = %q want failed after post-delivery failure", state)
+	}
+}
+
+func TestAgentRunUserPromptPersistFailureFailsClosed(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	a.failAgentRunEvent = func(runID, kind string) error {
+		if kind == "user" {
+			return errors.New("injected user prompt failure")
+		}
+		return nil
+	}
+	body, _ := json.Marshal(map[string]any{"workspace": ws, "prompt": "test", "clientSession": "conv1"})
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/agent/run", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.agentRun(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d want 500", rec.Code)
+	}
+	var n int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM agent_runs WHERE conversation_id='conv1'").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("durable run row missing after user-prompt failure")
+	}
+	var state string
+	if err := a.db.QueryRow("SELECT state FROM agent_runs WHERE conversation_id='conv1' LIMIT 1").Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(outcomeFailed) {
+		t.Fatalf("state = %q want failed", state)
+	}
+}
+
+func TestReconcileRecovered(t *testing.T) {
+	cases := []struct {
+		name           string
+		streamed       string
+		recovered      string
+		wantMissing    string
+		wantSuppressed bool
+	}{
+		{"identical", "hello world", "hello world", "", true},
+		{"recovered prefix of streamed", "hello world extra", "hello world", "", true},
+		{"streamed prefix of recovered", "hello world", "hello world more", "more", false},
+		{"streamed suffix overlap", "world", "hello world", "hello", false},
+		{"partial overlap", "prefix mid", "mid suffix", "suffix", false},
+		{"no overlap", "alpha", "beta", "beta", false},
+		{"empty recovered", "alpha", "", "", true},
+		{"empty streamed", "", "beta", "beta", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			missing, suppressed := reconcileRecovered(tc.streamed, tc.recovered)
+			if suppressed != tc.wantSuppressed {
+				t.Fatalf("suppressed = %v want %v", suppressed, tc.wantSuppressed)
+			}
+			if strings.TrimSpace(missing) != tc.wantMissing {
+				t.Fatalf("missing = %q want %q", missing, tc.wantMissing)
+			}
+		})
+	}
+}
+
+func TestAgentRunRecoverySuppressedWhenCompleteAlreadyStreamed(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	// The complete final answer is streamed before the failure, so recovery
+	// must be suppressed rather than duplicating it.
+	stdout := "{\"type\":\"text\",\"sessionID\":\"ses_x\",\"part\":{\"type\":\"text\",\"text\":\"final answer\"}}\n{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	export := `{"info":{"id":"ses_x"},"messages":[{"info":{"role":"assistant","finish":"stop"},"parts":[{"type":"text","text":"final answer"}]}]}`
+	fake.invoke(t, stdout, "", 1, export)
+	events := runAgentRequest(t, a, ws, fake)
+	for _, ev := range events {
+		if et, _ := ev["type"].(string); et == "recovered" {
+			t.Fatalf("recovery not suppressed: %+v", ev)
+		}
+	}
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	d := runDiagnosticsFromDB(t, a, runID)
+	if d.RecoveryResult != "ok_suppressed" {
+		t.Fatalf("recovery result = %q want ok_suppressed", d.RecoveryResult)
+	}
+}
+
+func TestAgentRunRecoveryPersistsOnlyMissingPortion(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	// Streamed is a prefix of the recovered answer: only the missing suffix is
+	// persisted and delivered.
+	stdout := "{\"type\":\"text\",\"sessionID\":\"ses_x\",\"part\":{\"type\":\"text\",\"text\":\"partial \"}}\n{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	export := `{"info":{"id":"ses_x"},"messages":[{"info":{"role":"assistant","finish":"stop"},"parts":[{"type":"text","text":"partial final"}]}]}`
+	fake.invoke(t, stdout, "", 1, export)
+	events := runAgentRequest(t, a, ws, fake)
+	found := ""
+	for _, ev := range events {
+		if t, _ := ev["type"].(string); t == "recovered" {
+			found = ev["data"].(map[string]any)["text"].(string)
+		}
+	}
+	if found != "final" {
+		t.Fatalf("recovered text = %q want 'final' (missing portion only)", found)
+	}
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	// Verify no duplicate assistant event was persisted.
+	events2, err := a.loadAgentRunEvents("conv1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, ev := range events2 {
+		if ev.Kind == "assistant" && strings.Contains(ev.Text, "partial") {
+			count++
+		}
+	}
+	_ = runID
+	if count != 1 {
+		t.Fatalf("partial text persisted %d times, want 1", count)
+	}
+}
+
+// --- per-session main-session correlation ---
+
+func TestAgentRunSubagentErrorThenMainBillingError(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	// A subagent error arrives first; the main session's billing error arrives
+	// afterward with a main-session stop. The main session must win.
+	stdout := "{\"type\":\"error\",\"sessionID\":\"ses_sub\",\"error\":{\"data\":{\"message\":\"generic subagent failure\"}}}\n" +
+		"{\"type\":\"step_finish\",\"sessionID\":\"ses_main\",\"part\":{\"reason\":\"stop\"}}\n" +
+		"{\"type\":\"error\",\"sessionID\":\"ses_main\",\"error\":{\"data\":{\"message\":\"Insufficient balance\"}}}\n"
+	fake.invoke(t, stdout, "", 1, `{"info":{"id":"ses_main"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	d := runDiagnosticsFromDB(t, a, runID)
+	if d.ProviderCause != string(causeProviderInsufficientBalance) {
+		t.Fatalf("main billing error not classified: providerCause=%q", d.ProviderCause)
+	}
+	if d.BillingURL != "" {
+		t.Fatalf("unexpected billing URL from subagent evidence: %q", d.BillingURL)
+	}
+}
+
+func TestAgentRunSubagentErrorThenMainGenericError(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	// Subagent billing-looking error first, then main generic error. The main
+	// session's error must be the one retained (generic), not billing.
+	stdout := "{\"type\":\"error\",\"sessionID\":\"ses_sub\",\"error\":{\"data\":{\"message\":\"Insufficient balance\"}}}\n" +
+		"{\"type\":\"step_finish\",\"sessionID\":\"ses_main\",\"part\":{\"reason\":\"stop\"}}\n" +
+		"{\"type\":\"error\",\"sessionID\":\"ses_main\",\"error\":{\"data\":{\"message\":\"provider crashed\"}}}\n"
+	fake.invoke(t, stdout, "", 1, `{"info":{"id":"ses_main"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	d := runDiagnosticsFromDB(t, a, runID)
+	if d.ProviderCause != "" {
+		t.Fatalf("subagent billing misclassified main: providerCause=%q", d.ProviderCause)
+	}
+	if d.StdoutError == "" || strings.Contains(d.StdoutError, "Insufficient balance") {
+		t.Fatalf("main generic error not retained: stdoutError=%q", d.StdoutError)
+	}
+}
+
+func TestAgentRunMainStopThenSubagentError(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	// Main session completes (stop), then a subagent error arrives. The main
+	// session's completion must not be invalidated by the subagent error.
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_main\",\"part\":{\"reason\":\"stop\"}}\n" +
+		"{\"type\":\"error\",\"sessionID\":\"ses_sub\",\"error\":{\"data\":{\"message\":\"Insufficient balance\"}}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_main"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeCompleted) {
+		t.Fatalf("main stop then subagent error state = %q want completed", state)
+	}
+	d := runDiagnosticsFromDB(t, a, runID)
+	if d.ProviderCause != "" {
+		t.Fatalf("subagent error misclassified main: %q", d.ProviderCause)
+	}
+}
+
+func TestAgentRunInterleavedMainSubagentSteps(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	// Interleaved step_finish from subagent and main; only the main session's
+	// final stop counts as completion evidence.
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_sub\",\"part\":{\"reason\":\"tool-calls\"}}\n" +
+		"{\"type\":\"step_finish\",\"sessionID\":\"ses_main\",\"part\":{\"reason\":\"tool-calls\"}}\n" +
+		"{\"type\":\"step_finish\",\"sessionID\":\"ses_sub\",\"part\":{\"reason\":\"stop\"}}\n" +
+		"{\"type\":\"step_finish\",\"sessionID\":\"ses_main\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_main"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeCompleted) {
+		t.Fatalf("interleaved steps state = %q want completed", state)
+	}
+}
+
+func TestAgentRunPromptStartFailureNoActivity(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	// No activity; a single error at start. The error's session is the main
+	// session and the billing error must classify.
+	stdout := "{\"type\":\"error\",\"sessionID\":\"ses_main\",\"error\":{\"data\":{\"message\":\"Insufficient balance\"}}}\n"
+	fake.invoke(t, stdout, "", 1, `{"info":{"id":"ses_main"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	d := runDiagnosticsFromDB(t, a, runID)
+	if d.ProviderCause != string(causeProviderInsufficientBalance) {
+		t.Fatalf("prompt-start billing not classified: %q", d.ProviderCause)
+	}
+}
+
+// --- nil request context Done() channel ---
+
+func TestAgentRunNilContextDoneDoesNotLeak(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
+	// Use a background context whose Done() is nil; the runner must not spawn
+	// a blocking goroutine and must still complete normally.
+	body, _ := json.Marshal(map[string]any{"workspace": ws, "prompt": "test", "clientSession": "conv1"})
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/agent/run", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(context.Background())
+	rec := httptest.NewRecorder()
+	a.agentRun(rec, req)
+	sc := bufio.NewScanner(rec.Body)
+	sawDone := false
+	for sc.Scan() {
+		var ev map[string]any
+		if json.Unmarshal([]byte(sc.Text()), &ev) == nil {
+			if ev["type"] == "done" {
+				sawDone = true
+			}
+		}
+	}
+	if !sawDone {
+		t.Fatal("run did not complete with nil Done() context")
 	}
 }

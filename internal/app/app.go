@@ -42,6 +42,9 @@ type App struct {
 	runSlots              chan struct{}
 	requestSlots          chan struct{}
 	settings              Settings
+	// test hooks (nil in production) inject persistence failures deterministically.
+	failAgentRunEvent  func(runID, kind string) error
+	failFinishAgentRun func(runID string) error
 }
 
 // activeRun tracks a live OpenCode process and its synchronized cancellation
