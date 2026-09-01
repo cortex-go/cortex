@@ -88,8 +88,9 @@ function makeContext(fetchImpl) {
   return ctx;
 }
 
-function loadContext(fetchImpl) {
+function loadContext(fetchImpl, preload) {
   const ctx = makeContext(fetchImpl);
+  if (preload) for (const k of Object.keys(preload)) ctx[k] = preload[k];
   vm.createContext(ctx);
   vm.runInContext(SCRIPT, ctx);
   return ctx;
@@ -332,32 +333,121 @@ test('closeSession keeps tab when cancellation is rejected', async () => {
   if (run(ctx, "sessions['a']") === undefined) throw new Error('session was archived despite rejected cancellation');
 });
 
-// Real closeSession: accepted-but-draining keeps the tab.
+// Real closeSession: accepted-but-draining keeps the tab, is not archived, the
+// active selection is unchanged, and the pending-stop message is surfaced.
 test('closeSession keeps tab when stop accepted but still draining', async () => {
   let n = 0;
+  const preload = { __STOP_SETTLE_MS: 20, __RECONCILE_STOP_WAIT_MS: 150 };
   const ctx = loadContext((url) => {
     if (url === '/api/agent/cancel') return Promise.resolve(jsonOk({ cancelled: true }));
-    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: n++ < 2 ? 'running' : 'running', currentRunId: 'run-1', events: [] }]));
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: n++ < 3 ? 'running' : 'running', currentRunId: 'run-1', events: [] }]));
     return Promise.resolve(jsonOk({}));
-  });
+  }, preload);
   run(ctx, "sessions={a:{id:'a',workspace:'/w',state:'running',runID:'run-1',currentRunId:'run-1',busy:true,abort:null,events:[],followBottom:true,unread:0}};activeId='a'");
-  // Bypass the 30s poll timeout by forcing the conversation to stay running for
-  // the bounded wait, which reports draining.
-  await run(ctx, 'stopAgentFor(sessions["a"]).then(()=>{})');
-  if (run(ctx, "sessions['a']") === undefined) throw new Error('draining stop should keep the tab');
+  await run(ctx, 'closeSession("a")');
+  if (run(ctx, "sessions['a']") === undefined) throw new Error('draining close must keep the tab in the open map');
+  if (run(ctx, "closedSessions.some(x=>x.id==='a')")) throw new Error('draining close must not archive the session');
+  if (run(ctx, "activeId") !== 'a') throw new Error('active selection changed while draining');
+  const msg = run(ctx, `$('#toast').textContent`);
+  if (!msg.includes('winding down')) throw new Error('pending-stop message not surfaced: ' + msg);
 });
 
 // Real closeSession: terminal cancellation archives it.
 test('closeSession archives after terminal cancellation', async () => {
   let n = 0;
+  const preload = { __STOP_SETTLE_MS: 20, __RECONCILE_STOP_WAIT_MS: 300 };
   const ctx = loadContext((url) => {
     if (url === '/api/agent/cancel') return Promise.resolve(jsonOk({ cancelled: true }));
     if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: n++ === 0 ? 'running' : 'cancelled', currentRunId: 'run-1', events: [] }]));
     return Promise.resolve(jsonOk({}));
-  });
+  }, preload);
   run(ctx, "sessions={a:{id:'a',workspace:'/w',state:'running',runID:'run-1',currentRunId:'run-1',busy:true,abort:null,events:[],followBottom:true,unread:0}};activeId='a'");
   await run(ctx, 'closeSession("a")');
   if (run(ctx, "sessions['a']") !== undefined) throw new Error('terminal cancellation should archive the session');
+});
+
+// Direct Stop control: explicit non-success cancel response is rejected.
+test('stopAgent shows rejected message on explicit cancel refusal', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/cancel') return Promise.resolve({ ok: false, status: 404, text: () => Promise.resolve('run not found') });
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',state:'running',runID:'run-1',busy:true,abort:null,events:[],followBottom:true,unread:0}};activeId='a'");
+  const res = await run(ctx, 'stopAgentFor(sessions["a"])');
+  if (res.rejected !== true) throw new Error('explicit refusal must be rejected, got ' + JSON.stringify(res));
+  await run(ctx, 'stopAgent()');
+  const msg = run(ctx, `$('#toast').textContent`);
+  if (msg !== 'Could not stop the running agent.') throw new Error('rejected toast = ' + msg);
+});
+
+// Direct Stop control: confirmed cancel followed by terminal is a clean stop.
+test('stopAgent shows terminal message on confirmed cancel', async () => {
+  let n = 0;
+  const preload = { __STOP_SETTLE_MS: 10, __RECONCILE_STOP_WAIT_MS: 300 };
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/cancel') return Promise.resolve(jsonOk({ cancelled: true }));
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: n++ === 0 ? 'running' : 'cancelled', currentRunId: 'run-1', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  }, preload);
+  run(ctx, "sessions={a:{id:'a',state:'running',runID:'run-1',busy:true,abort:null,events:[],followBottom:true,unread:0}};activeId='a'");
+  const res = await run(ctx, 'stopAgentFor(sessions["a"])');
+  if (res.ok !== true) throw new Error('terminal stop should be ok, got ' + JSON.stringify(res));
+  await run(ctx, 'stopAgent()');
+  const msg = run(ctx, `$('#toast').textContent`);
+  if (msg !== 'Agent stopped.') throw new Error('terminal toast = ' + msg);
+});
+
+// Direct Stop control: confirmed cancel followed by a still-running state is draining.
+test('stopAgent shows draining message on acknowledged still-running cancel', async () => {
+  const preload = { __STOP_SETTLE_MS: 10, __RECONCILE_STOP_WAIT_MS: 150 };
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/cancel') return Promise.resolve(jsonOk({ cancelled: true }));
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: 'running', currentRunId: 'run-1', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  }, preload);
+  run(ctx, "sessions={a:{id:'a',state:'running',runID:'run-1',busy:true,abort:null,events:[],followBottom:true,unread:0}};activeId='a'");
+  const res = await run(ctx, 'stopAgentFor(sessions["a"])');
+  if (res.draining !== true) throw new Error('acknowledged still-running must be draining, got ' + JSON.stringify(res));
+  await run(ctx, 'stopAgent()');
+  const msg = run(ctx, `$('#toast').textContent`);
+  if (!msg.includes('winding down')) throw new Error('draining toast = ' + msg);
+});
+
+// Timeout: a cancel request that never returns, followed by terminal state, is
+// a successful stop (reconciled against authoritative state).
+test('stopAgent cancel timeout followed by terminal returns success', async () => {
+  let n = 0;
+  const preload = { __CANCEL_TIMEOUT_MS: 30, __STOP_SETTLE_MS: 10, __RECONCILE_STOP_WAIT_MS: 300 };
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/cancel') return new Promise(() => {});
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: n++ === 0 ? 'running' : 'cancelled', currentRunId: 'run-1', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  }, preload);
+  run(ctx, "sessions={a:{id:'a',state:'running',runID:'run-1',busy:true,abort:null,events:[],followBottom:true,unread:0}};activeId='a'");
+  const res = await run(ctx, 'stopAgentFor(sessions["a"])');
+  if (res.ok !== true) throw new Error('timeout then terminal should stop cleanly, got ' + JSON.stringify(res));
+  if (res.unconfirmed) throw new Error('terminal must not be reported unconfirmed');
+  await run(ctx, 'stopAgent()');
+  const msg = run(ctx, `$('#toast').textContent`);
+  if (msg !== 'Agent stopped.') throw new Error('timeout-terminal toast = ' + msg);
+});
+
+// Timeout: a cancel request that never returns, followed by a still-running
+// state, is unconfirmed (never described as an explicit rejection).
+test('stopAgent cancel timeout followed by running is unconfirmed not rejected', async () => {
+  const preload = { __CANCEL_TIMEOUT_MS: 30, __STOP_SETTLE_MS: 10, __RECONCILE_STOP_WAIT_MS: 150 };
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/cancel') return new Promise(() => {});
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: 'running', currentRunId: 'run-1', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  }, preload);
+  run(ctx, "sessions={a:{id:'a',state:'running',runID:'run-1',busy:true,abort:null,events:[],followBottom:true,unread:0}};activeId='a'");
+  const res = await run(ctx, 'stopAgentFor(sessions["a"])');
+  if (res.rejected) throw new Error('timeout must never be reported as rejected');
+  if (res.unconfirmed !== true) throw new Error('timeout still-running must be unconfirmed, got ' + JSON.stringify(res));
+  await run(ctx, 'stopAgent()');
+  const msg = run(ctx, `$('#toast').textContent`);
+  if (!msg.includes('Could not confirm the stop')) throw new Error('unconfirmed toast = ' + msg);
 });
 
 (async function runAll() {

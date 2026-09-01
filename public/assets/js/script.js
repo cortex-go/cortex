@@ -49,12 +49,12 @@ async function closeSession(id){
   if(s.busy&&!confirm('This agent is still working. Stop and close it?'))return;
   if(s.busy){
     // Submit the server-side stop, then wait for a durable terminal outcome via
-    // bounded reconciliation. Genuine rejection keeps the tab; an accepted-but-
-    // still-draining stop keeps the tab and reports that the stop is pending
-    // rather than claiming it failed.
+    // bounded reconciliation. Rejection and unconfirmed results keep the tab;
+    // an accepted-but-still-draining stop keeps the tab and reports pending.
     const res=await stopAgentFor(s);
     if(res&&res.rejected){toast('Could not stop the running agent; the session stays open.');return}
     if(res&&res.draining){toast('Stop accepted; the agent is still winding down.');return}
+    if(res&&res.unconfirmed){toast('Could not confirm the stop; the agent is still running.');return}
     if(s.busy)await reconcileRunState(id);
   }else{s.abort?.abort()}
   const archived={...sessionSafe(s),archivedAt:Date.now(),closedAt:Date.now()};
@@ -270,8 +270,12 @@ function summarize(ev){const raw=ev?.data?.data||ev?.data||{},type=String(raw.ty
 // newer run replaces it, or the documented timeout is reached. Concurrent
 // polling for the same session is deduplicated.
 const reconcilePolls=new Map();
-const RECONCILE_MAX_WAIT_MS=30000;
-async function reconcileRunState(id){
+// RECONCILE_MAX_WAIT_MS and RECONCILE_STOP_WAIT_MS are overridable through the
+// window for tests (e.g. window.__RECONCILE_MAX_WAIT_MS) to keep suites fast.
+const RECONCILE_MAX_WAIT_MS=(typeof window!=='undefined'&&window.__RECONCILE_MAX_WAIT_MS)||30000;
+const RECONCILE_STOP_WAIT_MS=(typeof window!=='undefined'&&window.__RECONCILE_STOP_WAIT_MS)||5000;
+async function reconcileRunState(id, maxWaitMs){
+  maxWaitMs=maxWaitMs||RECONCILE_MAX_WAIT_MS;
   if(!sessions[id]||reconcilePolls.has(id))return;
   reconcilePolls.set(id,true);
   try{
@@ -280,7 +284,7 @@ async function reconcileRunState(id){
     // Capture the run being reconciled separately so the session's mutable
     // currentRunId is never mistaken for the reconciliation target.
     const targetRunId=sessions[id].currentRunId||sessions[id].runID||'';
-    while(Date.now()-start<RECONCILE_MAX_WAIT_MS){
+    while(Date.now()-start<maxWaitMs){
       const s=sessions[id];
       if(!s)return; // session removed
       try{
@@ -314,39 +318,57 @@ async function reconcileRunState(id){
 }
 async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace||workspaceUnavailable(s))return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();s.runID='';if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');const images=attachments.map(a=>({name:a.name,data:a.dataUrl}));for(const a of attachments)addEvent(id,'image',a.thumb,a.name);addEvent(id,'user',prompt);attachments=[];renderAttachments();renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id,images}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';const seenImages=new Set();for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line),text=summarize(ev),raw=ev?.data?.data||ev?.data||{};if(ev.type==='run'&&raw.runID){s.runID=raw.runID;s.currentRunId=raw.runID}if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;const oc=raw.outcome||'';if(oc)s.state=oc;else if(ev.type==='done')s.state='completed';else if(ev.type==='error')s.state='failed';else if(ev.type==='cancelled')s.state='cancelled';else if(ev.type==='truncated')s.state='truncated';if(ev.type==='done'||ev.type==='error'||ev.type==='cancelled'||ev.type==='truncated'){s.busy=false;s.abort=null};const termEvent={kind:eventKind(ev),text:summarize(ev),name:'run:'+(raw.runID||s.runID)+':'+oc,outcome:oc,runID:raw.runID||s.runID};if(termEvent.text)addEvent(id,termEvent.kind,termEvent.text,termEvent.name,{outcome:oc,runID:termEvent.runID});if(ev.type==='recovered-images'){for(const im of (raw.images||[]))addGeneratedImage(id,im)}for(const im of extractImages(raw)){if(seenImages.has(im.url))continue;seenImages.add(im.url);addGeneratedImage(id,im)}}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].abort=null;persistLocalState();saveSessionToServer(id);if(sessions[id]&&sessions[id].busy){reconcileRunState(id)}}if(activeId===id)renderAll();agentStatus()}}
 
-// stopAgent performs a server-side, authenticated Stop for the active run. The
-// streaming request is left open; only if the cancellation request fails or
-// exceeds a short timeout does the client fall back to aborting the fetch.
+// stopAgent performs a server-side, authenticated Stop for the active run and
+// surfaces the distinct outcome: terminal stop, explicit rejection, accepted-
+// but-draining, or an unconfirmed (timeout/transport) result.
 async function stopAgent(){
   const s=active();if(!s)return;
   const res=await stopAgentFor(s);
   if(res&&res.rejected)toast('Could not stop the running agent.');
   else if(res&&res.draining)toast('Stop accepted; the agent is still winding down.');
+  else if(res&&res.unconfirmed)toast('Could not confirm the stop; the agent is still running.');
   else toast('Agent stopped.');
+}
+// requestCancel sends the authenticated cancel request and reports whether it
+// was acknowledged, explicitly rejected, or unconfirmed (timeout/transport).
+const CANCEL_TIMEOUT_MS=(typeof window!=='undefined'&&window.__CANCEL_TIMEOUT_MS)||2000;
+const STOP_SETTLE_MS=(typeof window!=='undefined'&&window.__STOP_SETTLE_MS)||1500;
+async function requestCancel(runID){
+  let res;
+  try{
+    res=await Promise.race([
+      fetch('/api/agent/cancel',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState?.csrf||''},body:JSON.stringify({runID})}),
+      new Promise((_,rej)=>setTimeout(()=>rej(Error('cancel timeout')),CANCEL_TIMEOUT_MS))
+    ]);
+  }catch{return {unconfirmed:true}}
+  if(res&&res.ok)return {acknowledged:true};
+  return {rejected:true};
 }
 // stopAgentFor submits the server-side stop and waits for the run to reach a
 // durable terminal state via bounded reconciliation. It resolves to
 // {ok:true} when the run became terminal, {ok:false,rejected:true} when the
-// server refused cancellation, or {ok:false,draining:true} when cancellation
-// was accepted but the run is still draining after the bounded wait.
+// server explicitly refused cancellation, {ok:false,draining:true} when the
+// stop was acknowledged but the run is still draining, and
+// {ok:false,unconfirmed:true} when the cancel request timed out or failed and
+// the run is still running (never described as an explicit rejection).
 async function stopAgentFor(s){
   if(!s?.busy)return {ok:true};
   const abortFallback=()=>s.abort?.abort();
   if(!s.runID){abortFallback();return {ok:false,rejected:true}}
-  try{
-    await Promise.race([
-      api('/api/agent/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runID:s.runID})}),
-      new Promise((_,rej)=>setTimeout(()=>rej(Error('cancel timeout')),2000))
-    ]);
-    // Wait for the durable terminal event; if it did not arrive, poll the
-    // server with bounded backoff until the run is terminal or the timeout.
-    await new Promise(res=>setTimeout(res,1500));
+  const cancelResult=await requestCancel(s.runID);
+  if(cancelResult.rejected)return {ok:false,rejected:true};
+  const acknowledged=cancelResult.acknowledged===true;
+  // Wait briefly for the durable terminal event; if it did not arrive, poll
+  // the server with a bounded budget.
+  await new Promise(res=>setTimeout(res,STOP_SETTLE_MS));
+  if(s.busy){
+    await reconcileRunState(s.id||activeId, RECONCILE_STOP_WAIT_MS);
     if(s.busy){
-      await reconcileRunState(s.id||activeId);
-      if(s.busy)return {ok:false,draining:true};
+      if(acknowledged)return {ok:false,draining:true};
+      return {ok:false,unconfirmed:true};
     }
-    return {ok:true};
-  }catch{return {ok:false,rejected:true}}
+  }
+  return {ok:true};
 }
 
 function joinPath(base,name){return (base.replace(/\/+$/,'')+'/'+name).replace(/\/+/g,'/')}
