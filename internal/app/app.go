@@ -588,7 +588,6 @@ func writeEvent(w http.ResponseWriter, f http.Flusher, t string, data any) error
 	f.Flush()
 	return nil
 }
-func readLimit(r io.Reader, n int64) ([]byte, error) { return io.ReadAll(io.LimitReader(r, n)) }
 func setEnv(env []string, name, value string) []string {
 	prefix := name + "="
 	out := env[:0]

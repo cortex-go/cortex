@@ -508,3 +508,23 @@ Full gates: Go test/race/vet, builds, frontend, release, Nift, Git and history g
 Retained risks: OS sandbox, Windows process groups, host-account secrets and model truth
 Public claims changed: Battle Tested is a completed evidence ledger, not a plan
 ```
+
+### CX12 completion
+
+```text
+Checkpoint: CX12
+Threat and invariant: an OpenCode non-zero exit is never misrepresented by routine logs, and
+server-owned run events survive disconnects
+Cortex commit: this checkpoint commit
+Website source commit: 3f759d2
+Generated website commit: e3a4352
+Focused evidence: sealed cause machine, draining stderr tail, WARN production logging, explicit
+outcome states, Stop protocol, server-owned agent_run_events, bounded recovery, diagnostics endpoint
+Full gates: Go test, race, vet, build, frontend, Nift and repository gates passed
+Findings repaired: INFO stderr shown as the failure message; exit code/signal discarded; recovery
+skipped after non-zero exit; state overwritten by stale client saves; recovery output unbounded;
+Warden missing restart sweep and output-limit parity
+Retained risks: Windows direct-child cancellation; model output truth; exact late-error cause still
+requires real OpenCode dogfooding under the improved diagnostics
+Public claims changed: Agent documents truthful outcome presentation and disconnect-resumable sessions
+```
