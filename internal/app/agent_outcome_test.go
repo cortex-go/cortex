@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeOpenCode writes a deterministic fake `opencode` executable into a temp
@@ -689,7 +690,7 @@ func TestAgentRunDiagnosticsEndpoint(t *testing.T) {
 func TestAgentCancelRecordsUserStopAndStopsRun(t *testing.T) {
 	a := hardeningTestApp(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	run := &activeRun{cancel: cancel, state: newRunState()}
+	run := newActiveRun(cancel)
 	a.runMu.Lock()
 	a.activeRuns["run1"] = run
 	a.runMu.Unlock()
@@ -731,7 +732,7 @@ func TestAgentRunShutdownRecordsInterrupted(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a.runMu.Lock()
-	a.activeRuns["run1"] = &activeRun{cancel: cancel, state: newRunState()}
+	a.activeRuns["run1"] = newActiveRun(cancel)
 	a.runMu.Unlock()
 	defer func() { a.runMu.Lock(); delete(a.activeRuns, "run1"); a.runMu.Unlock() }()
 	a.stopActiveRuns()
@@ -945,7 +946,7 @@ func TestAgentRunBillingBeforeStopWins(t *testing.T) {
 }
 
 func TestAgentRunStopBeforeBillingKeepsCancelled(t *testing.T) {
-	run := &activeRun{cancel: func() {}, state: newRunState()}
+	run := newActiveRun(func() {})
 	// Stop accepted first.
 	run.state.recordCause(causeUserStop)
 	// Provider error observed afterwards.
@@ -1001,5 +1002,53 @@ func TestAgentRunSubagentBillingDoesNotClassifyMain(t *testing.T) {
 	d := runDiagnosticsFromDB(t, a, runID)
 	if d.ProviderCause != "" {
 		t.Fatalf("subagent billing set providerCause = %q", d.ProviderCause)
+	}
+}
+
+func TestAgentRunShutdownWaitsForPersistence(t *testing.T) {
+	a := hardeningTestApp(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	run := newActiveRun(cancel)
+	a.runMu.Lock()
+	a.activeRuns["run1"] = run
+	a.runMu.Unlock()
+	defer func() { a.runMu.Lock(); delete(a.activeRuns, "run1"); a.runMu.Unlock() }()
+	// Close the done channel asynchronously, like a handler finishing its
+	// interrupted persistence after cancellation.
+	done := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		time.Sleep(50 * time.Millisecond)
+		run.finished()
+		close(done)
+	}()
+	start := time.Now()
+	a.stopActiveRuns()
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("stopActiveRuns blocked too long: %v", elapsed)
+	}
+	<-done
+	if snap := run.state.snapshot(); snap.cause != causeServiceShutdown {
+		t.Fatalf("cause = %q want service_shutdown", snap.cause)
+	}
+}
+
+func TestAgentRunShutdownTimesOutAndLeavesStale(t *testing.T) {
+	a := hardeningTestApp(t)
+	_, cancel := context.WithCancel(context.Background())
+	run := newActiveRun(cancel)
+	a.runMu.Lock()
+	a.activeRuns["run1"] = run
+	a.runMu.Unlock()
+	defer func() { a.runMu.Lock(); delete(a.activeRuns, "run1"); a.runMu.Unlock() }()
+	// done is never closed: stopActiveRuns must return after the bounded wait
+	// and leave the run recoverably stale (still service-shutdown caused).
+	start := time.Now()
+	a.stopActiveRuns()
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Fatalf("stopActiveRuns exceeded bounded wait: %v", elapsed)
+	}
+	if snap := run.state.snapshot(); snap.cause != causeServiceShutdown {
+		t.Fatalf("cause = %q want service_shutdown", snap.cause)
 	}
 }

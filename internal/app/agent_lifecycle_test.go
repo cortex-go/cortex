@@ -8,7 +8,7 @@ import (
 func TestAgentRunRegistryCancellationAndCleanup(t *testing.T) {
 	a := hardeningTestApp(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	a.activeRuns["run1"] = &activeRun{cancel: cancel, state: newRunState()}
+	a.activeRuns["run1"] = newActiveRun(cancel)
 	a.runMu.Lock()
 	got := a.activeRuns["run1"]
 	a.runMu.Unlock()

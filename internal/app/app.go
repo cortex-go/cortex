@@ -46,11 +46,25 @@ type App struct {
 
 // activeRun tracks a live OpenCode process and its synchronized cancellation
 // cause machine. The cancel function stops the process group; state records
-// the first accepted cause and orders stdout errors against it.
+// the first accepted cause and orders stdout errors against it. done is closed
+// when the run handler finishes persisting its terminal state, so shutdown can
+// wait before closing the database.
 type activeRun struct {
-	cancel context.CancelFunc
-	state  *runState
+	cancel    context.CancelFunc
+	state     *runState
+	done      chan struct{}
+	closeOnce sync.Once
 }
+
+func newActiveRun(cancel context.CancelFunc) *activeRun {
+	return &activeRun{cancel: cancel, state: newRunState(), done: make(chan struct{})}
+}
+
+// finished marks the run handler's persistence complete exactly once.
+func (r *activeRun) finished() {
+	r.closeOnce.Do(func() { close(r.done) })
+}
+
 type Provider struct {
 	ID, Label, Hint, OpenCodeID, DefaultModel, AuthMode string
 }
@@ -126,11 +140,23 @@ func New(o Options) (*App, error) {
 // `interrupted` rather than an unexplained signal.
 func (a *App) stopActiveRuns() {
 	a.runMu.Lock()
-	defer a.runMu.Unlock()
+	runs := make([]*activeRun, 0, len(a.activeRuns))
 	for _, run := range a.activeRuns {
 		run.state.recordCause(causeServiceShutdown)
 		if run.cancel != nil {
 			run.cancel()
+		}
+		runs = append(runs, run)
+	}
+	a.runMu.Unlock()
+	// Wait a bounded period for handlers to persist their interrupted terminal
+	// state before the database is closed. If the timeout expires, the run is
+	// left recoverably stale and the restart sweep will reconcile it.
+	deadline := time.Now().Add(5 * time.Second)
+	for _, run := range runs {
+		select {
+		case <-run.done:
+		case <-time.After(time.Until(deadline)):
 		}
 	}
 }

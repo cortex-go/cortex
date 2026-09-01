@@ -186,7 +186,8 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	runID := randomToken(18)
-	run := &activeRun{cancel: cancel, state: newRunState()}
+	run := newActiveRun(cancel)
+	defer run.finished()
 
 	// Durable run creation happens before the process starts so an untracked
 	// OpenCode process is never launched if persistence fails. Once the
