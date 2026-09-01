@@ -47,7 +47,7 @@ function newWorkspaceSession(){newSession('');hideSessionMenu();setTimeout(openW
 function closeSession(id){
   const s=sessions[id];if(!s)return;
   if(s.busy&&!confirm('This agent is still working. Stop and close it?'))return;
-  s.abort?.abort();
+  if(s.busy){stopAgentFor(s)}else{s.abort?.abort()}
   const archived={...sessionSafe(s),archivedAt:Date.now(),closedAt:Date.now()};
   closedSessions=[archived,...closedSessions.filter(x=>x.id!==id)].slice(0,20);
   const fallbackWorkspace=s.workspace||'';
@@ -135,11 +135,13 @@ function renderMarkdown(row,text){
   }
 }
 function eventKind(ev){const raw=ev?.data?.data||ev?.data||{},t=String(raw.type||'');if(ev.type==='error')return'error';if(ev.type==='done')return'done';if(ev.type==='cancelled')return'error';return t.includes('tool')?'tool':'assistant'}
-function eventNode(ev){const row=document.createElement('div');row.className='event '+ev.kind;row.dataset.kind=ev.kind;if(ev.kind==='tool'||(ev.kind==='assistant'&&isToolEventText(ev.text)))renderTool(row,ev.text);else if(ev.kind==='assistant')renderMarkdown(row,ev.text);else if(ev.kind==='image'){const fig=document.createElement('figure');fig.className='image-attach';const img=document.createElement('img');img.src=ev.text;img.alt=ev.name||'attached image';img.title=ev.name||'';fig.append(img);if(ev.name){const cap=document.createElement('figcaption');cap.textContent=ev.name;fig.append(cap)}row.append(fig)}else row.textContent=ev.text;return row}
+function eventNode(ev){const row=document.createElement('div');row.className='event '+ev.kind;row.dataset.kind=ev.kind;if(ev.kind==='tool'||(ev.kind==='assistant'&&isToolEventText(ev.text)))renderTool(row,ev.text);else if(ev.kind==='assistant')renderMarkdown(row,ev.text);else if(ev.kind==='image'){const fig=document.createElement('figure');fig.className='image-attach';const img=document.createElement('img');img.src=ev.text;img.alt=ev.name||'attached image';img.title=ev.name||'';fig.append(img);if(ev.name){const cap=document.createElement('figcaption');cap.textContent=ev.name;fig.append(cap)}row.append(fig)}else row.textContent=ev.text;const marker=decodeRunMarker(ev.name);if(marker&&(marker.outcome==='failed'||marker.outcome==='completed_with_process_error'||marker.outcome==='cancelled'||marker.outcome==='truncated'))row.append(technicalDetailsNode(marker.runID));return row}
+function decodeRunMarker(name){const m=String(name||'').match(/^run:([^:]+):([a-z_]+)$/);if(!m)return null;return{runID:m[1],outcome:m[2]}}
+function technicalDetailsNode(runID){const wrap=document.createElement('details');wrap.className='tech-details';const sum=document.createElement('summary');sum.textContent='Technical details';const body=document.createElement('div');body.className='tech-body';wrap.append(sum,body);wrap.addEventListener('toggle',async()=>{if(!wrap.open||body.dataset.loaded)return;body.dataset.loaded='1';try{const d=await api('/api/agent/run-diagnostics?runID='+encodeURIComponent(runID));const parts=[];if(d.category)parts.push('Category: '+d.category);if(d.exitCode)parts.push('Exit code: '+d.exitCode);if(d.signal)parts.push('Signal: '+d.signal);if(d.stderrTruncated)parts.push('stderr truncated');if(d.errors&&d.errors.length)parts.push('Errors:\n'+d.errors.join('\n'));if(d.warnings&&d.warnings.length)parts.push('Warnings:\n'+d.warnings.join('\n'));if(d.stderrTail)parts.push('stderr tail:\n'+d.stderrTail);body.textContent=parts.join('\n')||'No additional details.'}catch(e){body.textContent='Could not load details: '+e.message}});return wrap}
 function renderFeed(){const s=active(),box=$('#feed');box.innerHTML='';if(!s.events.length){box.innerHTML='<div class="empty"><span class="orb">C</span><strong>What do you want to build?</strong><span>Choose a workspace, then give Cortex a development task.</span></div>';return}for(const ev of s.events)box.append(eventNode(ev));box.scrollTop=box.scrollHeight}
 function renderSession(){const s=active();$('#workspaceLabel').textContent=s.workspace||'Choose workspace';$('#run').disabled=s.busy||!s.workspace||workspaceUnavailable(s);$('#prompt').disabled=s.busy;$('#stop').hidden=!s.busy;$('#activity').hidden=!s.busy;$('#wsUnavailable').hidden=!workspaceUnavailable(s);$('#wsUnavailable').textContent=workspaceUnavailable(s)?('Workspace unavailable ('+s.workspaceStatus+') — choose a replacement to run.'):'';renderFeed()}
 function renderAll(){renderTabs();renderSession()}
-function addEvent(id,kind,text,name=''){const clean=String(text??'').trim();if(!clean)return;const s=sessions[id];if(!s)return;s.events.push({kind,text:clean,name});if(s.events.length>500)s.events=s.events.slice(-500);persistLocalState();saveSessionToServer(id);if(activeId===id){$('#feed .empty')?.remove();$('#feed').append(eventNode({kind,text:clean,name}));$('#feed').scrollTop=$('#feed').scrollHeight}}
+function addEvent(id,kind,text,name='',extra={}){const clean=String(text??'').trim();if(!clean)return;const s=sessions[id];if(!s)return;const ev={kind,text:clean,name,...extra};s.events.push(ev);if(s.events.length>500)s.events=s.events.slice(-500);persistLocalState();saveSessionToServer(id);if(activeId===id){$('#feed .empty')?.remove();$('#feed').append(eventNode(ev));$('#feed').scrollTop=$('#feed').scrollHeight}}
 async function loadSettings(){settings=await api('/api/settings');providers=settings.providers||[];const sel=$('#provider');sel.innerHTML='';for(const p of providers){const o=document.createElement('option');o.value=p.id;o.textContent=p.label+(p.configured?' · configured':'');sel.append(o)}sel.value=settings.activeProvider||providers[0]?.id||'';updateProviderUI()}
 function currentModel(){
   const sel=$('#model');
@@ -248,13 +250,14 @@ async function addGeneratedImage(id,im){
 }
 function toolText(raw){const p=raw.part||raw,st=p.state||{},tool=p.tool||raw.tool||raw.name||'tool',status=st.status||'';const input=st.input||p.input||{},lines=[`↳ ${tool}${status?' · '+status:''}`];if(tool==='bash'&&input.command)lines.push('$ '+input.command);else if(input.filePath||input.path)lines.push(input.filePath||input.path);if(st.error)lines.push('ERROR: '+clipped(typeof st.error==='string'?st.error:JSON.stringify(st.error)));else if(st.output)lines.push(clipped(st.output));return lines.join('\n')}
 function summarize(ev){const raw=ev?.data?.data||ev?.data||{},type=String(raw.type||'');if(ev.type==='error')return raw.message||'Agent failed';if(ev.type==='truncated')return raw.message||'Provider output was truncated.';if(ev.type==='cancelled')return raw.message||'Agent stopped.';if(ev.type==='recovered')return raw.text||'';if(ev.type==='done'){const i=raw.inputTokens||0,o=raw.outputTokens||0;return i||o?`Done · ${i} input · ${o} output tokens`:'Done'};if(ev.type==='output')return raw.text||'';if(type.includes('tool'))return toolText(raw);return raw.part?.text||raw.text||''}
-async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace||workspaceUnavailable(s))return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();s.runID='';if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');const images=attachments.map(a=>({name:a.name,data:a.dataUrl}));for(const a of attachments)addEvent(id,'image',a.thumb,a.name);addEvent(id,'user',prompt);attachments=[];renderAttachments();renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id,images}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';const seenImages=new Set();for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line),text=summarize(ev),raw=ev?.data?.data||ev?.data||{};if(ev.type==='run'&&raw.runID)s.runID=raw.runID;if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;if(ev.type==='done')s.state='completed';else if(ev.type==='error')s.state='failed';else if(ev.type==='cancelled')s.state='cancelled';else if(ev.type==='truncated')s.state='truncated';if(ev.type==='error'||ev.type==='cancelled'||ev.type==='truncated')appendTechnicalDetails(s.runID);if(text)addEvent(id,eventKind(ev),text);if(ev.type==='recovered-images'){for(const im of (raw.images||[]))addGeneratedImage(id,im)}for(const im of extractImages(raw)){if(seenImages.has(im.url))continue;seenImages.add(im.url);addGeneratedImage(id,im)}}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].busy=false;sessions[id].abort=null;persistLocalState();saveSessionToServer(id)}if(activeId===id)renderAll();agentStatus()}}
+async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace||workspaceUnavailable(s))return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();s.runID='';if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');const images=attachments.map(a=>({name:a.name,data:a.dataUrl}));for(const a of attachments)addEvent(id,'image',a.thumb,a.name);addEvent(id,'user',prompt);attachments=[];renderAttachments();renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id,images}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';const seenImages=new Set();for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line),text=summarize(ev),raw=ev?.data?.data||ev?.data||{};if(ev.type==='run'&&raw.runID)s.runID=raw.runID;if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;const oc=raw.outcome||'';if(oc)s.state=oc;else if(ev.type==='done')s.state='completed';else if(ev.type==='error')s.state='failed';else if(ev.type==='cancelled')s.state='cancelled';else if(ev.type==='truncated')s.state='truncated';const termEvent={kind:eventKind(ev),text:summarize(ev),name:'run:'+(raw.runID||s.runID)+':'+oc,outcome:oc,runID:raw.runID||s.runID};if(termEvent.text)addEvent(id,termEvent.kind,termEvent.text,termEvent.name,{outcome:oc,runID:termEvent.runID});if(ev.type==='recovered-images'){for(const im of (raw.images||[]))addGeneratedImage(id,im)}for(const im of extractImages(raw)){if(seenImages.has(im.url))continue;seenImages.add(im.url);addGeneratedImage(id,im)}}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].busy=false;sessions[id].abort=null;persistLocalState();saveSessionToServer(id)}if(activeId===id)renderAll();agentStatus()}}
 
 // stopAgent performs a server-side, authenticated Stop for the active run. The
 // streaming request is left open; only if the cancellation request fails or
 // exceeds a short timeout does the client fall back to aborting the fetch.
-async function stopAgent(){
-  const s=active();if(!s?.busy)return;
+async function stopAgent(){const s=active();if(!s)return;await stopAgentFor(s)}
+async function stopAgentFor(s){
+  if(!s?.busy)return;
   const abortFallback=()=>s.abort?.abort();
   if(!s.runID)return abortFallback();
   try{
@@ -267,36 +270,6 @@ async function stopAgent(){
   }catch{abortFallback()}
 }
 
-// appendTechnicalDetails renders a lazy, owner-authorized disclosure beneath a
-// terminal event that fetches the bounded run diagnostics on demand. The raw
-// tail is never embedded in the transcript; it is only fetched when expanded.
-function appendTechnicalDetails(runID){
-  if(!runID||!activeId)return;
-  const wrap=document.createElement('details');
-  wrap.className='event tech-details';
-  const sum=document.createElement('summary');
-  sum.textContent='Technical details';
-  const body=document.createElement('div');
-  body.className='tech-body';
-  wrap.append(sum,body);
-  wrap.addEventListener('toggle',async()=>{
-    if(!wrap.open||body.dataset.loaded)return;
-    body.dataset.loaded='1';
-    try{
-      const d=await api('/api/agent/run-diagnostics?runID='+encodeURIComponent(runID));
-      const parts=[];
-      if(d.category)parts.push('Category: '+d.category);
-      if(d.exitCode)parts.push('Exit code: '+d.exitCode);
-      if(d.signal)parts.push('Signal: '+d.signal);
-      if(d.stderrTruncated)parts.push('stderr truncated');
-      if(d.errors&&d.errors.length)parts.push('Errors:\n'+d.errors.join('\n'));
-      if(d.stderrTail)parts.push('stderr tail:\n'+d.stderrTail);
-      body.textContent=parts.join('\n')||'No additional details.';
-    }catch(e){body.textContent='Could not load details: '+e.message}
-  });
-  $('#feed').append(wrap);
-  $('#feed').scrollTop=$('#feed').scrollHeight
-}
 function joinPath(base,name){return (base.replace(/\/+$/,'')+'/'+name).replace(/\/+/g,'/')}
 function parentPath(p){if(p===root)return root;const x=p.replace(/\/+$/,'');const i=x.lastIndexOf('/');const out=i<=0?'/':x.slice(0,i);return out.length<root.length?root:out}
 async function browse(path){

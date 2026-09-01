@@ -199,6 +199,16 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// The user prompt is persisted immediately after the durable run, at
+	// sequence zero, before the process starts. Provider events begin at one,
+	// so a restored transcript always shows the prompt first.
+	seq := int64(0)
+	if err := a.persistAgentRunEvent(runID, "user", q.Prompt, "", seq, time.Now().UnixMilli()); err != nil {
+		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", "persist user prompt: "+err.Error(), 0, 0, 0, "")
+		http.Error(w, "persist user prompt: "+err.Error(), 500)
+		return
+	}
+	seq++
 	// Register the active run before cmd.Start so request cancellation or
 	// service shutdown between start and registry insertion is never an
 	// unclassified signal. The run ID is not exposed to the browser until the
@@ -261,9 +271,9 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := cmd.Start(); err != nil {
 		run.state.seal()
-		diag, summary := a.runDiagnostics(outcomeFailed, run.state.snapshot(), "", false, processExitStatus(cmd), nil, "", false, 0, true, nil, map[string]string{"result": "not_attempted"})
+		diag, summary := a.runDiagnostics(outcomeFailed, run.state.snapshot(), "", false, processExitStatus(cmd), nil, nil, "", false, 0, true, nil, map[string]string{"result": "not_attempted"})
 		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", summary, 0, 0, 0, diag)
-		_ = writeEvent(w, flusher, "error", map[string]any{"message": summary})
+		_ = writeEvent(w, flusher, "error", map[string]any{"message": summary, "outcome": string(outcomeFailed)})
 		return
 	}
 
@@ -285,17 +295,19 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	tail := captureTail(stderr, 64<<10)
 	var input, output uint64
 	var cost float64
+	mainSessionID := ""
 	sessionID := ""
 	var stdoutErrMsg string
 	stdoutErr := false
 	lastStopReason := ""
 	validStop := false
+	persistFailed := false
+	var persistErr string
 	scan := bufio.NewScanner(stdout)
 	scan.Buffer(make([]byte, 64<<10), maxProviderLine)
 	streamBytes, streamEvents := 0, 0
 	var stdoutScanErr error
 	truncated := false
-	seq := int64(0)
 	for scan.Scan() {
 		line := append([]byte(nil), scan.Bytes()...)
 		streamBytes += len(line)
@@ -304,7 +316,6 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			truncated = true
 			run.state.recordCause(causeOutputLimit)
 			cancel()
-			_ = writeEvent(w, flusher, "truncated", map[string]any{"message": "Provider output limit reached; the run was stopped."})
 			break
 		}
 		var raw map[string]any
@@ -312,15 +323,21 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			collectUsage(raw, &input, &output, &cost)
 			if id, _ := raw["sessionID"].(string); id != "" {
 				sessionID = id
+				if mainSessionID == "" {
+					mainSessionID = id
+				}
 			}
 			// An authoritative stdout error forces failure regardless of any
-			// later stop, unless a stronger local cause preceded it.
-			if typ, _ := raw["type"].(string); typ == "error" {
+			// later stop, unless a stronger local cause preceded it. Only an
+			// error for the target main session is authoritative.
+			if typ, _ := raw["type"].(string); typ == "error" && sameSession(raw, mainSessionID) {
 				stdoutErr = true
 				run.state.observeError()
 				stdoutErrMsg = a.redactSecrets(errorEventText(raw))
 			}
-			if typ, _ := raw["type"].(string); typ == "step_finish" {
+			// Completion evidence must belong to the target main session and
+			// be the final relevant terminal state.
+			if typ, _ := raw["type"].(string); typ == "step_finish" && sameSession(raw, mainSessionID) {
 				if reason, _ := raw["part"].(map[string]any)["reason"].(string); reason != "" {
 					lastStopReason = reason
 					validStop = lastStopReason == "stop"
@@ -328,9 +345,14 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			}
 			// Persist normalized server-owned events before delivery so a
 			// disconnect cannot lose the transcript.
-			kind, text := normalizedEvent(raw)
+			kind, text, name := normalizedEvent(raw)
 			if kind != "" {
-				_ = a.persistAgentRunEvent(runID, kind, text, "", seq, time.Now().UnixMilli())
+				if err := a.persistAgentRunEvent(runID, kind, text, name, seq, time.Now().UnixMilli()); err != nil {
+					persistFailed = true
+					persistErr = err.Error()
+					cancel()
+					break
+				}
 				seq++
 			}
 			rewriteImageURLs(raw, clientSession)
@@ -340,7 +362,12 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		} else {
 			lineText := strings.TrimSpace(string(line))
 			if lineText != "" {
-				_ = a.persistAgentRunEvent(runID, "assistant", lineText, "", seq, time.Now().UnixMilli())
+				if err := a.persistAgentRunEvent(runID, "assistant", lineText, "", seq, time.Now().UnixMilli()); err != nil {
+					persistFailed = true
+					persistErr = err.Error()
+					cancel()
+					break
+				}
 				seq++
 			}
 			if err := writeEvent(w, flusher, "output", map[string]any{"text": string(line)}); err != nil {
@@ -350,7 +377,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := scan.Err(); err != nil {
 		stdoutScanErr = err
-		if !truncated {
+		if !truncated && !persistFailed {
 			cancel()
 		}
 	}
@@ -366,79 +393,191 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	exit := processExitStatus(cmd)
 	snap := run.state.snapshot()
 	outcome := classifyRun(snap, stdoutErr, validStop, exit)
-	// stdout errors observed before any local cause always force failure; the
-	// classifier already encodes that ordering, so reflect it in the message.
-	recoverEligible := (outcome == outcomeFailed || outcome == outcomeCompletedWError) && !truncated && snap.cause != causeRequestCanceled && snap.cause != causeUserStop && snap.cause != causeOutputLimit
+	if persistFailed {
+		// A persistence failure is a storage/run failure: the authoritative
+		// transcript is incomplete, so the run cannot claim completion.
+		outcome = outcomeFailed
+		stdoutErrMsg = "agent transcript persistence failed: " + persistErr
+	}
+
+	// Recovery reconciles with already-persisted assistant content so the
+	// complete answer is not appended twice. It only runs when the outcome is
+	// a genuine failure, no streamed/persisted assistant text already covers
+	// the final response, and no known local cause stopped the run.
 	recoveryResult := ""
-	if recoverEligible && sessionID != "" {
-		// Recovery runs under a fresh bounded context: the request context may
-		// already be cancelled and must not be reused.
-		recCtx, recCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		recovered, images, ri, ro, rc, recErr := recoverSession(recCtx, binary, sessionID, workspace, clientSession, env)
-		recCancel()
-		if recErr != nil {
-			recoveryResult = "failed"
-		} else {
-			recoveryResult = "ok"
-			_ = a.persistAgentRunEvent(runID, "assistant", recovered, "", seq, time.Now().UnixMilli())
-			seq++
-			if strings.TrimSpace(recovered) != "" {
-				if err := writeEvent(w, flusher, "recovered", map[string]any{"text": recovered, "sessionID": sessionID}); err != nil {
-					deliveryErr = err
+	if outcome == outcomeFailed || outcome == outcomeCompletedWError {
+		if !persistFailed && !truncated && snap.cause != causeRequestCanceled && snap.cause != causeUserStop && snap.cause != causeOutputLimit {
+			if sessionID != "" {
+				recCtx, recCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				recovered, images, ri, ro, rc, recErr := recoverSession(recCtx, binary, sessionID, workspace, clientSession, env)
+				recCancel()
+				if recErr != nil {
+					recoveryResult = "failed"
+				} else {
+					recovered = strings.TrimSpace(recovered)
+					if recovered != "" {
+						// Persist the recovered answer under its own provenance
+						// marker and sequence, before delivery.
+						if err := a.persistAgentRunEvent(runID, "assistant", recovered, "recovered", seq, time.Now().UnixMilli()); err != nil {
+							recoveryResult = "persist_failed"
+						} else {
+							seq++
+							recoveryResult = "ok"
+							if err := writeEvent(w, flusher, "recovered", map[string]any{"text": recovered, "sessionID": sessionID, "recovered": true}); err != nil {
+								deliveryErr = err
+							}
+						}
+					} else {
+						recoveryResult = "ok_empty"
+					}
+					for _, im := range images {
+						url := sanitizeImageURL(im["url"])
+						if url == "" {
+							continue
+						}
+						if err := a.persistAgentRunEvent(runID, "image", url, im["name"], seq, time.Now().UnixMilli()); err != nil {
+							recoveryResult = "persist_failed"
+							break
+						}
+						seq++
+					}
+					if ri > input {
+						input = ri
+					}
+					if ro > output {
+						output = ro
+					}
+					if rc > cost {
+						cost = rc
+					}
+					if len(images) > 0 && recoveryResult == "ok" {
+						if err := writeEvent(w, flusher, "recovered-images", map[string]any{"images": images, "sessionID": sessionID}); err != nil {
+							deliveryErr = err
+						}
+					}
 				}
-			}
-			if len(images) > 0 {
-				_ = a.persistAgentRunEvent(runID, "image", images[0]["url"], "recovered", seq, time.Now().UnixMilli())
-				seq++
-				if err := writeEvent(w, flusher, "recovered-images", map[string]any{"images": images, "sessionID": sessionID}); err != nil {
-					deliveryErr = err
-				}
-			}
-			if ri > input {
-				input = ri
-			}
-			if ro > output {
-				output = ro
-			}
-			if rc > cost {
-				cost = rc
+			} else {
+				recoveryResult = "no_session"
 			}
 		}
 	}
 
-	// Persist the server-owned run events (user prompt + terminal) before the
-	// terminal event is attempted for delivery.
-	_ = a.persistAgentRunEvent(runID, "user", q.Prompt, "", seq, time.Now().UnixMilli())
+	// Determine and persist the execution outcome before terminal delivery.
+	stderrErrors, stderrWarnings := parsedStderr(a.redactSecrets(stderrText))
+	diag, summary := a.runDiagnostics(outcome, snap, stdoutErrMsg, validStop, exit, stderrErrors, stderrWarnings, a.redactSecrets(stderrText), stderrTrunc, seq, false, stdoutScanErr, map[string]string{"result": recoveryResult})
+	// The terminal event carries the run identity and outcome so technical
+	// details survive reload; the name field encodes them as
+	// "run:<runID>:<outcome>".
+	_ = a.persistAgentRunEvent(runID, terminalKind(outcome), summary, "run:"+runID+":"+string(outcome), seq, time.Now().UnixMilli())
 	seq++
-	diag, summary := a.runDiagnostics(outcome, snap, stdoutErrMsg, validStop, exit, parsedStderr(a.redactSecrets(stderrText)), a.redactSecrets(stderrText), stderrTrunc, seq, deliveryErr == nil, stdoutScanErr, map[string]string{"result": recoveryResult})
-	_ = a.persistAgentRunEvent(runID, terminalKind(outcome), summary, "", seq, time.Now().UnixMilli())
-	a.finishAgentRun(runID, clientSession, string(outcome), sessionID, summary, input, output, cost, diag)
+	finishErr := a.finishAgentRun(runID, clientSession, string(outcome), sessionID, summary, input, output, cost, diag)
+
+	// Terminal delivery is attempted only when the stream is still writable.
+	// The delivery outcome is captured from the actual write result.
+	terminalDelivered := false
+	var terminalDeliveryErr error
 	if deliveryErr == nil {
+		var payload map[string]any
 		switch outcome {
 		case outcomeCompleted:
-			_ = writeEvent(w, flusher, "done", map[string]any{"inputTokens": input, "outputTokens": output, "estimatedCostUsd": cost, "sessionID": sessionID})
-		case outcomeCompletedWError, outcomeFailed:
-			_ = writeEvent(w, flusher, "error", map[string]any{"message": summary, "exitCode": exit.exitCode, "signal": exit.signal})
+			payload = map[string]any{"inputTokens": input, "outputTokens": output, "estimatedCostUsd": cost, "sessionID": sessionID, "outcome": string(outcomeCompleted)}
+		case outcomeCompletedWError:
+			payload = map[string]any{"message": summary, "exitCode": exit.exitCode, "signal": exit.signal, "outcome": string(outcomeCompletedWError)}
+		case outcomeFailed:
+			payload = map[string]any{"message": summary, "exitCode": exit.exitCode, "signal": exit.signal, "outcome": string(outcomeFailed)}
 		case outcomeCancelled:
-			_ = writeEvent(w, flusher, "cancelled", map[string]any{"message": "Agent stopped."})
+			payload = map[string]any{"message": "Agent stopped.", "outcome": string(outcomeCancelled)}
 		case outcomeTruncated:
-			_ = writeEvent(w, flusher, "truncated", map[string]any{"message": "Provider output limit reached; the run was stopped."})
+			payload = map[string]any{"message": "Provider output limit reached; the run was stopped.", "outcome": string(outcomeTruncated)}
 		case outcomeInterrupted:
-			_ = writeEvent(w, flusher, "cancelled", map[string]any{"message": "The agent was interrupted."})
+			payload = map[string]any{"message": "The agent was interrupted.", "outcome": string(outcomeInterrupted)}
+		}
+		var termErr error
+		switch outcome {
+		case outcomeCompleted:
+			termErr = writeEvent(w, flusher, "done", payload)
+		case outcomeCompletedWError, outcomeFailed:
+			termErr = writeEvent(w, flusher, "error", payload)
+		case outcomeCancelled:
+			termErr = writeEvent(w, flusher, "cancelled", payload)
+		case outcomeTruncated:
+			termErr = writeEvent(w, flusher, "truncated", payload)
+		case outcomeInterrupted:
+			termErr = writeEvent(w, flusher, "cancelled", payload)
+		}
+		if termErr == nil {
+			terminalDelivered = true
+		} else {
+			terminalDeliveryErr = termErr
+		}
+	} else {
+		terminalDeliveryErr = deliveryErr
+	}
+
+	// Delivery diagnostics are recorded after the attempt, never before. A
+	// delivery failure does not change the underlying execution outcome.
+	diag2, summary2 := a.runDiagnostics(outcome, snap, stdoutErrMsg, validStop, exit, stderrErrors, stderrWarnings, a.redactSecrets(stderrText), stderrTrunc, seq, terminalDelivered, stdoutScanErr, map[string]string{"result": recoveryResult})
+	if terminalDeliveryErr != nil {
+		var d diagnostics
+		_ = json.Unmarshal([]byte(diag2), &d)
+		d.DeliveryError = a.redactSecrets(terminalDeliveryErr.Error())
+		d.TerminalEventDeliver = false
+		if b, err := json.Marshal(d); err == nil {
+			diag2 = string(b)
 		}
 	}
+	// Persist the updated diagnostics with the delivery outcome. The run-state
+	// update error is retained as evidence of an incomplete terminal record.
+	_ = a.finishAgentRun(runID, clientSession, string(outcome), sessionID, summary2, input, output, cost, diag2)
+	if finishErr != nil {
+		// The first terminal update failed; surface it via the summary so it
+		// is never silently claimed as a durable completion.
+		_ = summary2
+	}
+}
+
+// sameSession reports whether an OpenCode event belongs to the target main
+// session. Events without a session ID are treated conservatively as non-main.
+func sameSession(raw map[string]any, mainSessionID string) bool {
+	if mainSessionID == "" {
+		return false
+	}
+	id, _ := raw["sessionID"].(string)
+	return id == mainSessionID
+}
+
+// sanitizeImageURL validates or rewrites an unsafe file URL before persistence
+// so stored image events only reference safe, servable paths.
+func sanitizeImageURL(u string) string {
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return ""
+	}
+	if strings.HasPrefix(u, "data:") {
+		if len(u) > 10<<20 {
+			return ""
+		}
+		return u
+	}
+	if !strings.HasPrefix(u, "file://") {
+		return ""
+	}
+	p := fileURLPath(u)
+	if p == "" {
+		return ""
+	}
+	return "file://" + p
 }
 
 // finishAgentRunErr is the error-returning form of finishAgentRun used when
 // the run fails before the streaming tail exists.
 func (a *App) finishAgentRunErr(id, conversationID, state, sessionID, message string, input, output uint64, cost float64, diag string) error {
-	a.finishAgentRun(id, conversationID, state, sessionID, message, input, output, cost, diag)
-	return nil
+	return a.finishAgentRun(id, conversationID, state, sessionID, message, input, output, cost, diag)
 }
 
 // runDiagnostics builds the bounded, redacted diagnostic record and the
 // user-facing summary for a run outcome.
-func (a *App) runDiagnostics(outcome runOutcome, snap runStateSnapshot, stdoutErrMsg string, validStop bool, exit exitStatus, stderrErrors []string, stderrTail string, stderrTrunc bool, seq int64, delivered bool, scannerErr error, recovery map[string]string) (string, string) {
+func (a *App) runDiagnostics(outcome runOutcome, snap runStateSnapshot, stdoutErrMsg string, validStop bool, exit exitStatus, stderrErrors, stderrWarnings []string, stderrTail string, stderrTrunc bool, seq int64, delivered bool, scannerErr error, recovery map[string]string) (string, string) {
 	d := diagnostics{
 		Outcome:              string(outcome),
 		ExitCode:             exit.exitCode,
@@ -446,6 +585,7 @@ func (a *App) runDiagnostics(outcome runOutcome, snap runStateSnapshot, stdoutEr
 		Cause:                string(snap.cause),
 		StdoutError:          stdoutErrMsg,
 		Errors:               boundedStrings(stderrErrors, 8),
+		Warnings:             boundedStrings(stderrWarnings, 8),
 		StderrTail:           boundedTail(stderrTail, 8<<10),
 		StderrTruncated:      stderrTrunc,
 		TerminalEventDeliver: delivered,
@@ -563,18 +703,11 @@ func terminalKind(outcome runOutcome) string {
 	return "error"
 }
 
-// parsedStderr extracts bounded ERROR and WARN messages from mixed-format
-// stderr output, tolerating unstructured lines.
-func parsedStderr(text string) []string {
-	var out []string
+// parsedStderr splits mixed-format stderr output into bounded ERROR and WARN
+// collections, tolerating unstructured lines. The raw bounded tail is retained
+// separately as a fallback for unstructured output.
+func parsedStderr(text string) (errors, warnings []string) {
 	for _, line := range strings.Split(text, "\n") {
-		if len(out) >= 8 {
-			break
-		}
-		level := stderrLevel(line)
-		if level != "ERROR" && level != "WARN" {
-			continue
-		}
 		msg := strings.TrimSpace(line)
 		if msg == "" {
 			continue
@@ -582,9 +715,18 @@ func parsedStderr(text string) []string {
 		if len(msg) > 600 {
 			msg = msg[:600]
 		}
-		out = append(out, msg)
+		switch stderrLevel(line) {
+		case "ERROR":
+			if len(errors) < 8 {
+				errors = append(errors, msg)
+			}
+		case "WARN":
+			if len(warnings) < 8 {
+				warnings = append(warnings, msg)
+			}
+		}
 	}
-	return out
+	return errors, warnings
 }
 
 func boundedStrings(v []string, n int) []string {
@@ -1157,29 +1299,53 @@ func eventText(raw map[string]any) string {
 }
 
 // normalizedEvent maps an OpenCode stdout event to the server-owned
-// conversation event kind/text that mirrors what the frontend would render.
-// Non-rendered event types (step_start/step_finish) return "".
-func normalizedEvent(raw map[string]any) (kind, text string) {
+// conversation event kind/text/name that mirrors what the frontend would
+// render. Non-rendered event types (step_start/step_finish) return "".
+func normalizedEvent(raw map[string]any) (kind, text, name string) {
 	typ, _ := raw["type"].(string)
 	switch typ {
 	case "text":
 		if t := eventText(raw); t != "" {
-			return "assistant", t
+			return "assistant", t, ""
 		}
 	case "tool_use":
 		part, _ := raw["part"].(map[string]any)
 		tool, _ := part["tool"].(string)
 		state, _ := part["state"].(map[string]any)
 		status, _ := state["status"].(string)
+		input, _ := state["input"].(map[string]any)
 		lines := []string{"↳ " + tool}
 		if status != "" {
 			lines = []string{"↳ " + tool + " · " + status}
 		}
-		return "tool", strings.Join(lines, "\n")
+		if command, _ := input["command"].(string); tool == "bash" && command != "" {
+			lines = append(lines, "$ "+command)
+		} else if fp, _ := input["filePath"].(string); fp != "" {
+			lines = append(lines, fp)
+		} else if fp, _ := input["path"].(string); fp != "" {
+			lines = append(lines, fp)
+		}
+		if errTxt, _ := state["error"].(string); errTxt != "" {
+			lines = append(lines, "ERROR: "+errTxt)
+		} else if outTxt, _ := state["output"].(string); outTxt != "" {
+			lines = append(lines, boundedTail(outTxt, 2600))
+		}
+		return "tool", strings.Join(lines, "\n"), ""
 	case "error":
-		return "error", errorEventText(raw)
+		return "error", errorEventText(raw), ""
+	case "file":
+		part, _ := raw["part"].(map[string]any)
+		url, _ := part["url"].(string)
+		mime, _ := part["mediaType"].(string)
+		if mime == "" {
+			mime, _ = part["mime"].(string)
+		}
+		if strings.HasPrefix(strings.ToLower(mime), "image/") && sanitizeImageURL(url) != "" {
+			filename, _ := part["filename"].(string)
+			return "image", sanitizeImageURL(url), filename
+		}
 	}
-	return "", ""
+	return "", "", ""
 }
 func recoverSession(ctx context.Context, binary, id, workspace, clientSession string, env []string) (string, []map[string]string, uint64, uint64, float64, error) {
 	cmd := exec.CommandContext(ctx, binary, "export", id)
