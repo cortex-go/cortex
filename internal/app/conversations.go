@@ -369,6 +369,15 @@ func (a *App) startAgentRun(id, conversationID, prompt, workspace, provider, mod
 		return err
 	}
 	defer tx.Rollback()
+	// At most one active run per conversation: a follow-up prompt is rejected
+	// while the conversation is still running.
+	var running int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM agent_runs WHERE conversation_id=? AND state='running'", conversationID).Scan(&running); err != nil {
+		return err
+	}
+	if running > 0 {
+		return errors.New("agent is already running for this conversation")
+	}
 	if _, err = tx.Exec(`INSERT INTO conversations(id,title,workspace,provider,model,state,created_at,updated_at,current_run_id)
 		VALUES(?,?,?,?,?,'running',?,?,?)
 		ON CONFLICT(id) DO UPDATE SET workspace=excluded.workspace, provider=excluded.provider,

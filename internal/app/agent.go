@@ -192,7 +192,11 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	// OpenCode process is never launched if persistence fails. Once the
 	// durable row exists, every later failure finalizes it to a truthful state.
 	if err := a.startAgentRun(runID, clientSession, q.Prompt, workspace, providerID, modelID); err != nil {
-		http.Error(w, "persist agent run: "+err.Error(), 500)
+		if strings.Contains(err.Error(), "already running") {
+			http.Error(w, "agent is already running for this conversation", http.StatusConflict)
+		} else {
+			http.Error(w, "persist agent run: "+err.Error(), 500)
+		}
 		return
 	}
 	// Register the active run before cmd.Start so request cancellation or
@@ -282,7 +286,6 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	var input, output uint64
 	var cost float64
 	sessionID := ""
-	sawText := false
 	var stdoutErrMsg string
 	stdoutErr := false
 	lastStopReason := ""
@@ -310,9 +313,6 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			if id, _ := raw["sessionID"].(string); id != "" {
 				sessionID = id
 			}
-			if eventText(raw) != "" {
-				sawText = true
-			}
 			// An authoritative stdout error forces failure regardless of any
 			// later stop, unless a stronger local cause preceded it.
 			if typ, _ := raw["type"].(string); typ == "error" {
@@ -326,16 +326,27 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 					validStop = lastStopReason == "stop"
 				}
 			}
+			// Persist normalized server-owned events before delivery so a
+			// disconnect cannot lose the transcript.
+			kind, text := normalizedEvent(raw)
+			if kind != "" {
+				_ = a.persistAgentRunEvent(runID, kind, text, "", seq, time.Now().UnixMilli())
+				seq++
+			}
 			rewriteImageURLs(raw, clientSession)
 			if err := writeEvent(w, flusher, "opencode", raw); err != nil {
 				deliveryErr = err
 			}
 		} else {
+			lineText := strings.TrimSpace(string(line))
+			if lineText != "" {
+				_ = a.persistAgentRunEvent(runID, "assistant", lineText, "", seq, time.Now().UnixMilli())
+				seq++
+			}
 			if err := writeEvent(w, flusher, "output", map[string]any{"text": string(line)}); err != nil {
 				deliveryErr = err
 			}
 		}
-		seq++
 	}
 	if err := scan.Err(); err != nil {
 		stdoutScanErr = err
@@ -371,7 +382,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			recoveryResult = "ok"
 			_ = a.persistAgentRunEvent(runID, "assistant", recovered, "", seq, time.Now().UnixMilli())
 			seq++
-			if !sawText && strings.TrimSpace(recovered) != "" {
+			if strings.TrimSpace(recovered) != "" {
 				if err := writeEvent(w, flusher, "recovered", map[string]any{"text": recovered, "sessionID": sessionID}); err != nil {
 					deliveryErr = err
 				}
@@ -399,7 +410,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	// terminal event is attempted for delivery.
 	_ = a.persistAgentRunEvent(runID, "user", q.Prompt, "", seq, time.Now().UnixMilli())
 	seq++
-	diag, summary := a.runDiagnostics(outcome, snap, stdoutErrMsg, validStop, exit, parsedStderr(stderrText), a.redactSecrets(stderrText), stderrTrunc, seq, deliveryErr == nil, stdoutScanErr, map[string]string{"result": recoveryResult})
+	diag, summary := a.runDiagnostics(outcome, snap, stdoutErrMsg, validStop, exit, parsedStderr(a.redactSecrets(stderrText)), a.redactSecrets(stderrText), stderrTrunc, seq, deliveryErr == nil, stdoutScanErr, map[string]string{"result": recoveryResult})
 	_ = a.persistAgentRunEvent(runID, terminalKind(outcome), summary, "", seq, time.Now().UnixMilli())
 	a.finishAgentRun(runID, clientSession, string(outcome), sessionID, summary, input, output, cost, diag)
 	if deliveryErr == nil {
@@ -476,6 +487,10 @@ func (a *App) runDiagnostics(outcome runOutcome, snap runStateSnapshot, stdoutEr
 	}
 	if len(d.Errors) > 0 && strings.TrimSpace(d.Summary) != "" && d.Category != "opencode_error" {
 		d.Summary = d.Summary + " Details: " + strings.Join(d.Errors, "; ")
+	}
+	if rec, ok := recovery["result"]; ok {
+		d.RecoveryAttempted = rec == "ok" || rec == "failed"
+		d.RecoveryResult = rec
 	}
 	b, _ := json.Marshal(d)
 	return string(b), d.Summary
@@ -1139,6 +1154,32 @@ func eventText(raw map[string]any) string {
 	part, _ := raw["part"].(map[string]any)
 	s, _ := part["text"].(string)
 	return strings.TrimSpace(s)
+}
+
+// normalizedEvent maps an OpenCode stdout event to the server-owned
+// conversation event kind/text that mirrors what the frontend would render.
+// Non-rendered event types (step_start/step_finish) return "".
+func normalizedEvent(raw map[string]any) (kind, text string) {
+	typ, _ := raw["type"].(string)
+	switch typ {
+	case "text":
+		if t := eventText(raw); t != "" {
+			return "assistant", t
+		}
+	case "tool_use":
+		part, _ := raw["part"].(map[string]any)
+		tool, _ := part["tool"].(string)
+		state, _ := part["state"].(map[string]any)
+		status, _ := state["status"].(string)
+		lines := []string{"↳ " + tool}
+		if status != "" {
+			lines = []string{"↳ " + tool + " · " + status}
+		}
+		return "tool", strings.Join(lines, "\n")
+	case "error":
+		return "error", errorEventText(raw)
+	}
+	return "", ""
 }
 func recoverSession(ctx context.Context, binary, id, workspace, clientSession string, env []string) (string, []map[string]string, uint64, uint64, float64, error) {
 	cmd := exec.CommandContext(ctx, binary, "export", id)

@@ -85,7 +85,7 @@ func (s *runState) recordCause(c runCause) bool {
 	case causeOutputLimit:
 		// Once the limiter actually triggers it is authoritative, but a
 		// confirmed Stop is never downgraded to a limit.
-		if s.cause != causeNone && s.cause != causeRequestCanceled {
+		if s.cause != causeNone && s.cause != causeRequestCanceled && s.cause != causeUserStop {
 			return false
 		}
 	case causeServiceShutdown:
