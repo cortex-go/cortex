@@ -1166,15 +1166,14 @@ func TestAgentRunPostDeliveryFinalizeFailureFailsClosed(t *testing.T) {
 	ws := workspaceUnderRoot(t, a)
 	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
 	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
-	// Fail only the final (post-delivery) run-state update. The first
-	// finishAgentRun succeeds, so the run reaches its real outcome; the second
-	// update (with delivery diagnostics) fails and must be logged + left in
-	// the storage-failure outcome.
-	fail := true
+	// Call counter: call 1 is the pre-delivery run-state update (succeeds),
+	// call 2 is the post-delivery diagnostics update (fails), call 3 is the
+	// storage-failure best-effort finalize (succeeds).
+	calls := 0
 	a.failFinishAgentRun = func(runID string) error {
-		if fail {
-			fail = false
-			return errors.New("injected finalize failure")
+		calls++
+		if calls == 2 {
+			return errors.New("injected post-delivery finalize failure")
 		}
 		return nil
 	}
@@ -1188,9 +1187,72 @@ func TestAgentRunPostDeliveryFinalizeFailureFailsClosed(t *testing.T) {
 	if runID == "" {
 		t.Fatal("no run id")
 	}
-	// The storage-failure path finalizes as failed.
+	// The ordinary terminal event must have been delivered before the
+	// post-delivery failure.
+	var sawTerminal bool
+	for _, ev := range events {
+		if et, _ := ev["type"].(string); et == "done" {
+			sawTerminal = true
+		}
+	}
+	if !sawTerminal {
+		t.Fatal("ordinary terminal event was not delivered before post-delivery failure")
+	}
+	// The storage-failure path finalizes as failed (call 3).
+	if calls != 3 {
+		t.Fatalf("finishAgentRun called %d times, want 3", calls)
+	}
 	if state := runStateFromDB(t, a, runID); state != string(outcomeFailed) {
 		t.Fatalf("state = %q want failed after post-delivery failure", state)
+	}
+	// Diagnostics must identify the post-delivery run-state stage.
+	d := runDiagnosticsFromDB(t, a, runID)
+	if d.Category != "storage_failure" {
+		t.Fatalf("diagnostics category = %q want storage_failure", d.Category)
+	}
+	if !strings.Contains(d.DeliveryError, "post-delivery run-state") {
+		t.Fatalf("delivery error should name post-delivery run-state: %q", d.DeliveryError)
+	}
+}
+
+// TestAgentRunPreDeliveryFinalizeFailureFailsClosed verifies a failure of the
+// first (pre-delivery) run-state update also fails closed.
+func TestAgentRunPreDeliveryFinalizeFailureFailsClosed(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
+	calls := 0
+	a.failFinishAgentRun = func(runID string) error {
+		calls++
+		if calls == 1 {
+			return errors.New("injected pre-delivery finalize failure")
+		}
+		return nil
+	}
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if runID == "" {
+		t.Fatal("no run id")
+	}
+	// Pre-delivery failure means the ordinary terminal event is never written.
+	for _, ev := range events {
+		if et, _ := ev["type"].(string); et == "done" {
+			t.Fatal("terminal event should not be delivered after pre-delivery failure")
+		}
+	}
+	// The storage-failure path finalizes as failed (call 2).
+	if calls != 2 {
+		t.Fatalf("finishAgentRun called %d times, want 2", calls)
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeFailed) {
+		t.Fatalf("state = %q want failed after pre-delivery failure", state)
 	}
 }
 
@@ -1233,26 +1295,94 @@ func TestReconcileRecovered(t *testing.T) {
 		name           string
 		streamed       string
 		recovered      string
-		wantMissing    string
+		wantText       string
 		wantSuppressed bool
+		wantReplace    bool
 	}{
-		{"identical", "hello world", "hello world", "", true},
-		{"recovered prefix of streamed", "hello world extra", "hello world", "", true},
-		{"streamed prefix of recovered", "hello world", "hello world more", "more", false},
-		{"streamed suffix overlap", "world", "hello world", "hello", false},
-		{"partial overlap", "prefix mid", "mid suffix", "suffix", false},
-		{"no overlap", "alpha", "beta", "beta", false},
-		{"empty recovered", "alpha", "", "", true},
-		{"empty streamed", "", "beta", "beta", false},
+		{"identical", "hello world", "hello world", "", true, false},
+		{"recovered prefix of streamed", "hello world extra", "hello world", "", true, false},
+		{"streamed prefix of recovered", "hello world", "hello world more", "more", false, false},
+		{"streamed suffix of recovered (replacement)", "world", "hello world", "hello world", false, true},
+		{"partial overlap", "prefix mid", "mid suffix", "suffix", false, false},
+		{"no overlap", "alpha", "beta", "beta", false, false},
+		{"empty recovered", "alpha", "", "", true, false},
+		{"empty streamed", "", "beta", "beta", false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			missing, suppressed := reconcileRecovered(tc.streamed, tc.recovered)
+			text, suppressed, replace := reconcileRecovered(tc.streamed, tc.recovered)
 			if suppressed != tc.wantSuppressed {
 				t.Fatalf("suppressed = %v want %v", suppressed, tc.wantSuppressed)
 			}
-			if strings.TrimSpace(missing) != tc.wantMissing {
-				t.Fatalf("missing = %q want %q", missing, tc.wantMissing)
+			if replace != tc.wantReplace {
+				t.Fatalf("replace = %v want %v", replace, tc.wantReplace)
+			}
+			if strings.TrimSpace(text) != tc.wantText {
+				t.Fatalf("text = %q want %q", text, tc.wantText)
+			}
+		})
+	}
+}
+
+// TestReconcileRecoveredTranscriptOrder reconstructs the final user-visible
+// transcript for every overlap case, including a replacement recovery and
+// non-JSON streamed output.
+func TestReconcileRecoveredTranscriptOrder(t *testing.T) {
+	cases := []struct {
+		name      string
+		stdout    string // raw stdout bytes (JSON or plain output)
+		export    string
+		wantOrder []string // expected assistant transcript lines in order
+	}{
+		{
+			name:      "streamed prefix then append suffix",
+			stdout:    "{\"type\":\"text\",\"sessionID\":\"ses_x\",\"part\":{\"type\":\"text\",\"text\":\"hello\"}}\n",
+			export:    `{"info":{"id":"ses_x"},"messages":[{"info":{"role":"assistant","finish":"stop"},"parts":[{"type":"text","text":"hello world"}]}]}`,
+			wantOrder: []string{"hello", "world"},
+		},
+		{
+			name:      "streamed suffix then replacement",
+			stdout:    "world\n",
+			export:    `{"info":{"id":"ses_x"},"messages":[{"info":{"role":"assistant","finish":"stop"},"parts":[{"type":"text","text":"hello world"}]}]}`,
+			wantOrder: []string{"hello world"},
+		},
+		{
+			name:      "identical streamed suppresses recovery",
+			stdout:    "{\"type\":\"text\",\"sessionID\":\"ses_x\",\"part\":{\"type\":\"text\",\"text\":\"final\"}}\n",
+			export:    `{"info":{"id":"ses_x"},"messages":[{"info":{"role":"assistant","finish":"stop"},"parts":[{"type":"text","text":"final"}]}]}`,
+			wantOrder: []string{"final"},
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeOpenCode(t)
+			a := agentTestApp(t, fake)
+			ws := workspaceUnderRoot(t, a)
+			stdout := tc.stdout + "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+			fake.invoke(t, stdout, "", 1, tc.export)
+			// Use a unique conversation per case so transcripts do not mix.
+			body, _ := json.Marshal(map[string]any{"workspace": ws, "prompt": "test", "clientSession": fmt.Sprintf("conv%d", i)})
+			req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/agent/run", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			a.agentRun(rec, req)
+			merged, err := a.loadConversationMerged(fmt.Sprintf("conv%d", i))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var lines []string
+			for _, ev := range merged {
+				if ev.Kind == "assistant" {
+					lines = append(lines, ev.Text)
+				}
+			}
+			if len(lines) != len(tc.wantOrder) {
+				t.Fatalf("transcript lines = %d want %d: %+v", len(lines), len(tc.wantOrder), lines)
+			}
+			for j, want := range tc.wantOrder {
+				if strings.TrimSpace(lines[j]) != want {
+					t.Fatalf("line %d = %q want %q (full: %+v)", j, lines[j], want, lines)
+				}
 			}
 		})
 	}
@@ -1478,5 +1608,101 @@ func TestAgentRunNilContextDoneDoesNotLeak(t *testing.T) {
 	}
 	if !sawDone {
 		t.Fatal("run did not complete with nil Done() context")
+	}
+}
+
+// TestAgentRunTerminalMarkerSupersession verifies that when a post-delivery
+// finalization fails, a sequenced storage-failure terminal marker supersedes
+// the earlier completed marker in the reloaded merged transcript.
+func TestAgentRunTerminalMarkerSupersession(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
+	calls := 0
+	a.failFinishAgentRun = func(runID string) error {
+		calls++
+		if calls == 2 {
+			return errors.New("injected post-delivery finalize failure")
+		}
+		return nil
+	}
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if runID == "" {
+		t.Fatal("no run id")
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeFailed) {
+		t.Fatalf("run state = %q want failed", state)
+	}
+	// The reloaded merged transcript must show only the storage-failure
+	// terminal marker as the authoritative final outcome.
+	merged, err := a.loadConversationMerged("conv1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markers := []conversationEvent{}
+	for _, ev := range merged {
+		if runMarkerRunID(ev.Name) == runID {
+			markers = append(markers, ev)
+		}
+	}
+	if len(markers) != 1 {
+		t.Fatalf("expected exactly one authoritative terminal marker, got %d: %+v", len(markers), markers)
+	}
+	if markers[0].Name != "run:"+runID+":failed" {
+		t.Fatalf("terminal marker = %q want run:%s:failed", markers[0].Name, runID)
+	}
+}
+
+// TestAgentRunStorageFailureMarkerInsertStillFailsClosed verifies that when the
+// storage-failure terminal marker insert itself fails, the run row and
+// diagnostics remain the authoritative fallback source.
+func TestAgentRunStorageFailureMarkerInsertStillFailsClosed(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
+	// Fail every terminal-event insert AND every finalize (except the first
+	// finalize, which must succeed so the flow reaches post-delivery).
+	calls := 0
+	a.failAgentRunEvent = func(runID, kind string) error {
+		switch kind {
+		case "done", "error", "cancelled", "truncated":
+			return errors.New("injected terminal insert failure")
+		}
+		return nil
+	}
+	a.failFinishAgentRun = func(runID string) error {
+		calls++
+		if calls == 1 {
+			return nil // pre-delivery finalize succeeds
+		}
+		return errors.New("injected finalize failure")
+	}
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if runID == "" {
+		t.Fatal("no run id")
+	}
+	// Run row and diagnostics are the authoritative fallback.
+	if state := runStateFromDB(t, a, runID); state != string(outcomeFailed) {
+		t.Fatalf("run state = %q want failed", state)
+	}
+	d := runDiagnosticsFromDB(t, a, runID)
+	if d.Category != "storage_failure" {
+		t.Fatalf("diagnostics category = %q want storage_failure", d.Category)
 	}
 }

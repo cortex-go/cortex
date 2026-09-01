@@ -427,6 +427,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 					cancel()
 					break
 				}
+				streamedAssistant = strings.TrimSpace(streamedAssistant + "\n" + lineText)
 				seq++
 			}
 			if err := writeEvent(w, flusher, "output", map[string]any{"text": string(line)}); err != nil {
@@ -523,19 +524,27 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 					// Reconcile against the assistant text already durably
 					// streamed for this run: only the missing portion is
 					// persisted, and recovery is suppressed when the complete
-					// response is already present.
-					missing, suppressed := reconcileRecovered(streamedAssistant, recovered)
+					// response is already present. Replacement cases (the
+					// streamed fragment is only a suffix of the recovered
+					// response) persist the full response under a
+					// replacement marker so the merged transcript shows the
+					// correct final answer rather than a misordered append.
+					text, suppressed, replace := reconcileRecovered(streamedAssistant, recovered)
+					recoveryName := "recovered"
+					if replace {
+						recoveryName = "repl:" + runID
+					}
 					if suppressed {
 						recoveryResult = "ok_suppressed"
-					} else if missing == "" {
+					} else if text == "" {
 						recoveryResult = "ok_empty"
 					} else {
-						if err := a.persistAgentRunEvent(runID, "assistant", missing, "recovered", seq, time.Now().UnixMilli()); err != nil {
+						if err := a.persistAgentRunEvent(runID, "assistant", text, recoveryName, seq, time.Now().UnixMilli()); err != nil {
 							recoveryResult = "persist_failed"
 						} else {
 							seq++
 							recoveryResult = "ok"
-							if err := writeEvent(w, flusher, "recovered", map[string]any{"text": missing, "sessionID": sessionID, "recovered": true}); err != nil {
+							if err := writeEvent(w, flusher, "recovered", map[string]any{"text": text, "sessionID": sessionID, "recovered": true}); err != nil {
 								deliveryErr = err
 							}
 						}
@@ -580,12 +589,12 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	// "run:<runID>:<outcome>". Persistence is checked: a storage failure must
 	// never be represented as a durable completion.
 	if err := a.persistAgentRunEvent(runID, terminalKind(outcome), summary, "run:"+runID+":"+string(outcome), seq, time.Now().UnixMilli()); err != nil {
-		a.storageFailure(runID, clientSession, sessionID, "terminal event", err, input, output, cost, w, flusher)
+		a.storageFailure(runID, clientSession, sessionID, "terminal event", err, input, output, cost, w, flusher, seq)
 		return
 	}
 	seq++
 	if err := a.finishAgentRun(runID, clientSession, string(outcome), sessionID, summary, input, output, cost, diag); err != nil {
-		a.storageFailure(runID, clientSession, sessionID, "run-state", err, input, output, cost, w, flusher)
+		a.storageFailure(runID, clientSession, sessionID, "run-state", err, input, output, cost, w, flusher, seq)
 		return
 	}
 
@@ -651,7 +660,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	// run-state update is checked; a failure is logged and the run is left in
 	// the storage-failure outcome rather than a durable completion.
 	if err := a.finishAgentRun(runID, clientSession, string(outcome), sessionID, summary2, input, output, cost, diag2); err != nil {
-		a.storageFailure(runID, clientSession, sessionID, "post-delivery run-state", err, input, output, cost, w, flusher)
+		a.storageFailure(runID, clientSession, sessionID, "post-delivery run-state", err, input, output, cost, w, flusher, seq)
 	}
 }
 
@@ -659,16 +668,24 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 // the run ID, best-effort updates the durable run to a storage-failure outcome,
 // and emits a bounded client-facing failure if the stream is still writable.
 // The original error is never suppressed.
-func (a *App) storageFailure(runID, clientSession, sessionID, stage string, err error, input, output uint64, cost float64, w http.ResponseWriter, f http.Flusher) {
+func (a *App) storageFailure(runID, clientSession, sessionID, stage string, err error, input, output uint64, cost float64, w http.ResponseWriter, f http.Flusher, seq int64) {
 	log.Printf("cortex agent run %s: %s persistence failed: %v", runID, stage, err)
 	summary := "The agent result could not be stored durably."
 	d := diagnostics{
 		Outcome:       string(outcomeFailed),
 		Category:      "storage_failure",
 		Summary:       summary,
-		DeliveryError: "persistence failed: " + err.Error(),
+		DeliveryError: stage + ": persistence failed: " + err.Error(),
 	}
 	diag, _ := json.Marshal(d)
+	// Terminal-event supersession: append a sequenced storage-failure terminal
+	// marker (name "run:<id>:failed") so the merged transcript/UI treats it as
+	// the authoritative final outcome, superseding any earlier durable marker.
+	// The run row and diagnostics remain the fallback authoritative source if
+	// this insert also fails.
+	if err := a.persistAgentRunEvent(runID, "error", summary, "run:"+runID+":failed", seq+1, time.Now().UnixMilli()); err != nil {
+		log.Printf("cortex agent run %s: storage-failure terminal marker insert failed: %v", runID, err)
+	}
 	if ferr := a.finishAgentRun(runID, clientSession, string(outcomeFailed), sessionID, summary, input, output, cost, string(diag)); ferr != nil {
 		log.Printf("cortex agent run %s: storage-failure finalization also failed: %v", runID, ferr)
 	}
@@ -678,52 +695,54 @@ func (a *App) storageFailure(runID, clientSession, sessionID, stage string, err 
 }
 
 // reconcileRecovered compares recovered assistant text against the assistant
-// text already durably streamed for the run, returning the missing portion to
-// persist and whether recovery should be suppressed entirely (the complete
-// response is already present).
+// text already durably streamed for the run, returning the text to persist, a
+// suppress flag (the complete response is already present), and whether the
+// persisted recovery event must be a full-response replacement rather than an
+// appended tail.
 //
 // Policy:
-//   - recovered identical to streamed -> suppress (no duplicate)
-//   - recovered starts with streamed  -> persist only the missing suffix
-//   - streamed is a suffix / partial overlap -> persist only the genuinely
-//     new tail (longest common overlap)
-//   - no overlap -> persist the recovered text (genuinely new)
+//   - recovered identical/contained in streamed -> suppress
+//   - recovered starts with streamed -> append the missing suffix
+//   - partial overlap where recovered continues streamed (a suffix of streamed
+//     is a prefix of recovered) -> append the genuinely new tail
+//   - streamed is only a suffix of recovered -> the missing content is a
+//     prefix that cannot be appended after the existing suffix; persist the
+//     full recovered response as a replacement/supersession event
+//   - no overlap -> persist the full recovered response (genuinely new)
 //   - empty recovered -> suppress
-func reconcileRecovered(streamed, recovered string) (missing string, suppressed bool) {
+func reconcileRecovered(streamed, recovered string) (text string, suppressed, replace bool) {
 	s := strings.TrimSpace(streamed)
 	r := strings.TrimSpace(recovered)
 	if r == "" {
-		return "", true
+		return "", true, false
 	}
 	if s == "" {
-		return r, false
+		return r, false, false
 	}
-	if r == s {
-		return "", true
-	}
-	// The recovered text is fully contained in the already-streamed text: the
-	// complete response is present, so nothing is appended.
-	if strings.Contains(s, r) {
-		return "", true
+	if r == s || strings.Contains(s, r) {
+		return "", true, false
 	}
 	// Recovered starts with streamed -> only the missing suffix is new.
 	if strings.HasPrefix(r, s) {
-		return strings.TrimSpace(r[len(s):]), false
+		return strings.TrimSpace(r[len(s):]), false, false
 	}
-	// Streamed is a suffix of recovered -> only the new prefix is missing.
+	// Streamed is a suffix of recovered: appending a missing prefix after the
+	// existing suffix would produce the wrong order. The full recovered
+	// response replaces the streamed fragment.
 	if strings.HasSuffix(r, s) {
-		return strings.TrimSpace(r[:len(r)-len(s)]), false
+		return r, false, true
 	}
-	// Partial overlap: find the longest suffix of streamed that is a prefix of
-	// recovered so only the genuinely new tail is persisted.
+	// Partial overlap: a suffix of streamed is a prefix of recovered, so the
+	// recovered text continues the streamed text; the new tail is append-safe.
 	for i := len(s); i > 0; i-- {
 		if strings.HasPrefix(r, s[len(s)-i:]) {
 			// s[len(s)-i:] has length i and is a prefix of r; the new tail is
 			// r[i:].
-			return strings.TrimSpace(r[i:]), false
+			return strings.TrimSpace(r[i:]), false, false
 		}
 	}
-	return r, false
+	// No overlap: genuinely new content.
+	return r, false, false
 }
 
 // sanitizeImageURL validates or rewrites an unsafe file URL before persistence

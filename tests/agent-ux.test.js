@@ -62,7 +62,7 @@ function makeContext(fetchImpl) {
     body: new Node('body'),
   };
   const fetchCalls = [];
-  const fetchImplReal = fetchImpl || (() => Promise.resolve({ ok: true, json: () => Promise.resolve({}) }));
+  const fetchImplReal = fetchImpl || (() => Promise.resolve(jsonOk({})));
   const ctx = {
     document,
     console,
@@ -114,6 +114,7 @@ async function test(name, fn) {
 }
 
 // A fake feed element with controlled scroll metrics.
+function jsonOk(v){return {ok:true,json:()=>Promise.resolve(v),headers:{get:()=>'application/json'}}}
 function feedNode(scrollTop, scrollHeight, clientHeight) {
   const f = new Node('div');
   f.scrollTop = scrollTop;
@@ -178,7 +179,7 @@ test('busy session close uses server-side stop (no immediate abort)', async () =
   };
   const ctx2 = loadContext((url, opt) => {
     if (routes[url]) return routes[url](opt);
-    return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    return Promise.resolve(jsonOk({}));
   });
   run(ctx2, `(function(){const s=sessions['a']||{id:'a',busy:true,runID:'run-1',abort:null,followBottom:true,unread:0};sessions={a:s};activeId='a';stopAgentFor(s);})()`);
   await settle(20);
@@ -192,15 +193,53 @@ test('unread indicator cleared when switching to a tab', async () => {
   const unread = run(ctx, `sessions['b'].unread`);
   if (unread !== 0) throw new Error('unread not cleared');
 });
-test('reload while a run remains active keeps the spinner', async () => {
-  const ctx = loadContext();
-  // Authoritative server state says running with a current run id.
-  const s = { id: 'a', state: 'running', currentRunId: 'run-1', busy: true, events: [], followBottom: true, unread: 0 };
-  run(ctx, 'sessions={a:S};activeId="a"', { S: s });
-  // Simulate a reload that re-derives busy from server state.
-  run(ctx, `(function(){const s=sessions['a'];s.busy=(s.state==='running');})()`);
-  if (!run(ctx, "sessions['a'].busy")) throw new Error('spinner lost after reload while run active');
+test('real syncServerConversations keeps spinner for running conversation', async () => {
+  // Server returns an authoritative running conversation; the real sync
+  // function must derive busy from state, not a manual assignment.
+  const ctx = loadContext((url) => {
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: 'running', currentRunId: 'run-1', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, 'sessions={};activeId="a";serverReady=true');
+  await run(ctx, 'syncServerConversations()');
+  if (!run(ctx, "sessions['a'] && sessions['a'].busy")) throw new Error('spinner lost after reload while run active');
   if (run(ctx, "sessions['a'].currentRunId") !== 'run-1') throw new Error('currentRunId lost');
+});
+
+test('real syncServerConversations clears spinner for terminal conversation', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: 'interrupted', currentRunId: 'run-1', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, 'sessions={};activeId="a";serverReady=true');
+  await run(ctx, 'syncServerConversations()');
+  if (run(ctx, "sessions['a'] && sessions['a'].busy")) throw new Error('spinner not cleared for terminal conversation');
+});
+
+test('two running background tabs both show spinners', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([
+      { id: 'a', state: 'running', currentRunId: 'r1', events: [] },
+      { id: 'b', state: 'running', currentRunId: 'r2', events: [] },
+    ]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, 'sessions={};activeId="a";serverReady=true');
+  await run(ctx, 'syncServerConversations()');
+  if (!run(ctx, "sessions['a'].busy") || !run(ctx, "sessions['b'].busy")) throw new Error('both running tabs should show spinners');
+});
+
+test('reconcileRunState polls until terminal (running->running->completed)', async () => {
+  const states = ['running', 'running', 'completed'];
+  let i = 0;
+  const ctx = loadContext((url) => {
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: states[Math.min(i++, states.length - 1)], currentRunId: 'run-1', events: [] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, 'sessions={a:{id:"a",state:"running",currentRunId:"run-1",busy:true,events:[],followBottom:true,unread:0}};activeId="a"');
+  await run(ctx, 'reconcileRunState("a")');
+  if (run(ctx, "sessions['a'].busy")) throw new Error('spinner stuck after polling to terminal');
+  if (run(ctx, "sessions['a'].state") !== 'completed') throw new Error('state not updated after polling');
 });
 
 test('terminal state received normally clears the spinner', async () => {

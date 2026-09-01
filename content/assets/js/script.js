@@ -48,11 +48,13 @@ async function closeSession(id){
   const s=sessions[id];if(!s)return;
   if(s.busy&&!confirm('This agent is still working. Stop and close it?'))return;
   if(s.busy){
-    // Submit the server-side stop, then wait for a durable terminal outcome or
-    // a bounded reconciliation. If cancellation cannot be confirmed, keep the
-    // tab and surface an error rather than silently archiving a live run.
-    const ok=await stopAgentFor(s);
-    if(!ok){toast('Could not stop the running agent; the session stays open.');return}
+    // Submit the server-side stop, then wait for a durable terminal outcome via
+    // bounded reconciliation. Genuine rejection keeps the tab; an accepted-but-
+    // still-draining stop keeps the tab and reports that the stop is pending
+    // rather than claiming it failed.
+    const res=await stopAgentFor(s);
+    if(res&&res.rejected){toast('Could not stop the running agent; the session stays open.');return}
+    if(res&&res.draining){toast('Stop accepted; the agent is still winding down.');return}
     if(s.busy)await reconcileRunState(id);
   }else{s.abort?.abort()}
   const archived={...sessionSafe(s),archivedAt:Date.now(),closedAt:Date.now()};
@@ -261,23 +263,41 @@ async function addGeneratedImage(id,im){
 }
 function toolText(raw){const p=raw.part||raw,st=p.state||{},tool=p.tool||raw.tool||raw.name||'tool',status=st.status||'';const input=st.input||p.input||{},lines=[`↳ ${tool}${status?' · '+status:''}`];if(tool==='bash'&&input.command)lines.push('$ '+input.command);else if(input.filePath||input.path)lines.push(input.filePath||input.path);if(st.error)lines.push('ERROR: '+clipped(typeof st.error==='string'?st.error:JSON.stringify(st.error)));else if(st.output)lines.push(clipped(st.output));return lines.join('\n')}
 function summarize(ev){const raw=ev?.data?.data||ev?.data||{},type=String(raw.type||'');if(ev.type==='error')return raw.message||'Agent failed';if(ev.type==='truncated')return raw.message||'Provider output was truncated.';if(ev.type==='cancelled')return raw.message||'Agent stopped.';if(ev.type==='recovered')return raw.text||'';if(ev.type==='done'){const i=raw.inputTokens||0,o=raw.outputTokens||0;return i||o?`Done · ${i} input · ${o} output tokens`:'Done'};if(ev.type==='output')return raw.text||'';if(type.includes('tool'))return toolText(raw);return raw.part?.text||raw.text||''}
-// reconcileRunState re-fetches the authoritative conversation state after a
-// stream ends without a durable terminal event (disconnect/timeout) so the
-// running spinner reflects the server, not the vanished browser request.
+// reconcileRunState polls the authoritative conversation state after a stream
+// ends without a durable terminal event (disconnect/timeout) so the running
+// spinner reflects the server, not the vanished browser request. It polls with
+// bounded backoff until the run is terminal, the session is removed/archived, a
+// newer run replaces it, or the documented timeout is reached. Concurrent
+// polling for the same session is deduplicated.
+const reconcilePolls=new Map();
+const RECONCILE_MAX_WAIT_MS=30000;
 async function reconcileRunState(id){
-  const s=sessions[id];if(!s)return;
+  if(!sessions[id]||reconcilePolls.has(id))return;
+  const token=setTimeout(()=>{},0);
+  reconcilePolls.set(id,token);
   try{
-    const all=await api('/api/conversations');
-    const rec=all.find(c=>c.id===id);
-    if(!rec)return;
-    const terminal=rec.state!=='running'&&rec.state!=='idle'&&rec.state!=='';
-    s.state=rec.state||s.state;
-    s.currentRunId=rec.currentRunId||'';
-    if(rec.state==='running'){s.busy=true}
-    else if(terminal){s.busy=false}
-    persistLocalState();saveSessionToServer(id);
-    if(activeId===id)renderAll();
-  }catch{}
+    const start=Date.now();
+    const delay=ms=>new Promise(r=>setTimeout(r,ms));
+    while(Date.now()-start<RECONCILE_MAX_WAIT_MS){
+      const s=sessions[id];
+      if(!s)return; // session removed
+      try{
+        const all=await api('/api/conversations');
+        const rec=all.find(c=>c.id===id);
+        if(rec){
+          const terminal=rec.state!=='running'&&rec.state!=='idle'&&rec.state!=='';
+          s.state=rec.state||s.state;
+          // Stop when a newer run replaced the one being reconciled.
+          if(rec.currentRunId&&rec.currentRunId!==s.currentRunId&&s.currentRunId&&s.busy){s.currentRunId=rec.currentRunId;s.busy=false;persistLocalState();saveSessionToServer(id);if(activeId===id)renderAll();return}
+          s.currentRunId=rec.currentRunId||'';
+          if(rec.state==='running'){s.busy=true}
+          else if(terminal){s.busy=false;persistLocalState();saveSessionToServer(id);if(activeId===id)renderAll();return}
+        }
+      }catch{}
+      if(sessions[id]&&!sessions[id].busy)return; // became terminal meanwhile
+      await delay(Math.min(1500,Date.now()-start+250));
+    }
+  }finally{reconcilePolls.delete(id)}
 }
 async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace||workspaceUnavailable(s))return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();s.runID='';if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');const images=attachments.map(a=>({name:a.name,data:a.dataUrl}));for(const a of attachments)addEvent(id,'image',a.thumb,a.name);addEvent(id,'user',prompt);attachments=[];renderAttachments();renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id,images}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';const seenImages=new Set();for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line),text=summarize(ev),raw=ev?.data?.data||ev?.data||{};if(ev.type==='run'&&raw.runID){s.runID=raw.runID;s.currentRunId=raw.runID}if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;const oc=raw.outcome||'';if(oc)s.state=oc;else if(ev.type==='done')s.state='completed';else if(ev.type==='error')s.state='failed';else if(ev.type==='cancelled')s.state='cancelled';else if(ev.type==='truncated')s.state='truncated';if(ev.type==='done'||ev.type==='error'||ev.type==='cancelled'||ev.type==='truncated'){s.busy=false;s.abort=null};const termEvent={kind:eventKind(ev),text:summarize(ev),name:'run:'+(raw.runID||s.runID)+':'+oc,outcome:oc,runID:raw.runID||s.runID};if(termEvent.text)addEvent(id,termEvent.kind,termEvent.text,termEvent.name,{outcome:oc,runID:termEvent.runID});if(ev.type==='recovered-images'){for(const im of (raw.images||[]))addGeneratedImage(id,im)}for(const im of extractImages(raw)){if(seenImages.has(im.url))continue;seenImages.add(im.url);addGeneratedImage(id,im)}}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].abort=null;persistLocalState();saveSessionToServer(id);if(sessions[id]&&sessions[id].busy){reconcileRunState(id)}}if(activeId===id)renderAll();agentStatus()}}
 
@@ -285,25 +305,29 @@ async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace||wo
 // streaming request is left open; only if the cancellation request fails or
 // exceeds a short timeout does the client fall back to aborting the fetch.
 async function stopAgent(){const s=active();if(!s)return;await stopAgentFor(s)}
+// stopAgentFor submits the server-side stop and waits for the run to reach a
+// durable terminal state via bounded reconciliation. It resolves to
+// {ok:true} when the run became terminal, {ok:false,rejected:true} when the
+// server refused cancellation, or {ok:false,draining:true} when cancellation
+// was accepted but the run is still draining after the bounded wait.
 async function stopAgentFor(s){
-  if(!s?.busy)return true;
+  if(!s?.busy)return {ok:true};
   const abortFallback=()=>s.abort?.abort();
-  if(!s.runID){abortFallback();return false}
+  if(!s.runID){abortFallback();return {ok:false,rejected:true}}
   try{
     await Promise.race([
       api('/api/agent/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runID:s.runID})}),
       new Promise((_,rej)=>setTimeout(()=>rej(Error('cancel timeout')),2000))
     ]);
-    // Wait briefly for the durable terminal event; if it did not arrive,
-    // reconcile against server state. Failure to confirm cancellation returns
-    // false so the caller keeps the session.
+    // Wait for the durable terminal event; if it did not arrive, poll the
+    // server with bounded backoff until the run is terminal or the timeout.
     await new Promise(res=>setTimeout(res,1500));
     if(s.busy){
       await reconcileRunState(s.id||activeId);
-      if(s.busy){abortFallback();return false}
+      if(s.busy)return {ok:false,draining:true};
     }
-    return true;
-  }catch{abortFallback();return false}
+    return {ok:true};
+  }catch{return {ok:false,rejected:true}}
 }
 
 function joinPath(base,name){return (base.replace(/\/+$/,'')+'/'+name).replace(/\/+/g,'/')}

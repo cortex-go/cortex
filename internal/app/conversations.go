@@ -357,6 +357,100 @@ func mergeConversationEvents(server, client []conversationEvent) []conversationE
 		// authoritative copy is not shadowed by its duplicate.
 		return serverSig[eventSignature(out[i])] && !serverSig[eventSignature(out[j])]
 	})
+	// Terminal-event supersession: a run may have multiple durable terminal
+	// markers (e.g. an ordinary "completed" marker superseded by a storage
+	// failure). The latest marker per run is authoritative; earlier markers are
+	// retained only as delivery history, not as a competing final outcome.
+	return supersedeTerminalMarkers(supersedeAssistantPrefixes(out))
+}
+
+// replRunID extracts the run ID from a "repl:<id>" recovery-replacement marker
+// name, or "" if the event is not a recovery replacement.
+func replRunID(name string) string {
+	if strings.HasPrefix(name, "repl:") && len(name) > len("repl:") {
+		return name[len("repl:"):]
+	}
+	return ""
+}
+
+// supersedeAssistantPrefixes removes earlier streamed assistant events that
+// are fragments of a recovery-replacement event. A replacement (e.g.
+// "hello world") supersedes its streamed fragment ("world" was a suffix of the
+// recovered response, so appending would be misordered), leaving the full
+// recovered response as the only assistant content for that answer.
+func supersedeAssistantPrefixes(events []conversationEvent) []conversationEvent {
+	replacements := []conversationEvent{}
+	for _, e := range events {
+		if e.Kind == "assistant" && replRunID(e.Name) != "" {
+			replacements = append(replacements, e)
+		}
+	}
+	if len(replacements) == 0 {
+		return events
+	}
+	drop := map[int]bool{}
+	for i, e := range events {
+		if e.Kind != "assistant" || replRunID(e.Name) != "" {
+			continue
+		}
+		et := strings.TrimSpace(e.Text)
+		if et == "" {
+			continue
+		}
+		for _, r := range replacements {
+			rt := strings.TrimSpace(r.Text)
+			if rt != et && strings.Contains(rt, et) {
+				drop[i] = true
+				break
+			}
+		}
+	}
+	if len(drop) == 0 {
+		return events
+	}
+	out := make([]conversationEvent, 0, len(events))
+	for i, e := range events {
+		if !drop[i] {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// runMarkerRunID extracts the run ID from a "run:<id>:<outcome>" terminal
+// marker name, or "" if the event is not a run terminal marker.
+func runMarkerRunID(name string) string {
+	if m := strings.SplitN(name, ":", 3); len(m) == 3 && m[0] == "run" && m[1] != "" {
+		return m[1]
+	}
+	return ""
+}
+
+// supersedeTerminalMarkers keeps only the latest durable terminal marker per
+// run, so the reloaded transcript never shows both "Done" and a later
+// storage-failure outcome as independent final outcomes.
+func supersedeTerminalMarkers(events []conversationEvent) []conversationEvent {
+	last := map[string]int{}
+	for i, e := range events {
+		if id := runMarkerRunID(e.Name); id != "" {
+			last[id] = i
+		}
+	}
+	if len(last) == 0 {
+		return events
+	}
+	drop := map[int]bool{}
+	for i, e := range events {
+		if id := runMarkerRunID(e.Name); id != "" && i != last[id] {
+			drop[i] = true
+		}
+	}
+	out := make([]conversationEvent, 0, len(events))
+	for i, e := range events {
+		if !drop[i] {
+			out = append(out, e)
+		}
+	}
 	return out
 }
 
