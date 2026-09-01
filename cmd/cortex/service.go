@@ -238,15 +238,16 @@ func (m *serviceManager) rawState(verb string) (string, error) {
 }
 
 // restorableEnabledWord reports whether a prior is-enabled raw word can be
-// restored exactly by the rollback sequence. Persistent/runtime enablement
-// links (enabled, enabled-runtime, masked, masked-runtime) and their absence
-// (disabled) are restorable; not-found is not (disabling a loaded unit yields
-// disabled, never not-found), and unit-file states that enable/disable cannot
+// restored exactly by the rollback sequence. Persistent and runtime enablement
+// links (enabled, enabled-runtime) and their absence (disabled) are
+// restorable. Masked, masked-runtime and not-found are not: a masked unit can
+// never be enabled by the install itself, and disabling a loaded unit yields
+// disabled rather than not-found. Unit-file states that enable/disable cannot
 // reproduce (static, alias, indirect, generated, linked, linked-runtime,
-// transient, unknown) are not.
+// transient, unknown) are not restorable.
 func restorableEnabledWord(word string) bool {
 	switch word {
-	case "enabled", "enabled-runtime", "masked", "masked-runtime", "disabled":
+	case "enabled", "enabled-runtime", "disabled":
 		return true
 	}
 	return false
@@ -267,32 +268,27 @@ func restorableActiveWord(word string) bool {
 
 // restorablePriorState reports whether the enablement/active pair can be
 // reproduced exactly by the rollback ordering (enablement restored first, then
-// active state). A masked unit cannot be restarted, so masked + active is
-// refused before mutation.
+// active state), and whether the install itself can reach the documented
+// enabled-and-active state. Masked units are refused because `systemctl
+// enable` fails while a unit is masked, so no accepted prior state is masked.
 func restorablePriorState(enabledWord, activeWord string) bool {
-	if !restorableEnabledWord(enabledWord) || !restorableActiveWord(activeWord) {
-		return false
-	}
-	if (enabledWord == "masked" || enabledWord == "masked-runtime") && activeWord == "active" {
-		return false
-	}
-	return true
+	return restorableEnabledWord(enabledWord) && restorableActiveWord(activeWord)
 }
 
-// enableRestoreArgs returns the systemctl call that reproduces a prior
-// is-enabled word exactly.
-func enableRestoreArgs(word, unit string) []string {
+// enableRestoreSteps returns the systemctl calls that reproduce a prior
+// is-enabled word exactly. Enablement is normalized first: the persistent
+// enablement link created by the attempted install is removed with disable,
+// then the intended persistent or runtime link is recreated, so a runtime-only
+// prior never leaves a persistent enablement behind.
+func enableRestoreSteps(word, unit string) [][]string {
 	switch word {
 	case "enabled":
-		return []string{"enable", unit}
+		return [][]string{{"disable", unit}, {"enable", unit}}
 	case "enabled-runtime":
-		return []string{"enable", "--runtime", unit}
-	case "masked":
-		return []string{"mask", unit}
-	case "masked-runtime":
-		return []string{"mask", "--runtime", unit}
+		return [][]string{{"disable", unit}, {"enable", "--runtime", unit}}
+	default: // disabled
+		return [][]string{{"disable", unit}}
 	}
-	return []string{"disable", unit}
 }
 
 // activeRestoreArgs returns the systemctl call that reproduces a prior
@@ -350,8 +346,11 @@ func (m *serviceManager) rollbackInstall(priorUnit []byte, hadUnit bool, priorEn
 		errs = append(errs, fmt.Sprintf("reload systemd: %v", err))
 	}
 	if hadUnit {
-		if err := m.systemctlSuccess(enableRestoreArgs(priorEnabledWord, m.unitName)...); err != nil {
-			errs = append(errs, fmt.Sprintf("restore enablement %q: %v", priorEnabledWord, err))
+		for _, args := range enableRestoreSteps(priorEnabledWord, m.unitName) {
+			if err := m.systemctlSuccess(args...); err != nil {
+				errs = append(errs, fmt.Sprintf("restore enablement %q: %v", priorEnabledWord, err))
+				break
+			}
 		}
 		if err := m.systemctlSuccess(activeRestoreArgs(priorActiveWord, m.unitName)...); err != nil {
 			errs = append(errs, fmt.Sprintf("restore active state %q: %v", priorActiveWord, err))
