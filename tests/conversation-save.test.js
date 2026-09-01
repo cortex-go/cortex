@@ -50,6 +50,11 @@ class El {
   getBoundingClientRect() { return { height: 100 }; }
   requestSubmit() {}
   stopPropagation() {}
+  setAttribute(name, value) { this[name] = String(value); }
+  removeAttribute(name) { this[name] = ''; }
+  getAttribute(name) { return this[name] || null; }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
   set textContent(v) { this._text = String(v); }
   get textContent() { return this._text; }
   set className(v) { this._className = String(v); }
