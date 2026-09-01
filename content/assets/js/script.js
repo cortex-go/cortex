@@ -291,20 +291,71 @@ function startComposerResize(e){
   };
   document.addEventListener('pointermove',move);document.addEventListener('pointerup',up)
 }
+// migrateLegacy imports the browser's local conversations that are not already
+// on the server and consumes the deterministic imported/rejected result.
+// Successfully imported records are dropped from local storage (the server now
+// holds them); rejected records are preserved locally with their transcripts
+// and marked recoverable so they can be corrected and retried. Returns the
+// number of rejected records.
+async function migrateLegacy(legacy){
+  if(!legacy.length)return 0;
+  const res=await api('/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conversations:legacy})});
+  const imported=new Set(res.imported||[]);
+  const rejectedById=new Map((res.rejected||[]).map(r=>[r.id,r.reason]));
+  for(const [id,s] of Object.entries(sessions)){
+    if(rejectedById.has(id)){s.migrationRejected=true;s.migrationReason=rejectedById.get(id)}
+    else if(imported.has(id)){delete sessions[id]}
+  }
+  closedSessions=closedSessions.filter(s=>{
+    if(rejectedById.has(s.id)){s.migrationRejected=true;s.migrationReason=rejectedById.get(s.id);return true}
+    return !imported.has(s.id);
+  });
+  localStorage.setItem('cortex.sessions.migrated.sqlite.v1','1');
+  renderMigrationNotice();
+  return rejectedById.size;
+}
+function renderMigrationNotice(){
+  const el=$('#migrationNotice'),btn=$('#retryMigration');
+  const rejected=[...Object.values(sessions),...closedSessions].filter(s=>s.migrationRejected);
+  if(!rejected.length){el.hidden=true;return}
+  el.hidden=false;
+  el.textContent='Some conversations could not be imported ('+rejected.length+'). They remain in this browser with their transcripts. ';
+  btn.hidden=false
+}
+// retryMigration re-attempts the import of every local conversation that is not
+// already on the server, so a corrected or newly-valid record can be migrated
+// even when the database already contains other conversations.
+async function retryMigration(){
+  const legacy=[...Object.values(sessions),...closedSessions].map(sessionSafe);
+  const stored=await api('/api/conversations');
+  const toMigrate=legacy.filter(l=>!stored.some(s=>s.id===l.id));
+  const rejected=await migrateLegacy(toMigrate);
+  persistLocalState();renderAll();
+  toast(rejected?rejected+' conversations could not be imported.':'All remaining conversations imported.')
+}
 async function syncServerConversations(){
-  const legacy=[...Object.values(sessions),...closedSessions].map(sessionSafe),stored=await api('/api/conversations');
-  if(!stored.length&&legacy.length){await api('/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conversations:legacy})});localStorage.setItem('cortex.sessions.migrated.sqlite.v1','1')}
+  const legacy=[...Object.values(sessions),...closedSessions].map(sessionSafe);
+  let stored=await api('/api/conversations');
+  // Attempt migration of every legacy record the server does not already hold.
+  // This runs even when the server has other conversations, so a previously
+  // rejected record stays recoverable and is retried on a later boot. The
+  // idempotent upsert plus the not-on-server filter prevent duplicates.
+  const toMigrate=legacy.filter(l=>!stored.some(s=>s.id===l.id));
+  if(toMigrate.length){
+    await migrateLegacy(toMigrate);
+    stored=await api('/api/conversations');
+  }
   const authoritative=stored.length?stored:await api('/api/conversations');
-  sessions={};closedSessions=[];
   for(const s of authoritative){s.busy=false;s.abort=null;if(s.archivedAt){s.closedAt=s.archivedAt;closedSessions.push(s)}else sessions[s.id]=s}
   if(!Object.keys(sessions).length)newSession('',false);
   if(!sessions[activeId])activeId=Object.keys(sessions)[0];
   // Loading authoritative server conversations must not PUT any of them back:
   // only the local UI state is persisted here.
+  renderMigrationNotice();
   serverReady=true;persistLocalState();renderAll()
 }
 async function boot(){const st=await api('/api/status');root=st.root;loadSessions();renderAll();restoreComposerHeight();await Promise.all([loadSettings(),agentStatus(),syncServerConversations()]);if(!active()?.workspace)setTimeout(openWorkspacePicker,0)}
-$('#newSession').onclick=e=>{e.stopPropagation();toggleSessionMenu()};$('#newSameWorkspace').onclick=newSessionSameWorkspace;$('#newWorkspace').onclick=newWorkspaceSession;$('#workspaceBtn').onclick=openWorkspacePicker;$('#closeWorkspace').onclick=$('#cancelWorkspace').onclick=()=>$('#workspaceModal').hidden=true;$('#browserUp').onclick=()=>browse(parentPath(browserPath));$('#chooseWorkspace').onclick=chooseWorkspace;
+$('#newSession').onclick=e=>{e.stopPropagation();toggleSessionMenu()};$('#newSameWorkspace').onclick=newSessionSameWorkspace;$('#newWorkspace').onclick=newWorkspaceSession;$('#workspaceBtn').onclick=openWorkspacePicker;$('#closeWorkspace').onclick=$('#cancelWorkspace').onclick=()=>$('#workspaceModal').hidden=true;$('#browserUp').onclick=()=>browse(parentPath(browserPath));$('#chooseWorkspace').onclick=chooseWorkspace;$('#retryMigration').onclick=retryMigration;
 $('#composerResize').onpointerdown=startComposerResize;$('#composerResize').ondblclick=()=>{applyComposerHeight(150);localStorage.setItem(COMPOSER_STORE,'150')};document.addEventListener('click',e=>{if(!e.target.closest('.new-session-wrap'))hideSessionMenu()});window.addEventListener('resize',()=>applyComposerHeight($('#agentForm').getBoundingClientRect().height));
 $('#agentForm').onsubmit=e=>{e.preventDefault();const p=$('#prompt').value.trim();if(!p)return;$('#prompt').value='';runAgent(p)};$('#prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('#agentForm').requestSubmit()}};$('#stop').onclick=()=>active()?.abort?.abort();$('#copy').onclick=copySession;
 $('#prompt').addEventListener('paste',e=>{const files=[...(e.clipboardData?.items||[])].map(i=>i.getAsFile()).filter(Boolean).filter(f=>f.type&&f.type.startsWith('image/'));if(!files.length)return;let handled=false;for(const f of files)handled=addImage(f)||handled;if(handled)e.preventDefault()});

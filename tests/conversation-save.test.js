@@ -112,7 +112,7 @@ function makeContext(fetchImpl) {
   return ctx;
 }
 
-function loadContext() {
+function loadContext(server) {
   const ok = (body) => ({
     ok: true,
     status: 200,
@@ -120,33 +120,42 @@ function loadContext() {
     json: async () => body,
     text: async () => JSON.stringify(body),
   });
-  const notOk = (msg) => ({
-    ok: false,
-    status: 400,
-    headers: { get: () => '' },
-    json: async () => ({ error: msg }),
-    text: async () => msg,
-  });
-  // Default backend behaviour: auth unconfigured (no auto-boot), status ok,
-  // conversations list configurable per-test.
+  // Stateful conversation store shared across "browser restarts": GET returns
+  // the stored records, POST imports records not in `rejectIds` and reports
+  // imported/rejected deterministically.
+  const store = server || { records: [], rejectIds: new Set() };
+  const handleConversations = (opt) => {
+    const method = (opt.method || 'GET').toUpperCase();
+    if (method === 'GET') return ok([...store.records]);
+    const batch = JSON.parse(opt.body || '{}');
+    const imported = [];
+    const rejected = [];
+    for (const c of (batch.conversations || [])) {
+      if (store.rejectIds.has(c.id)) {
+        rejected.push({ id: c.id, reason: 'rejected by fixture' });
+      } else if (!store.records.some((r) => r.id === c.id)) {
+        store.records.push(c);
+        imported.push(c.id);
+      } else {
+        imported.push(c.id); // idempotent upsert
+      }
+    }
+    return ok({ imported, rejected });
+  };
   const routes = {
     '/api/auth/state': () => ok({ configured: false, authenticated: false }),
     '/api/status': () => ok({ root: '/home/nick', settings: {} }),
     '/api/settings': () => ok({ providers: [], activeProvider: '' }),
     '/api/agent/status': () => ok({ available: false }),
-    '/api/conversations': () => ok([]),
+    '/api/conversations': (opt) => handleConversations(opt),
   };
-  let conversationList = () => ok([]);
   const ctx = makeContext((url, opt) => {
-    if (url === '/api/conversations' && (!opt.method || opt.method.toUpperCase() === 'GET')) {
-      return conversationList();
-    }
     const h = routes[url];
-    if (h) return h();
+    if (h) return h(opt);
     return ok({});
   });
   ctx.routes = routes;
-  ctx.setConversations = (fn) => { conversationList = fn; };
+  ctx.store = store;
   vm.runInContext(SCRIPT, ctx);
   return ctx;
 }
@@ -165,6 +174,15 @@ async function test(t) {
   ctx.fetchCalls.length = 0;
   await t(ctx);
   console.log('ok - ' + t.name);
+}
+
+// bootSimulation seeds browser localStorage and runs a fresh boot.
+async function bootSimulation(ctx, localStore) {
+  const payload = JSON.stringify({ activeId: 'a', sessions: localStore.sessions || {}, closedSessions: localStore.closedSessions || [] });
+  run(ctx, `localStorage.setItem('cortex.sessions.v1', ${JSON.stringify(payload)});`);
+  run(ctx, `loadSessions()`);
+  await runAsync(ctx, `syncServerConversations()`);
+  await settle();
 }
 
 (async () => {
@@ -191,16 +209,10 @@ async function test(t) {
 
   await test(async function boot_synchronization_issues_zero_puts(ctx) {
     run(ctx, `serverReady=false; sessions={}; closedSessions=[]; localStorage.removeItem('cortex.sessions.v1');`);
-    ctx.setConversations(() => ({
-      ok: true,
-      status: 200,
-      headers: { get: () => 'application/json' },
-      json: async () => [
-        { id: 'valid', workspace: '/home/nick/repo', workspaceStatus: 'available', archivedAt: 0, events: [], createdAt: 1, updatedAt: 1 },
-        { id: 'archived', workspace: '/home/nick/gone', workspaceStatus: 'missing', archivedAt: 123, events: [], createdAt: 1, updatedAt: 1 },
-      ],
-      text: async () => '',
-    }));
+    ctx.store.records.push(
+      { id: 'valid', workspace: '/home/nick/repo', workspaceStatus: 'available', archivedAt: 0, events: [], createdAt: 1, updatedAt: 1 },
+      { id: 'archived', workspace: '/home/nick/gone', workspaceStatus: 'missing', archivedAt: 123, events: [], createdAt: 1, updatedAt: 1 },
+    );
     await runAsync(ctx, `syncServerConversations()`);
     await settle();
     assert.strictEqual(putCalls(ctx).length, 0, 'loading authoritative conversations must issue no PUT');
@@ -232,4 +244,63 @@ async function test(t) {
     assert.strictEqual(run(ctx, `sessions['a'].openCodeSession`), '', 'old OpenCode session must be cleared when the workspace changes');
     assert.strictEqual(run(ctx, `sessions['a'].workspace`), '/home/nick/real', 'replacement workspace must be recorded');
   });
+
+  // Partial legacy migration: A imports, B is rejected. B must stay recoverable
+  // locally, retry later, and never be silently dropped; A must not be
+  // duplicated or overwritten by a later boot.
+  {
+    const local = () => ({
+      sessions: {
+        a: { id: 'a', workspace: '/w1', events: [{ kind: 'user', text: 'A transcript' }], createdAt: 1, updatedAt: 1 },
+        b: { id: 'b', workspace: '/w2', events: [{ kind: 'user', text: 'B transcript' }], createdAt: 2, updatedAt: 2 },
+      },
+      closedSessions: [],
+    });
+    const server = { records: [], rejectIds: new Set(['b']) };
+    const ctx1 = loadContext(server);
+    await settle(10);
+    ctx1.fetchCalls.length = 0;
+    await bootSimulation(ctx1, local());
+    assert.deepStrictEqual(server.records.map((r) => r.id), ['a'], 'only the valid record imports on the first boot');
+    assert.strictEqual(run(ctx1, `sessions['a'].workspace`), '/w1', 'imported record must be present as the authoritative server copy');
+    assert.strictEqual(run(ctx1, `sessions['b'].migrationRejected`), true, 'rejected record must remain recoverable locally');
+    assert.strictEqual(run(ctx1, `sessions['b'].events[0].text`), 'B transcript', 'rejected record transcript must be preserved');
+    assert.strictEqual(ctx1.els.get('#migrationNotice').hidden, false, 'migration failure must be surfaced visibly');
+    assert.strictEqual(putCalls(ctx1).length, 0, 'boot must issue zero conversation PUTs');
+
+    // "Restart the browser": the server now holds A (non-empty), B is still
+    // rejected. A must not be re-imported (no duplication) and must not be
+    // overwritten by the stale local copy.
+    const ctx2 = loadContext(server);
+    await settle(10);
+    ctx2.fetchCalls.length = 0;
+    const persisted = run(ctx1, `localStorage.getItem('cortex.sessions.v1')`);
+    run(ctx2, `localStorage.setItem('cortex.sessions.v1', ${JSON.stringify(persisted)});`);
+    run(ctx2, `loadSessions()`);
+    await runAsync(ctx2, `syncServerConversations()`);
+    await settle();
+    const posted2 = ctx2.fetchCalls.filter((c) => c.method === 'POST' && c.url === '/api/conversations');
+    assert.deepStrictEqual(JSON.parse(posted2[0].body).conversations.map((c) => c.id), ['b'], 'already-imported A must not be re-posted');
+    assert.deepStrictEqual(server.records.map((r) => r.id), ['a'], 'retry must not duplicate the already-imported record');
+    assert.strictEqual(server.records[0].events.length, 1, 'imported record must not be overwritten by stale local state');
+    assert.strictEqual(run(ctx2, `sessions['b'].migrationRejected`), true, 'still-rejected record must stay recoverable');
+    assert.strictEqual(ctx2.els.get('#migrationNotice').hidden, false, 'migration failure must remain visible');
+    assert.strictEqual(putCalls(ctx2).length, 0, 'restart boot must issue zero conversation PUTs');
+
+    // The correction is accepted: retrying imports B with no duplication.
+    server.rejectIds.delete('b');
+    const ctx3 = loadContext(server);
+    await settle(10);
+    ctx3.fetchCalls.length = 0;
+    const persisted2 = run(ctx2, `localStorage.getItem('cortex.sessions.v1')`);
+    run(ctx3, `localStorage.setItem('cortex.sessions.v1', ${JSON.stringify(persisted2)});`);
+    run(ctx3, `loadSessions()`);
+    await runAsync(ctx3, `syncServerConversations()`);
+    await settle();
+    assert.strictEqual(run(ctx3, `sessions['b'].migrationRejected`), undefined, 'corrected record must import on retry');
+    assert.strictEqual(ctx3.els.get('#migrationNotice').hidden, true, 'migration notice must clear after full import');
+    assert.deepStrictEqual(server.records.map((r) => r.id), ['a', 'b'], 'retry must not duplicate any record');
+    assert.strictEqual(putCalls(ctx3).length, 0, 'retry boot must issue zero conversation PUTs');
+    console.log('ok - partial_migration_preserves_rejected_and_retries_without_duplication');
+  }
 })();
