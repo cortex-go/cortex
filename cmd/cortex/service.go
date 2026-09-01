@@ -133,9 +133,9 @@ func stateName(s svcState) string { return string(s) }
 type exitExpect int
 
 const (
-	exitZero     exitExpect = iota // the state must exit 0
-	exitNonzero                    // the state must exit nonzero
-	exitEither                     // the exit code varies across versions
+	exitZero    exitExpect = iota // the state must exit 0
+	exitNonzero                   // the state must exit nonzero
+	exitEither                    // the exit code varies across versions
 )
 
 // classifyActive maps an is-active output word to a lifecycle category and its
@@ -220,6 +220,129 @@ func (m *serviceManager) queryState(verb string) (svcState, error) {
 		}
 	}
 	return st, nil
+}
+
+// rawState returns the exact systemctl is-enabled/is-active output word. The
+// install transaction snapshots these raw words rather than the resolved
+// lifecycle categories so rollback can reproduce the precise prior state.
+func (m *serviceManager) rawState(verb string) (string, error) {
+	out, _, err := m.systemctl(verb, m.unitName)
+	if err != nil {
+		return "", fmt.Errorf("cannot run systemctl %s %s: %w", verb, m.unitName, err)
+	}
+	word := strings.TrimSpace(out)
+	if word == "" {
+		return "", fmt.Errorf("systemctl %s %s returned no state", verb, m.unitName)
+	}
+	return word, nil
+}
+
+// restorableEnabledWord reports whether a prior is-enabled raw word can be
+// restored exactly. Enablement links (enabled, enabled-runtime, masked,
+// masked-runtime) and their absence (disabled, not-found) are restorable;
+// unit-file states that enable/disable cannot reproduce (static, alias,
+// indirect, generated, linked, linked-runtime, transient, unknown) are not.
+func restorableEnabledWord(word string) bool {
+	switch word {
+	case "enabled", "enabled-runtime", "masked", "masked-runtime", "disabled", "not-found":
+		return true
+	}
+	return false
+}
+
+// restorableActiveWord reports whether a prior is-active raw word can be
+// restored exactly. Running and stopped states are restorable; transient and
+// failed states cannot be reproduced deterministically.
+func restorableActiveWord(word string) bool {
+	switch word {
+	case "active", "inactive", "dead", "unknown", "not-found":
+		return true
+	}
+	return false
+}
+
+// enableRestoreArgs returns the systemctl call that reproduces a prior
+// is-enabled word exactly.
+func enableRestoreArgs(word, unit string) []string {
+	switch word {
+	case "enabled":
+		return []string{"enable", unit}
+	case "enabled-runtime":
+		return []string{"enable", "--runtime", unit}
+	case "masked":
+		return []string{"mask", unit}
+	case "masked-runtime":
+		return []string{"mask", "--runtime", unit}
+	}
+	return []string{"disable", unit}
+}
+
+// activeRestoreArgs returns the systemctl call that reproduces a prior
+// is-active word exactly.
+func activeRestoreArgs(word, unit string) []string {
+	if word == "active" {
+		return []string{"restart", unit}
+	}
+	return []string{"stop", unit}
+}
+
+// systemctlTolerantMissing runs a systemctl operation that must exit zero,
+// tolerating systemd's "not loaded"/"not found" results that signal the unit
+// was already absent.
+func (m *serviceManager) systemctlTolerantMissing(args ...string) error {
+	out, code, err := m.systemctl(args...)
+	if err != nil {
+		return fmt.Errorf("cannot run systemctl %s: %w", strings.Join(args, " "), err)
+	}
+	if code != 0 {
+		lower := strings.ToLower(strings.TrimSpace(out))
+		if strings.Contains(lower, "not loaded") || strings.Contains(lower, "not found") || strings.Contains(lower, "no such") {
+			return nil
+		}
+		return fmt.Errorf("systemctl %s exited %d: %s", strings.Join(args, " "), code, bounded(strings.TrimSpace(out)))
+	}
+	return nil
+}
+
+// rollbackInstall restores the pre-install state after a failed publish or
+// lifecycle step. For a reinstall it restores the prior unit bytes, reloads
+// systemd, then reproduces the exact prior enablement and active states. For a
+// failed fresh install it stops and disables the newly installed unit while it
+// is still loaded, then removes the unit file and reloads systemd, so no
+// enablement link or active service is left behind. It returns a "rollback
+// incomplete" description when any restoration step fails.
+func (m *serviceManager) rollbackInstall(priorUnit []byte, hadUnit bool, priorEnabledWord, priorActiveWord string) string {
+	var errs []string
+	if hadUnit {
+		if err := writeManagedUnit(m.unitPath, string(priorUnit)); err != nil {
+			errs = append(errs, fmt.Sprintf("restore unit: %v", err))
+		}
+	} else {
+		if err := m.systemctlTolerantMissing("stop", m.unitName); err != nil {
+			errs = append(errs, fmt.Sprintf("stop new unit: %v", err))
+		}
+		if err := m.systemctlTolerantMissing("disable", m.unitName); err != nil {
+			errs = append(errs, fmt.Sprintf("disable new unit: %v", err))
+		}
+		if err := os.Remove(m.unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Sprintf("remove new unit: %v", err))
+		}
+	}
+	if err := m.systemctlSuccess("daemon-reload"); err != nil {
+		errs = append(errs, fmt.Sprintf("reload systemd: %v", err))
+	}
+	if hadUnit {
+		if err := m.systemctlSuccess(enableRestoreArgs(priorEnabledWord, m.unitName)...); err != nil {
+			errs = append(errs, fmt.Sprintf("restore enablement %q: %v", priorEnabledWord, err))
+		}
+		if err := m.systemctlSuccess(activeRestoreArgs(priorActiveWord, m.unitName)...); err != nil {
+			errs = append(errs, fmt.Sprintf("restore active state %q: %v", priorActiveWord, err))
+		}
+	}
+	if len(errs) == 0 {
+		return ""
+	}
+	return "; rollback incomplete: " + strings.Join(errs, "; ")
 }
 
 // bounded caps captured command output used in errors.
@@ -516,19 +639,80 @@ func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
 		}
 	}
 	unit := buildCortexUnit(m.exe, opts)
-	if err := writeManagedUnit(m.unitPath, unit); err != nil {
+	priorUnit, hadUnit := []byte(nil), false
+	if b, err := os.ReadFile(m.unitPath); err == nil {
+		hadUnit = true
+		priorUnit = b
+		if _, err := readManagedUnit(m.unitPath); err != nil {
+			return fmt.Errorf("refusing to reinstall %s: %w", m.unitName, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	for _, step := range []struct {
-		verb string
-		args []string
-	}{
-		{"reloading systemd", []string{"daemon-reload"}},
-		{"enabling", []string{"enable", m.unitName}},
-		{"starting", []string{"start", m.unitName}},
-	} {
-		if err := m.systemctlSuccess(step.args...); err != nil {
-			return fmt.Errorf("%s %s: %w", step.verb, m.unitName, err)
+	// Snapshot the exact prior enablement and active states before any
+	// mutation so rollback can reproduce them precisely. States that cannot be
+	// restored exactly are refused up front rather than flattened.
+	priorEnabledWord, priorActiveWord := "", ""
+	if hadUnit {
+		var err error
+		if priorEnabledWord, err = m.rawState("is-enabled"); err != nil {
+			return err
+		}
+		if !restorableEnabledWord(priorEnabledWord) {
+			return fmt.Errorf("refusing to reinstall %s: prior enablement state %q cannot be restored exactly; disable or unmask it first", m.unitName, priorEnabledWord)
+		}
+		if priorActiveWord, err = m.rawState("is-active"); err != nil {
+			return err
+		}
+		if !restorableActiveWord(priorActiveWord) {
+			return fmt.Errorf("refusing to reinstall %s: prior active state %q cannot be restored exactly; stop or restart it first", m.unitName, priorActiveWord)
+		}
+		// True no-op: a byte-identical unit that is already enabled and active
+		// needs no rewrite, reload or restart.
+		if string(priorUnit) == unit && priorEnabledWord == "enabled" && priorActiveWord == "active" {
+			fmt.Fprintf(out, "%s is already installed, enabled and active; nothing to do.\n", m.unitName)
+			return nil
+		}
+	}
+	changed := !hadUnit || string(priorUnit) != unit
+	if changed {
+		if err := writeManagedUnit(m.unitPath, unit); err != nil {
+			return err
+		}
+		// A changed unit must restart (not merely start) so the new
+		// configuration takes effect on an already-running process.
+		for _, step := range []struct {
+			verb string
+			args []string
+		}{
+			{"reloading systemd", []string{"daemon-reload"}},
+			{"enabling", []string{"enable", m.unitName}},
+			{"starting", []string{"restart", m.unitName}},
+		} {
+			if err := m.systemctlSuccess(step.args...); err != nil {
+				if rb := m.rollbackInstall(priorUnit, hadUnit, priorEnabledWord, priorActiveWord); rb != "" {
+					return fmt.Errorf("%s %s: %w%s", step.verb, m.unitName, err, rb)
+				}
+				return fmt.Errorf("%s %s: %w", step.verb, m.unitName, err)
+			}
+		}
+	} else {
+		// Unit bytes are unchanged: only perform the lifecycle work required
+		// to reach the documented installed state (enabled and active).
+		steps := [][]string{}
+		if priorEnabledWord != "enabled" {
+			steps = append(steps, []string{"enable", m.unitName})
+		}
+		if priorActiveWord != "active" {
+			steps = append(steps, []string{"start", m.unitName})
+		}
+		for _, args := range steps {
+			if err := m.systemctlSuccess(args...); err != nil {
+				if rb := m.rollbackInstall(priorUnit, hadUnit, priorEnabledWord, priorActiveWord); rb != "" {
+					return fmt.Errorf("bringing %s to the installed state: %w%s", m.unitName, err, rb)
+				}
+				return fmt.Errorf("bringing %s to the installed state: %w", m.unitName, err)
+			}
 		}
 	}
 	active, _, _ := m.systemctl("is-active", m.unitName)
@@ -626,8 +810,8 @@ func syncDir(dir string) {
 }
 
 var (
-	linkFile = os.Link
-	removeFile = os.Remove
+	linkFile     = os.Link
+	removeFile   = os.Remove
 	randomSuffix = func() (string, error) {
 		b := make([]byte, 8)
 		if _, err := rand.Read(b); err != nil {

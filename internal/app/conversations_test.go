@@ -1,6 +1,7 @@
 package app
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -33,14 +34,123 @@ func TestDurableConversationRoundTrip(t *testing.T) {
 	}
 }
 
-func TestConversationRejectsEscapingWorkspace(t *testing.T) {
+// TestConversationStoresEscapingWorkspaceVerbatim verifies conversation
+// metadata persists even when the historical workspace is outside the current
+// root, and that the availability category is reported for the UI.
+func TestConversationStoresEscapingWorkspaceVerbatim(t *testing.T) {
 	a, err := New(Options{Root: t.TempDir(), DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	c := conversation{ID: "bad", Workspace: filepath.Dir(a.root)}
-	if err := a.saveConversation(&c); err == nil {
-		t.Fatal("escaping workspace accepted")
+	esc := filepath.Dir(a.root)
+	c := conversation{ID: "esc-ws", Workspace: esc, Events: []conversationEvent{{Kind: "user", Text: "keep"}}}
+	if err := a.saveConversation(&c); err != nil {
+		t.Fatalf("escaping workspace should persist: %v", err)
+	}
+	if c.Workspace != esc {
+		t.Fatalf("workspace was rewritten to %q; must be stored verbatim", c.Workspace)
+	}
+	items, err := a.loadConversations("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("loaded %d conversations", len(items))
+	}
+	if items[0].Workspace != esc || items[0].WorkspaceStatus != wsOutsideRoot {
+		t.Fatalf("got workspace=%q status=%q want %q/%q", items[0].Workspace, items[0].WorkspaceStatus, esc, wsOutsideRoot)
+	}
+	if len(items[0].Events) != 1 || items[0].Events[0].Text != "keep" {
+		t.Fatal("escaping-workspace transcript was not persisted")
+	}
+}
+
+// TestConversationMissingWorkspacePersists verifies a missing and an
+// inaccessible workspace both persist transcripts and report their category.
+func TestConversationMissingWorkspacePersists(t *testing.T) {
+	a, err := New(Options{Root: t.TempDir(), DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	missing := filepath.Join(a.root, "renamed-away")
+	c := conversation{ID: "missing-ws", Workspace: missing, Events: []conversationEvent{{Kind: "user", Text: "survives"}}}
+	if err := a.saveConversation(&c); err != nil {
+		t.Fatalf("missing workspace should persist: %v", err)
+	}
+	items, _ := a.loadConversations("")
+	if items[0].WorkspaceStatus != wsMissing {
+		t.Fatalf("status=%q want %q", items[0].WorkspaceStatus, wsMissing)
+	}
+
+	// A path whose parent component is a regular file reports inaccessible
+	// (ENOTDIR) deterministically, regardless of the test user's permissions.
+	notDir := filepath.Join(a.root, "afile")
+	if err := os.WriteFile(notDir, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	blocked := filepath.Join(notDir, "sub")
+	c2 := conversation{ID: "inaccessible-ws", Workspace: blocked, Events: []conversationEvent{{Kind: "user", Text: "also survives"}}}
+	if err := a.saveConversation(&c2); err != nil {
+		t.Fatalf("inaccessible workspace should persist: %v", err)
+	}
+	items, _ = a.loadConversations("")
+	for _, it := range items {
+		if it.ID == "inaccessible-ws" {
+			if it.WorkspaceStatus != wsInaccessible {
+				t.Fatalf("status=%q want %q", it.WorkspaceStatus, wsInaccessible)
+			}
+			if len(it.Events) != 1 {
+				t.Fatal("inaccessible-workspace transcript not persisted")
+			}
+		}
+	}
+}
+
+// TestSymlinkEscapeCannotExecute verifies a stored symlink-escape workspace is
+// reported as such and is rejected at the execution boundary.
+func TestSymlinkEscapeCannotExecute(t *testing.T) {
+	a, err := New(Options{Root: t.TempDir(), DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	outside := filepath.Join(t.TempDir(), "secret")
+	if err := os.MkdirAll(outside, 0700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(a.root, "alias")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	c := conversation{ID: "link-ws", Workspace: link}
+	if err := a.saveConversation(&c); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := a.loadConversations("")
+	if items[0].WorkspaceStatus != wsSymlinkEsc {
+		t.Fatalf("status=%q want %q", items[0].WorkspaceStatus, wsSymlinkEsc)
+	}
+	if _, err := a.resolve(link); err == nil {
+		t.Fatal("symlink-escape workspace passed strict resolve")
+	}
+}
+
+// TestOutOfRootWorkspaceCannotExecute verifies a stored outside-root workspace
+// is rejected at the execution boundary even though it persists as metadata.
+func TestOutOfRootWorkspaceCannotExecute(t *testing.T) {
+	a, err := New(Options{Root: t.TempDir(), DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	esc := filepath.Dir(a.root)
+	c := conversation{ID: "esc-ws", Workspace: esc}
+	if err := a.saveConversation(&c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.resolve(esc); err == nil {
+		t.Fatal("outside-root workspace passed strict resolve")
 	}
 }

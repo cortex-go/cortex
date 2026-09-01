@@ -44,15 +44,25 @@ func TestWorkspaceBoundaryAllowsCanonicalInRootPath(t *testing.T) {
 	}
 }
 
-func TestConversationCannotRestoreEscapingWorkspace(t *testing.T) {
+func TestConversationSymlinkEscapePersistsButCannotExecute(t *testing.T) {
 	a := hardeningTestApp(t)
 	root := a.root
 	outside := t.TempDir()
 	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	c := conversation{ID: "c1", Workspace: "escape"}
-	if err := a.saveConversation(&c); err == nil {
-		t.Fatal("escaping restored workspace accepted")
+	c := conversation{ID: "c1", Workspace: "escape", Events: []conversationEvent{{Kind: "user", Text: "transcript kept"}}}
+	if err := a.saveConversation(&c); err != nil {
+		t.Fatalf("symlink-escape workspace should persist as metadata: %v", err)
+	}
+	items, err := a.loadConversations("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items[0].WorkspaceStatus != wsSymlinkEsc {
+		t.Fatalf("status=%q want %q", items[0].WorkspaceStatus, wsSymlinkEsc)
+	}
+	if _, err := a.resolve(c.Workspace); err == nil {
+		t.Fatal("escaping restored workspace passed execution resolution")
 	}
 }

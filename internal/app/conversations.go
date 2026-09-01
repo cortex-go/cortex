@@ -4,8 +4,21 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
+)
+
+// Workspace availability categories returned to the client for each stored
+// conversation. They describe only the workspace's current state; the strict
+// resolve check remains mandatory immediately before browsing or executing.
+const (
+	wsAvailable    = "available"
+	wsMissing      = "missing"
+	wsInaccessible = "inaccessible"
+	wsOutsideRoot  = "outside-root"
+	wsSymlinkEsc   = "symlink-escape"
 )
 
 type conversationEvent struct {
@@ -19,6 +32,7 @@ type conversation struct {
 	ID              string              `json:"id"`
 	Title           string              `json:"title"`
 	Workspace       string              `json:"workspace"`
+	WorkspaceStatus string              `json:"workspaceStatus,omitempty"`
 	Provider        string              `json:"provider,omitempty"`
 	Model           string              `json:"model,omitempty"`
 	OpenCodeSession string              `json:"openCodeSession,omitempty"`
@@ -27,6 +41,48 @@ type conversation struct {
 	UpdatedAt       int64               `json:"updatedAt"`
 	ArchivedAt      int64               `json:"archivedAt,omitempty"`
 	Events          []conversationEvent `json:"events"`
+}
+
+// workspaceStatus reports the structured availability of a stored workspace
+// without rewriting it. It mirrors the lexical and symlink checks of resolve
+// but reports a category instead of failing, so conversation metadata and
+// transcripts remain persistable when the historical workspace is missing,
+// renamed, inaccessible or outside the current root. Execution itself still
+// goes through the strict resolve boundary.
+func (a *App) workspaceStatus(workspace string) string {
+	w := strings.TrimSpace(workspace)
+	if w == "" || w == "/" {
+		if _, err := os.Stat(a.root); err == nil {
+			return wsAvailable
+		}
+		return wsMissing
+	}
+	var p string
+	if filepath.IsAbs(w) {
+		p = filepath.Clean(w)
+	} else {
+		p = filepath.Join(a.root, w)
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return wsInaccessible
+	}
+	rel, err := filepath.Rel(a.root, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return wsOutsideRoot
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return wsMissing
+		}
+		return wsInaccessible
+	}
+	rel, err = filepath.Rel(a.root, real)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return wsSymlinkEsc
+	}
+	return wsAvailable
 }
 
 func validRecordID(id string) bool {
@@ -39,6 +95,17 @@ func validRecordID(id string) bool {
 		}
 	}
 	return true
+}
+
+// hasControlChars reports whether s contains CR, LF, NUL or other control
+// characters that must not reach stored conversation metadata.
+func hasControlChars(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) conversationsAPI(w http.ResponseWriter, r *http.Request) {
@@ -61,23 +128,21 @@ func (a *App) conversationsAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "too many conversations", 400)
 			return
 		}
-		tx, err := a.db.Begin()
-		if err != nil {
-			http.Error(w, "begin import", 500)
-			return
-		}
-		defer tx.Rollback()
+		// Per-record import: each conversation is saved independently so a
+		// record whose workspace is unavailable, or which is structurally
+		// invalid, never rolls back or discards the valid records around it.
+		// The upsert makes the migration safe to retry without duplication.
+		imported := []string{}
+		rejected := []map[string]string{}
 		for i := range q.Conversations {
-			if err := a.saveConversationTx(tx, &q.Conversations[i]); err != nil {
-				http.Error(w, err.Error(), 400)
-				return
+			c := q.Conversations[i]
+			if err := a.saveConversation(&c); err != nil {
+				rejected = append(rejected, map[string]string{"id": c.ID, "reason": err.Error()})
+				continue
 			}
+			imported = append(imported, c.ID)
 		}
-		if err := tx.Commit(); err != nil {
-			http.Error(w, "commit import", 500)
-			return
-		}
-		jsonOut(w, map[string]any{"ok": true, "imported": len(q.Conversations)})
+		jsonOut(w, map[string]any{"imported": imported, "rejected": rejected})
 	default:
 		http.Error(w, "method", 405)
 	}
@@ -134,13 +199,14 @@ func (a *App) saveConversationTx(tx *sql.Tx, c *conversation) error {
 	if len(c.Title) > 500 || len(c.Workspace) > 4096 || len(c.OpenCodeSession) > 256 || len(c.Events) > 2000 {
 		return errors.New("conversation exceeds storage limits")
 	}
-	if c.Workspace != "" {
-		resolved, err := a.resolve(c.Workspace)
-		if err != nil {
-			return errors.New("invalid conversation workspace")
-		}
-		c.Workspace = resolved
+	if hasControlChars(c.Workspace) || hasControlChars(c.Title) {
+		return errors.New("conversation contains control characters")
 	}
+	// The workspace is stored verbatim: a historical workspace may be missing,
+	// renamed, inaccessible or outside the current root, and the transcript
+	// must remain persistable in every one of those cases. Strict resolution
+	// is enforced immediately before browsing or executing, never here, and an
+	// unavailable workspace is never replaced with the current root.
 	now := time.Now().UnixMilli()
 	if c.CreatedAt <= 0 {
 		c.CreatedAt = now
@@ -204,6 +270,7 @@ func (a *App) loadConversations(query string) ([]conversation, error) {
 		if archived.Valid {
 			c.ArchivedAt = archived.Int64
 		}
+		c.WorkspaceStatus = a.workspaceStatus(c.Workspace)
 		events, err := a.loadConversationEvents(c.ID)
 		if err != nil {
 			return nil, err

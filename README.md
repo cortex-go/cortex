@@ -100,3 +100,22 @@ The user unit is written to `~/.config/systemd/user/cortex.service` and managed 
 * **System service:** not yet supported. A future system-wide service would run under a dedicated account with no login keyring, so GitHub CLI authentication would need `gh auth login` for that account or an explicit `GH_TOKEN`/`GITHUB_TOKEN` in its environment.
 
 Cortex's agent subprocesses inherit the host GitHub CLI configuration directory (`GH_CONFIG_DIR`) when `hosts.yml` exists, without copying any file or token; the token itself stays in your keyring. OpenCode's own configuration and session data remain isolated in per-run temporary directories.
+
+### Persistence and lingering
+
+The installed service runs independently of the terminal that launched it. Closing that terminal does not stop the service; `cortex service uninstall` (or `systemctl --user stop cortex.service`) is how you stop it deliberately.
+
+The unit belongs to your OS user's systemd user manager, so it normally starts when that manager starts (your first login or boot, depending on the distribution). If you want Cortex to keep running after you log out, or to start at boot before any interactive login, the user manager itself must be allowed to run without a session — that is what *lingering* enables:
+
+```sh
+loginctl show-user "$USER" -p Linger
+loginctl enable-linger "$USER"
+```
+
+Cortex never enables lingering automatically, because it changes what the host runs without a login session — enable it deliberately only when unattended operation is actually required. The recorded unit also contains the absolute executable path that was current at install time; moving or deleting that executable breaks the service until you reinstall.
+
+### Historical workspaces
+
+Cortex keeps the transcript and metadata of every conversation even when its historical workspace is no longer available. A workspace may be missing (the repository was moved or deleted), renamed, inaccessible, or outside the current `--root`. Cortex stores the recorded path verbatim and never silently replaces it with the current root.
+
+The browser marks such conversations visibly as unavailable and disables **Run** for them; the transcript stays intact. To keep working with an old conversation, open the workspace picker and select a valid replacement — Run re-enables only after the new workspace passes the same strict root and symlink checks. No filesystem details beyond the path you already chose are shown. The execution boundary itself is unchanged: a missing, renamed, inaccessible, out-of-root or symlink-escaping workspace is never used for browsing or agent execution.
