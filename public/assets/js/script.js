@@ -8,7 +8,7 @@ function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');se
 async function api(url,opt={}){opt={...opt,headers:{...(opt.headers||{})}};const method=(opt.method||'GET').toUpperCase();if(!['GET','HEAD','OPTIONS'].includes(method)&&authState?.csrf)opt.headers['X-Cortex-CSRF']=authState.csrf;const r=await fetch(url,opt);if(!r.ok)throw Error((await r.text()).trim()||r.statusText);return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
 function sid(){return crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)}
 function sessionTitle(s){if(s.title)return s.title;if(s.workspace)return s.workspace.split('/').filter(Boolean).pop()||s.workspace;return 'New session'}
-function sessionSafe(s){return{id:s.id,workspace:s.workspace||'',workspaceStatus:s.workspaceStatus||'',title:s.title||'',provider:s.provider||'',model:s.model||'',openCodeSession:s.openCodeSession||'',state:s.busy?'running':(s.state||'idle'),createdAt:s.createdAt||Date.now(),updatedAt:Date.now(),archivedAt:s.archivedAt||s.closedAt||0,events:s.events||[]}}
+function sessionSafe(s){return{id:s.id,workspace:s.workspace||'',workspaceStatus:s.workspaceStatus||'',title:s.title||'',provider:s.provider||'',model:s.model||'',openCodeSession:s.openCodeSession||'',currentRunId:s.currentRunId||'',state:s.busy?'running':(s.state||'idle'),createdAt:s.createdAt||Date.now(),updatedAt:Date.now(),archivedAt:s.archivedAt||s.closedAt||0,events:s.events||[]}}
 function scheduleServerSave(s){
   if(!serverReady||!s?.id)return;
   clearTimeout(serverSaveTimers.get(s.id));
@@ -44,10 +44,17 @@ function newSession(workspace='',render=true){
 }
 function newSessionSameWorkspace(){const workspace=active()?.workspace||'';newSession(workspace);hideSessionMenu();if(!workspace)setTimeout(openWorkspacePicker,0)}
 function newWorkspaceSession(){newSession('');hideSessionMenu();setTimeout(openWorkspacePicker,0)}
-function closeSession(id){
+async function closeSession(id){
   const s=sessions[id];if(!s)return;
   if(s.busy&&!confirm('This agent is still working. Stop and close it?'))return;
-  if(s.busy){stopAgentFor(s)}else{s.abort?.abort()}
+  if(s.busy){
+    // Submit the server-side stop, then wait for a durable terminal outcome or
+    // a bounded reconciliation. If cancellation cannot be confirmed, keep the
+    // tab and surface an error rather than silently archiving a live run.
+    const ok=await stopAgentFor(s);
+    if(!ok){toast('Could not stop the running agent; the session stays open.');return}
+    if(s.busy)await reconcileRunState(id);
+  }else{s.abort?.abort()}
   const archived={...sessionSafe(s),archivedAt:Date.now(),closedAt:Date.now()};
   closedSessions=[archived,...closedSessions.filter(x=>x.id!==id)].slice(0,20);
   const fallbackWorkspace=s.workspace||'';
@@ -254,24 +261,49 @@ async function addGeneratedImage(id,im){
 }
 function toolText(raw){const p=raw.part||raw,st=p.state||{},tool=p.tool||raw.tool||raw.name||'tool',status=st.status||'';const input=st.input||p.input||{},lines=[`↳ ${tool}${status?' · '+status:''}`];if(tool==='bash'&&input.command)lines.push('$ '+input.command);else if(input.filePath||input.path)lines.push(input.filePath||input.path);if(st.error)lines.push('ERROR: '+clipped(typeof st.error==='string'?st.error:JSON.stringify(st.error)));else if(st.output)lines.push(clipped(st.output));return lines.join('\n')}
 function summarize(ev){const raw=ev?.data?.data||ev?.data||{},type=String(raw.type||'');if(ev.type==='error')return raw.message||'Agent failed';if(ev.type==='truncated')return raw.message||'Provider output was truncated.';if(ev.type==='cancelled')return raw.message||'Agent stopped.';if(ev.type==='recovered')return raw.text||'';if(ev.type==='done'){const i=raw.inputTokens||0,o=raw.outputTokens||0;return i||o?`Done · ${i} input · ${o} output tokens`:'Done'};if(ev.type==='output')return raw.text||'';if(type.includes('tool'))return toolText(raw);return raw.part?.text||raw.text||''}
-async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace||workspaceUnavailable(s))return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();s.runID='';if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');const images=attachments.map(a=>({name:a.name,data:a.dataUrl}));for(const a of attachments)addEvent(id,'image',a.thumb,a.name);addEvent(id,'user',prompt);attachments=[];renderAttachments();renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id,images}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';const seenImages=new Set();for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line),text=summarize(ev),raw=ev?.data?.data||ev?.data||{};if(ev.type==='run'&&raw.runID){s.runID=raw.runID;s.currentRunId=raw.runID}if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;const oc=raw.outcome||'';if(oc)s.state=oc;else if(ev.type==='done')s.state='completed';else if(ev.type==='error')s.state='failed';else if(ev.type==='cancelled')s.state='cancelled';else if(ev.type==='truncated')s.state='truncated';if(ev.type==='done'||ev.type==='error'||ev.type==='cancelled'||ev.type==='truncated'){s.busy=false;s.abort=null};const termEvent={kind:eventKind(ev),text:summarize(ev),name:'run:'+(raw.runID||s.runID)+':'+oc,outcome:oc,runID:raw.runID||s.runID};if(termEvent.text)addEvent(id,termEvent.kind,termEvent.text,termEvent.name,{outcome:oc,runID:termEvent.runID});if(ev.type==='recovered-images'){for(const im of (raw.images||[]))addGeneratedImage(id,im)}for(const im of extractImages(raw)){if(seenImages.has(im.url))continue;seenImages.add(im.url);addGeneratedImage(id,im)}}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].busy=false;sessions[id].abort=null;persistLocalState();saveSessionToServer(id)}if(activeId===id)renderAll();agentStatus()}}
+// reconcileRunState re-fetches the authoritative conversation state after a
+// stream ends without a durable terminal event (disconnect/timeout) so the
+// running spinner reflects the server, not the vanished browser request.
+async function reconcileRunState(id){
+  const s=sessions[id];if(!s)return;
+  try{
+    const all=await api('/api/conversations');
+    const rec=all.find(c=>c.id===id);
+    if(!rec)return;
+    const terminal=rec.state!=='running'&&rec.state!=='idle'&&rec.state!=='';
+    s.state=rec.state||s.state;
+    s.currentRunId=rec.currentRunId||'';
+    if(rec.state==='running'){s.busy=true}
+    else if(terminal){s.busy=false}
+    persistLocalState();saveSessionToServer(id);
+    if(activeId===id)renderAll();
+  }catch{}
+}
+async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace||workspaceUnavailable(s))return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();s.runID='';if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');const images=attachments.map(a=>({name:a.name,data:a.dataUrl}));for(const a of attachments)addEvent(id,'image',a.thumb,a.name);addEvent(id,'user',prompt);attachments=[];renderAttachments();renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id,images}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';const seenImages=new Set();for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line),text=summarize(ev),raw=ev?.data?.data||ev?.data||{};if(ev.type==='run'&&raw.runID){s.runID=raw.runID;s.currentRunId=raw.runID}if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;const oc=raw.outcome||'';if(oc)s.state=oc;else if(ev.type==='done')s.state='completed';else if(ev.type==='error')s.state='failed';else if(ev.type==='cancelled')s.state='cancelled';else if(ev.type==='truncated')s.state='truncated';if(ev.type==='done'||ev.type==='error'||ev.type==='cancelled'||ev.type==='truncated'){s.busy=false;s.abort=null};const termEvent={kind:eventKind(ev),text:summarize(ev),name:'run:'+(raw.runID||s.runID)+':'+oc,outcome:oc,runID:raw.runID||s.runID};if(termEvent.text)addEvent(id,termEvent.kind,termEvent.text,termEvent.name,{outcome:oc,runID:termEvent.runID});if(ev.type==='recovered-images'){for(const im of (raw.images||[]))addGeneratedImage(id,im)}for(const im of extractImages(raw)){if(seenImages.has(im.url))continue;seenImages.add(im.url);addGeneratedImage(id,im)}}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].abort=null;persistLocalState();saveSessionToServer(id);if(sessions[id]&&sessions[id].busy){reconcileRunState(id)}}if(activeId===id)renderAll();agentStatus()}}
 
 // stopAgent performs a server-side, authenticated Stop for the active run. The
 // streaming request is left open; only if the cancellation request fails or
 // exceeds a short timeout does the client fall back to aborting the fetch.
 async function stopAgent(){const s=active();if(!s)return;await stopAgentFor(s)}
 async function stopAgentFor(s){
-  if(!s?.busy)return;
+  if(!s?.busy)return true;
   const abortFallback=()=>s.abort?.abort();
-  if(!s.runID)return abortFallback();
+  if(!s.runID){abortFallback();return false}
   try{
     await Promise.race([
       api('/api/agent/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runID:s.runID})}),
       new Promise((_,rej)=>setTimeout(()=>rej(Error('cancel timeout')),2000))
     ]);
+    // Wait briefly for the durable terminal event; if it did not arrive,
+    // reconcile against server state. Failure to confirm cancellation returns
+    // false so the caller keeps the session.
     await new Promise(res=>setTimeout(res,1500));
-    if(s.busy)abortFallback();
-  }catch{abortFallback()}
+    if(s.busy){
+      await reconcileRunState(s.id||activeId);
+      if(s.busy){abortFallback();return false}
+    }
+    return true;
+  }catch{abortFallback();return false}
 }
 
 function joinPath(base,name){return (base.replace(/\/+$/,'')+'/'+name).replace(/\/+/g,'/')}
@@ -371,7 +403,10 @@ async function syncServerConversations(){
     stored=await api('/api/conversations');
   }
   const authoritative=stored.length?stored:await api('/api/conversations');
-  for(const s of authoritative){s.busy=false;s.abort=null;if(s.archivedAt){s.closedAt=s.archivedAt;closedSessions.push(s)}else sessions[s.id]=s}
+  for(const s of authoritative){s.abort=null;s.currentRunId=s.currentRunId||'';if(s.archivedAt){s.closedAt=s.archivedAt;closedSessions.push(s)}else sessions[s.id]=s}
+  // Derive authoritative running state from the server, not browser-local
+  // busy: a conversation whose state is still 'running' has a live server run.
+  for(const s of Object.values(sessions)){s.busy=(s.state==='running');if(s.followBottom===undefined)s.followBottom=true}
   if(!Object.keys(sessions).length)newSession('',false);
   if(!sessions[activeId])activeId=Object.keys(sessions)[0];
   // Loading authoritative server conversations must not PUT any of them back:

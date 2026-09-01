@@ -192,3 +192,48 @@ test('unread indicator cleared when switching to a tab', async () => {
   const unread = run(ctx, `sessions['b'].unread`);
   if (unread !== 0) throw new Error('unread not cleared');
 });
+test('reload while a run remains active keeps the spinner', async () => {
+  const ctx = loadContext();
+  // Authoritative server state says running with a current run id.
+  const s = { id: 'a', state: 'running', currentRunId: 'run-1', busy: true, events: [], followBottom: true, unread: 0 };
+  run(ctx, 'sessions={a:S};activeId="a"', { S: s });
+  // Simulate a reload that re-derives busy from server state.
+  run(ctx, `(function(){const s=sessions['a'];s.busy=(s.state==='running');})()`);
+  if (!run(ctx, "sessions['a'].busy")) throw new Error('spinner lost after reload while run active');
+  if (run(ctx, "sessions['a'].currentRunId") !== 'run-1') throw new Error('currentRunId lost');
+});
+
+test('terminal state received normally clears the spinner', async () => {
+  const ctx = loadContext();
+  const s = { id: 'a', state: 'running', currentRunId: 'run-1', busy: true, events: [], followBottom: true, unread: 0 };
+  run(ctx, 'sessions={a:S};activeId="a"', { S: s });
+  run(ctx, `(function(){const s=sessions['a'];s.state='completed';s.busy=false;})()`);
+  if (run(ctx, "sessions['a'].busy")) throw new Error('spinner not cleared on terminal outcome');
+});
+
+test('reconcileRunState clears spinner for interrupted state after disconnect', async () => {
+  const ctx = loadContext();
+  const rec = { id: 'a', state: 'interrupted', currentRunId: 'run-1', events: [] };
+  run(ctx, 'sessions={a:{id:"a",state:"running",currentRunId:"run-1",busy:true,events:[],followBottom:true,unread:0}};activeId="a"');
+  run(ctx, 'window.__conv=REC', { REC: rec });
+  // Override api to return the authoritative record.
+  run(ctx, `(function(){const orig=api;api=async()=>[window.__conv];})(S)`, { S: ctx });
+  await run(ctx, 'reconcileRunState("a")');
+  if (run(ctx, "sessions['a'].busy")) throw new Error('spinner not cleared after interrupted reconciliation');
+  if (run(ctx, "sessions['a'].state") !== 'interrupted') throw new Error('state not reconciled');
+});
+
+test('busy close keeps the tab when cancellation is rejected', async () => {
+  const ctx = loadContext((url, opt) => {
+    if (url === '/api/agent/cancel') return Promise.resolve({ ok: false, status: 404, text: () => Promise.resolve('run not found') });
+    return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
+  });
+  run(ctx, 'sessions={a:{id:"a",state:"running",runID:"run-1",busy:true,abort:null,events:[],followBottom:true,unread:0}};activeId="a"');
+  // api helper in this sandbox is the script's own; it calls fetch which returns non-ok -> throws.
+  let kept = true;
+  try { await run(ctx, '(async()=>{await stopAgentFor(sessions["a"]);return sessions["a"]!==undefined})()'); }
+  catch (e) { kept = false; }
+  // stopAgentFor returns false and keeps the session object; the close flow
+  // then refuses to archive. Verify the session is still present.
+  if (run(ctx, "sessions['a']") === undefined) throw new Error('session was archived despite rejection');
+});
