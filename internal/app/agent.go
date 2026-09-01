@@ -271,7 +271,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := cmd.Start(); err != nil {
 		run.state.seal()
-		diag, summary := a.runDiagnostics(outcomeFailed, run.state.snapshot(), "", false, processExitStatus(cmd), nil, nil, "", false, 0, true, nil, map[string]string{"result": "not_attempted"})
+		diag, summary := a.runDiagnostics(outcomeFailed, run.state.snapshot(), "", false, processExitStatus(cmd), nil, nil, "", false, 0, true, nil, map[string]string{"result": "not_attempted"}, causeNone, "", providerID, modelID)
 		_ = a.finishAgentRunErr(runID, clientSession, "failed", "", summary, 0, 0, 0, diag)
 		_ = writeEvent(w, flusher, "error", map[string]any{"message": summary, "outcome": string(outcomeFailed)})
 		return
@@ -295,10 +295,16 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	tail := captureTail(stderr, 64<<10)
 	var input, output uint64
 	var cost float64
-	mainSessionID := ""
+	activitySessionID := ""
 	sessionID := ""
-	var stdoutErrMsg string
-	stdoutErr := false
+	// Candidate main-session error evidence captured during the stream and
+	// resolved after the loop once the activity session is known.
+	var firstErrorSeq uint64
+	firstErrorSession := ""
+	var firstErrorMsg string
+	firstErrorCode := ""
+	firstErrorStatus := 0
+	var firstErrorBillingURL string
 	lastStopReason := ""
 	validStop := false
 	persistFailed := false
@@ -323,24 +329,34 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			collectUsage(raw, &input, &output, &cost)
 			if id, _ := raw["sessionID"].(string); id != "" {
 				sessionID = id
-				if mainSessionID == "" {
-					mainSessionID = id
+			}
+			typ, _ := raw["type"].(string)
+			// Activity events (steps, text, tools) establish the target main
+			// session. A pure subagent session never becomes the main session.
+			if typ == "step_start" || typ == "step_finish" || typ == "text" || typ == "tool_use" || typ == "reasoning" {
+				if id, _ := raw["sessionID"].(string); id != "" && activitySessionID == "" {
+					activitySessionID = id
 				}
 			}
-			// An authoritative stdout error forces failure regardless of any
-			// later stop, unless a stronger local cause preceded it. Only an
-			// error for the target main session is authoritative.
-			if typ, _ := raw["type"].(string); typ == "error" && sameSession(raw, mainSessionID) {
-				stdoutErr = true
-				run.state.observeError()
-				stdoutErrMsg = a.redactSecrets(errorEventText(raw))
+			// Candidate authoritative error: capture the first main-candidate
+			// error (chronological seq, session, message, provider meta, billing
+			// URL) but do not resolve yet — the main session is only confirmed
+			// after the stream ends.
+			if typ == "error" && firstErrorSession == "" {
+				firstErrorSeq = run.state.nextSeq()
+				firstErrorSession, _ = raw["sessionID"].(string)
+				firstErrorMsg = a.redactSecrets(errorEventText(raw))
+				firstErrorCode, firstErrorStatus = providerErrorMeta(raw)
+				firstErrorBillingURL = sanitizeBillingURL(extractBillingURL(firstErrorMsg))
 			}
 			// Completion evidence must belong to the target main session and
 			// be the final relevant terminal state.
-			if typ, _ := raw["type"].(string); typ == "step_finish" && sameSession(raw, mainSessionID) {
-				if reason, _ := raw["part"].(map[string]any)["reason"].(string); reason != "" {
-					lastStopReason = reason
-					validStop = lastStopReason == "stop"
+			if typ == "step_finish" {
+				if id, _ := raw["sessionID"].(string); id == activitySessionID && activitySessionID != "" {
+					if reason, _ := raw["part"].(map[string]any)["reason"].(string); reason != "" {
+						lastStopReason = reason
+						validStop = lastStopReason == "stop"
+					}
 				}
 			}
 			// Persist normalized server-owned events before delivery so a
@@ -375,6 +391,31 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// Resolve the target main session. Activity events are authoritative; only
+	// when no activity occurred (a prompt-start failure) is the first error's
+	// session treated as the main session.
+	mainSessionID := activitySessionID
+	if mainSessionID == "" {
+		mainSessionID = firstErrorSession
+	}
+	// Promote the candidate error only if it belongs to the main session.
+	var stdoutErrMsg string
+	stdoutErr := false
+	var providerCause runCause
+	var billingURL string
+	if firstErrorSession != "" && (mainSessionID == "" || firstErrorSession == mainSessionID) {
+		stdoutErr = true
+		run.state.recordErrorAt(firstErrorSeq)
+		stdoutErrMsg = firstErrorMsg
+		if classifyProviderError(firstErrorMsg, firstErrorCode, firstErrorStatus) {
+			providerCause = causeProviderInsufficientBalance
+			run.state.recordProviderFailureAt(firstErrorSeq)
+			billingURL = firstErrorBillingURL
+		}
+	}
+	// The durable session identifier for recovery, persistence and the
+	// terminal payload is always the target main session.
+	sessionID = mainSessionID
 	if err := scan.Err(); err != nil {
 		stdoutScanErr = err
 		if !truncated && !persistFailed {
@@ -392,7 +433,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	}
 	exit := processExitStatus(cmd)
 	snap := run.state.snapshot()
-	outcome := classifyRun(snap, stdoutErr, validStop, exit)
+	outcome := classifyRun(snap, stdoutErr, validStop, exit, providerCause)
 	if persistFailed {
 		// A persistence failure is a storage/run failure: the authoritative
 		// transcript is incomplete, so the run cannot claim completion.
@@ -464,7 +505,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 
 	// Determine and persist the execution outcome before terminal delivery.
 	stderrErrors, stderrWarnings := parsedStderr(a.redactSecrets(stderrText))
-	diag, summary := a.runDiagnostics(outcome, snap, stdoutErrMsg, validStop, exit, stderrErrors, stderrWarnings, a.redactSecrets(stderrText), stderrTrunc, seq, false, stdoutScanErr, map[string]string{"result": recoveryResult})
+	diag, summary := a.runDiagnostics(outcome, snap, stdoutErrMsg, validStop, exit, stderrErrors, stderrWarnings, a.redactSecrets(stderrText), stderrTrunc, seq, false, stdoutScanErr, map[string]string{"result": recoveryResult}, providerCause, billingURL, providerID, modelID)
 	// The terminal event carries the run identity and outcome so technical
 	// details survive reload; the name field encodes them as
 	// "run:<runID>:<outcome>".
@@ -484,7 +525,11 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		case outcomeCompletedWError:
 			payload = map[string]any{"message": summary, "exitCode": exit.exitCode, "signal": exit.signal, "outcome": string(outcomeCompletedWError)}
 		case outcomeFailed:
-			payload = map[string]any{"message": summary, "exitCode": exit.exitCode, "signal": exit.signal, "outcome": string(outcomeFailed)}
+			payload = map[string]any{"message": summary, "exitCode": exit.exitCode, "signal": exit.signal, "outcome": string(outcomeFailed), "runId": runID}
+			if providerCause == causeProviderInsufficientBalance {
+				payload["cause"] = string(causeProviderInsufficientBalance)
+				payload["billingUrl"] = billingURL
+			}
 		case outcomeCancelled:
 			payload = map[string]any{"message": "Agent stopped.", "outcome": string(outcomeCancelled)}
 		case outcomeTruncated:
@@ -516,7 +561,7 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 
 	// Delivery diagnostics are recorded after the attempt, never before. A
 	// delivery failure does not change the underlying execution outcome.
-	diag2, summary2 := a.runDiagnostics(outcome, snap, stdoutErrMsg, validStop, exit, stderrErrors, stderrWarnings, a.redactSecrets(stderrText), stderrTrunc, seq, terminalDelivered, stdoutScanErr, map[string]string{"result": recoveryResult})
+	diag2, summary2 := a.runDiagnostics(outcome, snap, stdoutErrMsg, validStop, exit, stderrErrors, stderrWarnings, a.redactSecrets(stderrText), stderrTrunc, seq, terminalDelivered, stdoutScanErr, map[string]string{"result": recoveryResult}, providerCause, billingURL, providerID, modelID)
 	if terminalDeliveryErr != nil {
 		var d diagnostics
 		_ = json.Unmarshal([]byte(diag2), &d)
@@ -534,16 +579,6 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 		// is never silently claimed as a durable completion.
 		_ = summary2
 	}
-}
-
-// sameSession reports whether an OpenCode event belongs to the target main
-// session. Events without a session ID are treated conservatively as non-main.
-func sameSession(raw map[string]any, mainSessionID string) bool {
-	if mainSessionID == "" {
-		return false
-	}
-	id, _ := raw["sessionID"].(string)
-	return id == mainSessionID
 }
 
 // sanitizeImageURL validates or rewrites an unsafe file URL before persistence
@@ -577,7 +612,7 @@ func (a *App) finishAgentRunErr(id, conversationID, state, sessionID, message st
 
 // runDiagnostics builds the bounded, redacted diagnostic record and the
 // user-facing summary for a run outcome.
-func (a *App) runDiagnostics(outcome runOutcome, snap runStateSnapshot, stdoutErrMsg string, validStop bool, exit exitStatus, stderrErrors, stderrWarnings []string, stderrTail string, stderrTrunc bool, seq int64, delivered bool, scannerErr error, recovery map[string]string) (string, string) {
+func (a *App) runDiagnostics(outcome runOutcome, snap runStateSnapshot, stdoutErrMsg string, validStop bool, exit exitStatus, stderrErrors, stderrWarnings []string, stderrTail string, stderrTrunc bool, seq int64, delivered bool, scannerErr error, recovery map[string]string, providerCause runCause, billingURL, provider, model string) (string, string) {
 	d := diagnostics{
 		Outcome:              string(outcome),
 		ExitCode:             exit.exitCode,
@@ -590,8 +625,15 @@ func (a *App) runDiagnostics(outcome runOutcome, snap runStateSnapshot, stdoutEr
 		StderrTruncated:      stderrTrunc,
 		TerminalEventDeliver: delivered,
 		OpenCodeVersion:      openCodeVersion(),
+		Provider:             provider,
+		Model:                model,
+		ProviderCause:        string(providerCause),
+		BillingURL:           billingURL,
 	}
-	if snap.cause == causeUserStop {
+	if providerCause == causeProviderInsufficientBalance {
+		d.Category = "provider_insufficient_balance"
+		d.Summary, _ = insufficientBalanceMessage(billingURL)
+	} else if snap.cause == causeUserStop {
 		d.Category = "user_stop"
 		d.Summary = "Agent stopped."
 	} else if snap.cause == causeRequestCanceled {
@@ -687,6 +729,59 @@ func errorEventText(raw map[string]any) string {
 		return msg
 	}
 	return "OpenCode reported a provider error."
+}
+
+// providerErrorMeta extracts an optional provider error code and numeric HTTP
+// status from a serialized OpenCode error event, tolerating their absence.
+// Only fields that actually appear in the captured event shape are read.
+func providerErrorMeta(raw map[string]any) (code string, statusCode int) {
+	e, ok := raw["error"].(map[string]any)
+	if !ok {
+		return "", 0
+	}
+	if data, ok := e["data"].(map[string]any); ok {
+		if c, _ := data["code"].(string); c != "" {
+			code = c
+		}
+		if s, ok := data["statusCode"].(float64); ok {
+			statusCode = int(s)
+		} else if s, ok := data["status"].(float64); ok {
+			statusCode = int(s)
+		}
+	}
+	if c, _ := e["code"].(string); c != "" {
+		code = c
+	}
+	if s, ok := e["statusCode"].(float64); ok {
+		statusCode = int(s)
+	}
+	return code, statusCode
+}
+
+// extractBillingURL pulls a candidate billing URL out of a provider error
+// message for later validation. It returns the first https URL found; the
+// caller must still pass it through sanitizeBillingURL.
+func extractBillingURL(msg string) string {
+	i := strings.Index(msg, "https://")
+	if i < 0 {
+		return ""
+	}
+	rest := msg[i:]
+	end := len(rest)
+	for j, r := range rest {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != ':' && r != '/' && r != '.' && r != '-' && r != '_' && r != '?' && r != '=' && r != '&' {
+			end = j
+			break
+		}
+	}
+	return rest[:end]
+}
+
+// insufficientBalanceMessage returns the concise, transcript-safe message and
+// whether a validated billing action is available.
+func insufficientBalanceMessage(billingURL string) (msg string, hasBilling bool) {
+	msg = "The provider could not run this request because the account has insufficient credit. Add credit or choose another configured provider, then try again."
+	return msg, billingURL != ""
 }
 
 func terminalKind(outcome runOutcome) string {

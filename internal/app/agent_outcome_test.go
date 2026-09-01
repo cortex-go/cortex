@@ -352,7 +352,7 @@ func TestClassifyRunPrecedence(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := classifyRun(tc.state, tc.stdoutError, tc.validStop, tc.exit); got != tc.want {
+			if got := classifyRun(tc.state, tc.stdoutError, tc.validStop, tc.exit, causeNone); got != tc.want {
 				t.Fatalf("classifyRun = %q want %q", got, tc.want)
 			}
 		})
@@ -825,5 +825,181 @@ func TestAgentRunMigrationAddsRunEventsAndColumns(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("conversations.%s missing after migration", col)
 		}
+	}
+}
+
+// --- provider insufficient-balance ---
+
+func TestClassifyProviderErrorRecognition(t *testing.T) {
+	cases := []struct {
+		msg    string
+		code   string
+		status int
+		want   bool
+	}{
+		{"AI_APICallError: Insufficient balance. Manage your billing here: https://opencode.ai/workspace/x/billing", "", 0, true},
+		{"Insufficient balance", "", 0, true},
+		{"provider said insufficient balance before closing", "", 0, true},
+		{"", "insufficient_balance", 0, true},
+		{"", "", 402, true},
+		{"Payment required", "", 0, false},
+		{"402 Payment Required", "", 0, false},
+		{"billing limit reached", "", 0, false},
+		{"quota exceeded", "", 0, false},
+		{"rate limit reached, reset in 1m", "", 0, false},
+		{"provider overloaded", "", 429, false},
+		{"API key invalid", "", 401, false},
+	}
+	for _, tc := range cases {
+		if got := classifyProviderError(tc.msg, tc.code, tc.status); got != tc.want {
+			t.Fatalf("classifyProviderError(%q, %q, %d) = %v want %v", tc.msg, tc.code, tc.status, got, tc.want)
+		}
+	}
+}
+
+func TestSanitizeBillingURL(t *testing.T) {
+	ok := "https://opencode.ai/workspace/abc123/billing"
+	if got := sanitizeBillingURL(ok); got != ok {
+		t.Fatalf("valid URL = %q want %q", got, ok)
+	}
+	reject := []string{
+		"http://opencode.ai/workspace/x/billing",
+		"https://www.opencode.ai/workspace/x/billing",
+		"https://opencode.ai.evil.com/workspace/x/billing",
+		"https://evil.com/workspace/x/billing",
+		"https://opencode.ai/",
+		"https://opencode.ai",
+		"https://user:pass@opencode.ai/workspace/x/billing",
+		"https://opencode.ai:8443/workspace/x/billing",
+		"javascript:alert(1)",
+		"https://opencode.ai/workspace/x/billing?next=https://evil.com",
+		"https://opencode.ai/workspace/x/billing#frag",
+		"opencode.ai/workspace/x/billing",
+		"https://opencode.ai./workspace/x/billing",
+		"https://opencode.ai/%0d%0a/workspace/x",
+		"",
+	}
+	for _, u := range reject {
+		if got := sanitizeBillingURL(u); got != "" {
+			t.Fatalf("rejected URL %q was accepted as %q", u, got)
+		}
+	}
+}
+
+func TestAgentRunInsufficientBalanceClassifiesAndPreservesBilling(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	msg := "AI_APICallError: Insufficient balance. Manage your billing here: https://opencode.ai/workspace/abc/billing"
+	stdout := "{\"type\":\"error\",\"sessionID\":\"ses_x\",\"error\":{\"name\":\"AI_APICallError\",\"data\":{\"message\":\"" + msg + "\"}}}\n"
+	fake.invoke(t, stdout, "", 1, `{"info":{"id":"ses_x"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	var terminal map[string]any
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+		if t, _ := ev["type"].(string); t == "error" {
+			terminal = ev["data"].(map[string]any)
+		}
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeFailed) {
+		t.Fatalf("state = %q want failed", state)
+	}
+	d := runDiagnosticsFromDB(t, a, runID)
+	if d.ProviderCause != string(causeProviderInsufficientBalance) {
+		t.Fatalf("providerCause = %q want provider_insufficient_balance", d.ProviderCause)
+	}
+	if d.BillingURL != "https://opencode.ai/workspace/abc/billing" {
+		t.Fatalf("billingUrl = %q", d.BillingURL)
+	}
+	if !strings.Contains(d.Summary, "insufficient credit") {
+		t.Fatalf("summary should be friendly: %q", d.Summary)
+	}
+	if terminal == nil || terminal["cause"] != string(causeProviderInsufficientBalance) {
+		t.Fatalf("terminal payload missing cause: %+v", terminal)
+	}
+	if terminal == nil || terminal["billingUrl"] != "https://opencode.ai/workspace/abc/billing" {
+		t.Fatalf("terminal payload missing billingUrl: %+v", terminal)
+	}
+}
+
+func TestAgentRunBillingBeforeStopWins(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	// Provider billing error first, then a user stop request.
+	stdout := "{\"type\":\"error\",\"sessionID\":\"ses_x\",\"error\":{\"data\":{\"message\":\"Insufficient balance\"}}}\n"
+	fake.invoke(t, stdout, "", 1, `{"info":{"id":"ses_x"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeFailed) {
+		t.Fatalf("billing-before-stop state = %q want failed", state)
+	}
+}
+
+func TestAgentRunStopBeforeBillingKeepsCancelled(t *testing.T) {
+	run := &activeRun{cancel: func() {}, state: newRunState()}
+	// Stop accepted first.
+	run.state.recordCause(causeUserStop)
+	// Provider error observed afterwards.
+	run.state.recordProviderFailure()
+	snap := run.state.snapshot()
+	if got := classifyRun(snap, true, false, exitStatus{signaled: true, signal: "SIGKILL"}, causeProviderInsufficientBalance); got != outcomeCancelled {
+		t.Fatalf("stop-before-billing classify = %q want cancelled", got)
+	}
+}
+
+func TestAgentRunAssistantProseDoesNotClassifyBilling(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	// Assistant text mentions "insufficient balance" but it is not a provider
+	// error event; the run completes normally and must not be misclassified.
+	stdout := "{\"type\":\"text\",\"sessionID\":\"ses_x\",\"part\":{\"type\":\"text\",\"text\":\"Insufficient balance is a common issue.\"}}\n{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeCompleted) {
+		t.Fatalf("assistant prose state = %q want completed", state)
+	}
+	d := runDiagnosticsFromDB(t, a, runID)
+	if d.ProviderCause != "" {
+		t.Fatalf("assistant prose set providerCause = %q", d.ProviderCause)
+	}
+}
+
+func TestAgentRunSubagentBillingDoesNotClassifyMain(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	// A billing error from a subagent session (different sessionID) must not
+	// classify the main run; main session completes normally.
+	stdout := "{\"type\":\"error\",\"sessionID\":\"ses_subagent\",\"error\":{\"data\":{\"message\":\"Insufficient balance\"}}}\n{\"type\":\"step_finish\",\"sessionID\":\"ses_main\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_main"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeCompleted) {
+		t.Fatalf("subagent billing state = %q want completed", state)
+	}
+	d := runDiagnosticsFromDB(t, a, runID)
+	if d.ProviderCause != "" {
+		t.Fatalf("subagent billing set providerCause = %q", d.ProviderCause)
 	}
 }
