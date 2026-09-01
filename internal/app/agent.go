@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -365,6 +366,17 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			kind, text, name := normalizedEvent(raw)
 			if kind != "" {
 				if err := a.persistAgentRunEvent(runID, kind, text, name, seq, time.Now().UnixMilli()); err != nil {
+					persistFailed = true
+					persistErr = err.Error()
+					cancel()
+					break
+				}
+				seq++
+			}
+			// A valid todowrite snapshot is persisted as its own authoritative
+			// task event so the task panel restores after reload.
+			if tasks := taskSnapshot(raw); tasks != "" {
+				if err := a.persistAgentRunEvent(runID, "task", tasks, "", seq, time.Now().UnixMilli()); err != nil {
 					persistFailed = true
 					persistErr = err.Error()
 					cancel()
@@ -1397,6 +1409,77 @@ func eventText(raw map[string]any) string {
 // normalizedEvent maps an OpenCode stdout event to the server-owned
 // conversation event kind/text/name that mirrors what the frontend would
 // render. Non-rendered event types (step_start/step_finish) return "".
+// taskSnapshot extracts and validates a todowrite task list from a tool_use
+// event. It returns a normalized JSON string (kind "task") or "" when the
+// payload is not a trusted structured todowrite snapshot. Validation bounds
+// item count, content length, statuses and priorities; unrecognized values are
+// normalized so a malformed item never corrupts the panel.
+func taskSnapshot(raw map[string]any) string {
+	part, _ := raw["part"].(map[string]any)
+	tool, _ := part["tool"].(string)
+	if tool != "todowrite" {
+		return ""
+	}
+	state, _ := part["state"].(map[string]any)
+	input, _ := state["input"].(map[string]any)
+	items, ok := input["todos"].([]any)
+	if !ok {
+		return ""
+	}
+	if len(items) > 100 {
+		items = items[:100]
+	}
+	out := make([]map[string]string, 0, len(items))
+	for _, it := range items {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, _ := m["content"].(string)
+		content = strings.TrimSpace(content)
+		if content == "" || len(content) > 500 {
+			continue
+		}
+		status := normalizeTaskStatus(fmt.Sprint(m["status"]))
+		priority := normalizeTaskPriority(fmt.Sprint(m["priority"]))
+		out = append(out, map[string]string{"content": content, "status": status, "priority": priority})
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func normalizeTaskStatus(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "completed", "done":
+		return "completed"
+	case "in_progress", "in-progress", "running":
+		return "in_progress"
+	case "pending", "":
+		return "pending"
+	default:
+		return "pending"
+	}
+}
+
+func normalizeTaskPriority(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "high":
+		return "high"
+	case "medium", "normal":
+		return "medium"
+	case "low":
+		return "low"
+	default:
+		return "medium"
+	}
+}
+
 func normalizedEvent(raw map[string]any) (kind, text, name string) {
 	typ, _ := raw["type"].(string)
 	switch typ {

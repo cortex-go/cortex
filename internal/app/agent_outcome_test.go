@@ -1052,3 +1052,66 @@ func TestAgentRunShutdownTimesOutAndLeavesStale(t *testing.T) {
 		t.Fatalf("cause = %q want service_shutdown", snap.cause)
 	}
 }
+
+func TestTaskSnapshotValidation(t *testing.T) {
+	valid := map[string]any{"type": "tool_use", "part": map[string]any{
+		"tool": "todowrite",
+		"state": map[string]any{"input": map[string]any{"todos": []any{
+			map[string]any{"content": "first", "status": "pending", "priority": "high"},
+			map[string]any{"content": "second", "status": "in_progress", "priority": "low"},
+			map[string]any{"content": "third", "status": "completed", "priority": "medium"},
+		}}},
+	}}
+	snap := taskSnapshot(valid)
+	if snap == "" {
+		t.Fatal("valid todowrite snapshot not extracted")
+	}
+	var todos []map[string]string
+	if err := json.Unmarshal([]byte(snap), &todos); err != nil {
+		t.Fatal(err)
+	}
+	if len(todos) != 3 || todos[0]["status"] != "pending" || todos[1]["status"] != "in_progress" || todos[2]["status"] != "completed" {
+		t.Fatalf("todos = %+v", todos)
+	}
+
+	// Non-todowrite tool: no snapshot.
+	other := map[string]any{"type": "tool_use", "part": map[string]any{"tool": "bash", "state": map[string]any{"input": map[string]any{"command": "ls"}}}}
+	if got := taskSnapshot(other); got != "" {
+		t.Fatal("non-todowrite produced a task snapshot")
+	}
+
+	// Unknown status/priority normalized to defaults.
+	unknown := map[string]any{"type": "tool_use", "part": map[string]any{
+		"tool": "todowrite",
+		"state": map[string]any{"input": map[string]any{"todos": []any{
+			map[string]any{"content": "x", "status": "weird", "priority": "urgent"},
+		}}},
+	}}
+	if got := taskSnapshot(unknown); got != "" {
+		var todos2 []map[string]string
+		if err := json.Unmarshal([]byte(got), &todos2); err == nil && len(todos2) == 1 {
+			if todos2[0]["status"] != "pending" || todos2[0]["priority"] != "medium" {
+				t.Fatalf("unknown normalized wrong: %+v", todos2)
+			}
+		} else {
+			t.Fatalf("unknown snapshot = %q", got)
+		}
+	}
+
+	// Oversized content dropped.
+	oversize := map[string]any{"type": "tool_use", "part": map[string]any{
+		"tool": "todowrite",
+		"state": map[string]any{"input": map[string]any{"todos": []any{
+			map[string]any{"content": strings.Repeat("a", 600), "status": "pending"},
+		}}},
+	}}
+	if got := taskSnapshot(oversize); got != "" {
+		t.Fatal("oversized content should be dropped")
+	}
+
+	// Malformed (todos not an array) returns empty.
+	malformed := map[string]any{"type": "tool_use", "part": map[string]any{"tool": "todowrite", "state": map[string]any{"input": map[string]any{"todos": "nope"}}}}
+	if got := taskSnapshot(malformed); got != "" {
+		t.Fatal("malformed todowrite produced a snapshot")
+	}
+}
