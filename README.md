@@ -51,13 +51,24 @@ go build -o cortex ./cmd/cortex
 
 Cortex listens on `127.0.0.1:7331` and uses your home directory as the default workspace root. Use `--root ~/Repositories` when you want a tighter browser-visible boundary.
 
+The listener is configured with `--host`/`--port` (or the legacy single-address `--listen`) and the `CORTEX_HOST`/`CORTEX_PORT` environment variables, in that precedence order:
+
+```sh
+cortex                        # 127.0.0.1:7331
+cortex --port 7401            # 127.0.0.1:7401
+CORTEX_PORT=7401 cortex       # 127.0.0.1:7401
+cortex --host 0.0.0.0 --port 7401
+```
+
+Loopback (`127.0.0.1`) is recommended behind a reverse proxy. Binding `0.0.0.0` exposes Cortex on all IPv4 interfaces and should only be used deliberately. IPv6 hosts are accepted and bracketed automatically. Ports must be integers from 1 through 65535; an invalid or empty value fails rather than silently falling back.
+
 > Remote binding is intentionally not the default. Cortex now requires browser authentication after first-run password setup, with optional TOTP and Google sign-in. For an Internet-facing deployment, TLS and normal host/reverse-proxy hardening are still recommended.
 
 When Cortex is behind Caddy or nginx on the same host, enable proxy trust
 explicitly and pin the external origin:
 
 ```sh
-cortex --listen 127.0.0.1:7331 \
+cortex --host 127.0.0.1 --port 7331 \
   --trust-proxy \
   --public-origin https://cortex.example.com
 ```
@@ -82,14 +93,17 @@ Cortex detects those OAuth credentials and copies the selected provider credenti
 Run Cortex in the foreground with `cortex` or `cortex serve`. To keep it running without a terminal, install a per-user systemd unit:
 
 ```sh
-cortex service install            # --listen, --root, --data, --public-origin, --trust-proxy accepted
+cortex service install            # --host, --port, --root, --data, --public-origin, --trust-proxy accepted
+cortex service install --port 7401  # install on 127.0.0.1:7401
 cortex service status
 cortex service logs               # or: cortex service logs --follow
 cortex service restart
 cortex service uninstall          # stops the service but keeps all Cortex data
 ```
 
-The user unit is written to `~/.config/systemd/user/cortex.service` and managed with `systemctl --user` and `journalctl --user-unit cortex.service`. `service install` resolves the executable to a stable absolute path, refuses empty, relative or transient paths, and writes the unit atomically with a versioned integrity header. An existing unit that is not managed by Cortex is never overwritten or removed silently. Install is transactional: the prior managed unit bytes are preserved, prior systemd enablement and activity are inspected before mutation, only exactly-recreatable states are accepted (`enabled`, `enabled-runtime`, `disabled` × `active`, `inactive`; masked/static/linked/generated/transient/failed/reloading states are refused before mutation — unmask or stop first), and rollback reproduces the exact prior enablement and activity states, distinguishing persistent from runtime enablement. A byte-identical unit already enabled and active is a genuine no-op; an unchanged unit that is inactive or disabled receives only the lifecycle steps needed, and a changed configuration reloads systemd and restarts the service. A failed fresh install is stopped and disabled while the unit is still loaded, then removed and systemd is reloaded. `cortex service status` reports enabled/running state, PID, version, listen address and a live health check, and exits nonzero when the service is failed or missing. The health check targets the public, read-only `GET /api/health` (a minimal `{"ok":true}` JSON response); the richer `/api/status` endpoint stays behind browser authentication.
+`service install` records the resolved host and port directly in the unit command, so the selected listener survives login, restart and reboot. It accepts `--host`/`--port` (defaulting to `127.0.0.1:7331` or the current `CORTEX_HOST`/`CORTEX_PORT` values), plus the legacy single-address `--listen`, `--root`, `--data`, `--public-origin` and `--trust-proxy`.
+
+The user unit is written to `~/.config/systemd/user/cortex.service` and managed with `systemctl --user` and `journalctl --user-unit cortex.service`. `service install` resolves the executable to a stable absolute path, refuses empty, relative or transient paths, and writes the unit atomically with a versioned integrity header. An existing unit that is not managed by Cortex is never overwritten or removed silently. Install is transactional: the prior managed unit bytes are preserved, prior systemd enablement and activity are inspected before mutation, only exactly-recreatable states are accepted (`enabled`, `enabled-runtime`, `disabled` × `active`, `inactive`; masked/static/linked/generated/transient/failed/reloading states are refused before mutation — unmask or stop first), and rollback reproduces the exact prior enablement and activity states, distinguishing persistent from runtime enablement. A byte-identical unit already enabled and active is a genuine no-op; an unchanged unit that is inactive or disabled receives only the lifecycle steps needed, and a changed configuration reloads systemd and restarts the service. A failed fresh install is stopped and disabled while the unit is still loaded, then removed and systemd is reloaded. `cortex service status` reports enabled/running state, PID, version, listen address, effective listener URL and a live health check, and exits nonzero when the service is failed or missing. The health check targets the public, read-only `GET /api/health` (a minimal `{"ok":true}` JSON response); the richer `/api/status` endpoint stays behind browser authentication.
 
 `service install --system` (system-wide units) is a documented follow-up and is not yet supported; user mode is the default.
 

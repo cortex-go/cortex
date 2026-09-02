@@ -10,8 +10,6 @@ import (
 	"github.com/cortex-go/cortex/internal/app"
 )
 
-const defaultListen = "127.0.0.1:7331"
-
 var version = "0.1.0-dev"
 
 func main() {
@@ -23,12 +21,18 @@ func main() {
 			os.Args = append(os.Args[:1], os.Args[2:]...)
 		}
 	}
-	listen := flag.String("listen", defaultListen, "HTTP listen address")
+	host := flag.String("host", "", "HTTP bind host (default 127.0.0.1; CORTEX_HOST overrides, CLI wins)")
+	port := flag.String("port", "", "HTTP bind port, 1-65535 (default 7331; CORTEX_PORT overrides, CLI wins)")
+	listen := flag.String("listen", "", "HTTP listen address (legacy; alternative to --host/--port)")
 	root := flag.String("root", "", "workspace root (default: home directory)")
 	data := flag.String("data", "", "Cortex data directory")
 	trustProxy := flag.Bool("trust-proxy", false, "trust forwarding headers from a direct loopback reverse proxy")
 	publicOrigin := flag.String("public-origin", "", "canonical external origin, for example https://cortex.example.com")
 	flag.Parse()
+	addr, err := resolveListener(*host, *port, *listen, flagProvided(flag.CommandLine, "host"), flagProvided(flag.CommandLine, "port"), flagProvided(flag.CommandLine, "listen"))
+	if err != nil {
+		log.Fatal("cortex: " + err.Error())
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		log.Fatal(err)
@@ -47,13 +51,13 @@ func main() {
 			*data = filepath.Join(cwd, ".cortex")
 		}
 	}
-	srv, err := app.New(app.Options{Listen: *listen, Root: *root, DataDir: *data, TrustProxy: *trustProxy, PublicOrigin: *publicOrigin})
+	srv, err := app.New(app.Options{Listen: addr, Root: *root, DataDir: *data, TrustProxy: *trustProxy, PublicOrigin: *publicOrigin})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer srv.Close()
-	fmt.Printf("Cortex · http://%s\nWorkspace root · %s\n", *listen, srv.Root())
+	fmt.Printf("Cortex · http://%s\nWorkspace root · %s\n", addr, srv.Root())
 	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
+		log.Fatalf("cortex: %v (listener: %s)", err, addr)
 	}
 }

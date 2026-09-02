@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -157,6 +158,38 @@ func readManagedUnitBytes(t *testing.T, data []byte) (unitMeta, error) {
 		return unitMeta{}, err
 	}
 	return readManagedUnit(path)
+}
+
+func testOptsHostPort(host, port string) serviceOptions {
+	return serviceOptions{host: host, port: port, root: "/home/nick", data: "/home/nick/.config/cortex"}
+}
+
+func TestBuildCortexUnitHostPort(t *testing.T) {
+	// A default install resolves to 127.0.0.1:7331 and the unit must record it
+	// through --host/--port so it survives login, restart and reboot.
+	def := buildCortexUnit("/usr/local/bin/cortex", testOptsHostPort("127.0.0.1", "7331"))
+	for _, want := range []string{`"--host" "127.0.0.1"`, `"--port" "7331"`, `# cortex-listen: 127.0.0.1:7331`} {
+		if !strings.Contains(def, want) {
+			t.Fatalf("default unit missing %q\n%s", want, def)
+		}
+	}
+	if strings.Contains(def, "--listen") {
+		t.Fatal("default unit must use --host/--port, not legacy --listen")
+	}
+	if _, err := readManagedUnitBytes(t, []byte(def)); err != nil {
+		t.Fatalf("default unit should validate: %v", err)
+	}
+
+	// An explicit 0.0.0.0:7401 install records that exact listener.
+	wide := buildCortexUnit("/usr/local/bin/cortex", testOptsHostPort("0.0.0.0", "7401"))
+	for _, want := range []string{`"--host" "0.0.0.0"`, `"--port" "7401"`, `# cortex-listen: 0.0.0.0:7401`} {
+		if !strings.Contains(wide, want) {
+			t.Fatalf("wide unit missing %q\n%s", want, wide)
+		}
+	}
+	if _, err := readManagedUnitBytes(t, []byte(wide)); err != nil {
+		t.Fatalf("wide unit should validate: %v", err)
+	}
 }
 
 func unitWithMeta(listen, health string) string {
@@ -1225,6 +1258,26 @@ func TestStatus(t *testing.T) {
 			t.Fatal("status with a non-JSON 200 health response should fail")
 		}
 	})
+}
+
+func TestStatusReportsListenerURL(t *testing.T) {
+	srv := jsonServer(t, 200, `{"ok":true}`, "application/json")
+	listen := strings.TrimPrefix(srv.URL, "http://")
+	m, fr, _ := newFakeManager(t)
+	if err := m.install(testOpts(listen), os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	fr.handler = activeHandler(fr)
+	var out bytes.Buffer
+	if err := m.status(&out, "1.0"); err != nil {
+		t.Fatalf("status failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "listen:  "+listen) {
+		t.Fatalf("status missing listen address:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "url:     http://"+listen) {
+		t.Fatalf("status missing effective listener URL:\n%s", out.String())
+	}
 }
 
 func TestRealCortexHealthAndStatusBoundary(t *testing.T) {

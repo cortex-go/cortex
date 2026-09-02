@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -88,12 +89,25 @@ type unitMeta struct {
 }
 
 type serviceOptions struct {
-	listen       string
+	host         string
+	port         string
+	listen       string // legacy single-address form (alternative to host/port)
 	root         string
 	data         string
 	publicOrigin string
 	trustProxy   bool
 	ghDir        string
+}
+
+// listener returns the resolved HTTP listen address recorded in the unit: the
+// legacy listen address when set, otherwise the host/port pair joined safely
+// (so IPv6 hosts are bracketed). Values are validated by the installer before
+// the unit is rendered.
+func (o serviceOptions) listener() string {
+	if o.listen != "" {
+		return o.listen
+	}
+	return net.JoinHostPort(o.host, o.port)
 }
 
 func userUnitPath(unitName string) string {
@@ -449,7 +463,12 @@ func renderCortexUnitBody(exe string, opts serviceOptions) string {
 	b.WriteString("[Service]\n")
 	b.WriteString("Type=simple\n")
 	b.WriteString("ExecStart=" + systemdQuote(exe))
-	b.WriteString(" " + systemdQuote("--listen") + " " + systemdQuote(opts.listen))
+	if opts.listen != "" {
+		b.WriteString(" " + systemdQuote("--listen") + " " + systemdQuote(opts.listen))
+	} else {
+		b.WriteString(" " + systemdQuote("--host") + " " + systemdQuote(opts.host))
+		b.WriteString(" " + systemdQuote("--port") + " " + systemdQuote(opts.port))
+	}
 	b.WriteString(" " + systemdQuote("--root") + " " + systemdQuote(opts.root))
 	b.WriteString(" " + systemdQuote("--data") + " " + systemdQuote(opts.data))
 	if opts.publicOrigin != "" {
@@ -474,7 +493,7 @@ func renderCortexUnitBody(exe string, opts serviceOptions) string {
 // integrity header carrying the SHA-256 of the managed content below it, the
 // runtime metadata (listen/health) used by `service status`, and the body.
 func buildCortexUnit(exe string, opts serviceOptions) string {
-	content := "# cortex-listen: " + opts.listen + "\n# cortex-health: " + cortexHealthPath + "\n" + renderCortexUnitBody(exe, opts)
+	content := "# cortex-listen: " + opts.listener() + "\n# cortex-health: " + cortexHealthPath + "\n" + renderCortexUnitBody(exe, opts)
 	sum := sha256.Sum256([]byte(content))
 	header := cortexUnitMarker + "\n" + cortexManagedPrefix + "v1 sha256=" + hex.EncodeToString(sum[:]) + "\n"
 	return header + content
@@ -649,7 +668,7 @@ func (m *serviceManager) requireManaged(verb string) error {
 
 func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
 	for _, v := range []struct{ val, name string }{
-		{opts.listen, "listen"}, {opts.root, "root"}, {opts.data, "data"}, {opts.publicOrigin, "public-origin"}, {opts.ghDir, "gh config dir"},
+		{opts.listener(), "listen"}, {opts.root, "root"}, {opts.data, "data"}, {opts.publicOrigin, "public-origin"}, {opts.ghDir, "gh config dir"},
 	} {
 		if err := validateNoControl(v.val, v.name); err != nil {
 			return err
@@ -784,6 +803,7 @@ func (m *serviceManager) status(out io.Writer, version string) error {
 	fmt.Fprintf(out, "pid:     %s\n", strings.TrimSpace(pid))
 	fmt.Fprintf(out, "version: %s\n", version)
 	fmt.Fprintf(out, "listen:  %s\n", meta.listen)
+	fmt.Fprintf(out, "url:     http://%s\n", meta.listen)
 	if active != stateActive {
 		return fmt.Errorf("%s is %q; expected active", m.unitName, active)
 	}
@@ -972,7 +992,9 @@ func runService(args []string, version string) int {
 	fs := flag.NewFlagSet("cortex service "+cmd, flag.ContinueOnError)
 	system := fs.Bool("system", false, "install a system-wide unit (not yet supported; user mode is the default)")
 	follow := fs.Bool("follow", false, "follow new journal output")
-	listen := fs.String("listen", defaultListen, "HTTP listen address recorded in the unit")
+	host := fs.String("host", "", "HTTP bind host recorded in the unit (default 127.0.0.1; CORTEX_HOST overrides, CLI wins)")
+	port := fs.String("port", "", "HTTP bind port recorded in the unit, 1-65535 (default 7331; CORTEX_PORT overrides, CLI wins)")
+	listen := fs.String("listen", "", "HTTP listen address recorded in the unit (legacy; alternative to --host/--port)")
 	root := fs.String("root", "", "workspace root recorded in the unit")
 	data := fs.String("data", "", "data directory recorded in the unit")
 	trustProxy := fs.Bool("trust-proxy", false, "trust forwarding headers from a direct loopback reverse proxy")
@@ -995,6 +1017,24 @@ func runService(args []string, version string) int {
 	}
 	switch cmd {
 	case "install":
+		listenSet := flagProvided(fs, "listen")
+		hostSet := flagProvided(fs, "host")
+		portSet := flagProvided(fs, "port")
+		listenVal, hostVal, portVal := "", "", ""
+		if listenSet {
+			if hostSet || portSet {
+				fmt.Fprintln(os.Stderr, "cortex: --listen cannot be combined with --host or --port")
+				return 2
+			}
+			listenVal = *listen
+		} else {
+			h, p, err := resolveHostPort(*host, *port, hostSet, portSet)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "cortex:", err)
+				return 2
+			}
+			hostVal, portVal = h, p
+		}
 		if *root == "" {
 			if home, err := os.UserHomeDir(); err == nil && home != "" {
 				*root = home
@@ -1024,8 +1064,12 @@ func runService(args []string, version string) int {
 			return 1
 		}
 		m.exe = exe
+		addr := net.JoinHostPort(hostVal, portVal)
+		if listenVal != "" {
+			addr = listenVal
+		}
 		for _, v := range []struct{ val, name string }{
-			{*listen, "listen"}, {*root, "root"}, {*data, "data"}, {*publicOrigin, "public-origin"},
+			{addr, "listen"}, {*root, "root"}, {*data, "data"}, {*publicOrigin, "public-origin"},
 		} {
 			if err := validateNoControl(v.val, v.name); err != nil {
 				fmt.Fprintln(os.Stderr, "cortex:", err)
@@ -1037,7 +1081,7 @@ func runService(args []string, version string) int {
 			fmt.Fprintln(os.Stderr, "cortex:", err)
 			return 2
 		}
-		opts := serviceOptions{listen: *listen, root: *root, data: *data, publicOrigin: *publicOrigin, trustProxy: *trustProxy, ghDir: ghDir}
+		opts := serviceOptions{host: hostVal, port: portVal, listen: listenVal, root: *root, data: *data, publicOrigin: *publicOrigin, trustProxy: *trustProxy, ghDir: ghDir}
 		if err := m.install(opts, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "cortex:", err)
 			return 1
