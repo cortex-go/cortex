@@ -37,8 +37,9 @@ BEGIN {
   required_block["gofmt -l"]=1
   in_on=0; in_permissions=0; in_jobs=0
   in_push=0; in_branches=0; in_block=0
-  push_main=0; seen_pull_request=0; perms_read=0; perms_write=0
-  uses_count=0; bad=0
+  in_setupgo=0; job_perms_seen=0
+  push_main=0; seen_pull_request=0; top_contents_read=0; top_perm_seen=0; top_perm_bad=0
+  uses_count=0; go_version_file=0; bad=0
 }
 {
   line=$0
@@ -87,18 +88,29 @@ BEGIN {
   }
 
   if (in_permissions) {
-    if (content ~ /^[A-Za-z0-9_-]+:[ \t]*read[ \t]*$/) { perms_read=1 }
-    else if (content ~ /^[A-Za-z0-9_-]+:[ \t]*write[ \t]*$/) { perms_write=1; print "elevated permission: " content > "/dev/stderr" }
+    # Exact active top-level permission contract: contents: read. Track whether
+    # any top-level permission key is present and reject anything but the exact
+    # "contents: read" (e.g. "issues: read", "contents: write", "actions: read").
+    if (content ~ /^[A-Za-z0-9_-]+:[ \t]*[^ \t]+/) {
+      top_perm_seen=1
+      if (content=="contents: read") { top_contents_read=1 }
+      else { top_perm_bad=1; print "invalid top-level permission: " content > "/dev/stderr" }
+    }
     next
   }
 
   if (in_jobs) {
+    if (content ~ /^permissions:/) { job_perms_seen=1; print "job-level permissions: block present (escalation risk)" > "/dev/stderr"; next }
     if (content ~ /^-[ \t]*uses:[ \t]*[^ \t]+/) {
       ref=content; sub(/^-[ \t]*uses:[ \t]*/, "", ref); sub(/^.*@/, "", ref)
       uses_count++
       if (ref !~ /^[0-9a-fA-F]{40}$/) { bad=1; print "uses: reference is not a full 40-hex SHA: " content > "/dev/stderr" }
+      # The pinned setup-go step must be followed by go-version-file: go.mod.
+      if (index(ref, "0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32")>0) in_setupgo=1
+      else in_setupgo=0
       next
     }
+    if (in_setupgo && content ~ /^go-version-file:[ \t]+go\.mod[ \t]*$/) { go_version_file=1; in_setupgo=0; next }
     if (content ~ /^run:[ \t]*\|[ \t]*$/) { in_block=1; block_indent=ws; next }
     if (content ~ /^run:[ \t]+/) {
       cmd=content; sub(/^run:[ \t]+/, "", cmd); cmd=trim(cmd)
@@ -111,9 +123,11 @@ END {
   fail=0
   if (!push_main) { print "missing active push trigger targeting main" > "/dev/stderr"; fail=1 }
   if (!seen_pull_request) { print "missing active pull_request trigger" > "/dev/stderr"; fail=1 }
-  if (!perms_read) { print "workflow permissions are not read-only" > "/dev/stderr"; fail=1 }
-  if (perms_write) fail=1
+  if (!top_perm_seen || !top_contents_read) { print "workflow top-level permission is not exactly contents: read" > "/dev/stderr"; fail=1 }
+  if (top_perm_bad) fail=1
+  if (job_perms_seen) fail=1
   if (uses_count==0) { print "no uses: references found" > "/dev/stderr"; fail=1 }
+  if (!go_version_file) { print "missing active go-version-file: go.mod beneath pinned setup-go" > "/dev/stderr"; fail=1 }
   for (cmd in required_inline) if (!(cmd in found_inline)) { print "missing active run step: " cmd > "/dev/stderr"; fail=1 }
   for (cmd in required_block) if (!(cmd in found_block)) { print "missing active run block command: " cmd > "/dev/stderr"; fail=1 }
   exit (fail==0 && bad==0 ? 0 : 1)

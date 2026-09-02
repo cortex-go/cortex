@@ -9,10 +9,14 @@ async function api(url,opt={}){opt={...opt,headers:{...(opt.headers||{})}};const
 function sid(){return crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)}
 function sessionTitle(s){if(s.title)return s.title;if(s.workspace)return s.workspace.split('/').filter(Boolean).pop()||s.workspace;return 'New session'}
 function sessionSafe(s){return{id:s.id,workspace:s.workspace||'',workspaceStatus:s.workspaceStatus||'',title:s.title||'',provider:s.provider||'',model:s.model||'',openCodeSession:s.openCodeSession||'',currentRunId:s.currentRunId||'',state:s.busy?'running':(s.state||'idle'),createdAt:s.createdAt||Date.now(),updatedAt:Date.now(),archivedAt:s.archivedAt||s.closedAt||0,events:s.events||[],tasksCollapsed:!!s.tasksCollapsed}}
+// sessionServerSafe is the browser-local UI view minus the task-panel collapsed
+// preference, which is intentionally local-only and must not be sent to the
+// server conversation endpoint (the Go decoder rejects unknown fields).
+function sessionServerSafe(s){const o=sessionSafe(s);delete o.tasksCollapsed;return o}
 function scheduleServerSave(s){
   if(!serverReady||!s?.id)return;
   clearTimeout(serverSaveTimers.get(s.id));
-  serverSaveTimers.set(s.id,setTimeout(async()=>{serverSaveTimers.delete(s.id);try{await api('/api/conversation',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(sessionSafe(s))})}catch(e){toast('Conversation save failed · '+e.message)}},120))
+  serverSaveTimers.set(s.id,setTimeout(async()=>{serverSaveTimers.delete(s.id);try{await api('/api/conversation',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(sessionServerSafe(s))})}catch(e){toast('Conversation save failed · '+e.message)}},120))
 }
 // saveSessionToServer issues a PUT for exactly one conversation, coalescing
 // rapid changes for the same id without fan-out to unrelated sessions.

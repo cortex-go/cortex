@@ -89,3 +89,30 @@ func TestPanicIsContained(t *testing.T) {
 		t.Fatalf("panic response=%d %q", rec.Code, rec.Body.String())
 	}
 }
+
+// TestConversationPUTAcceptStrictContract verifies the frontend's conversation
+// PUT payload (the browser-local view minus the local-only tasksCollapsed
+// preference) is accepted by the real handler, while an actually unknown
+// property is still rejected so strict decoding is not weakened.
+func TestConversationPUTAcceptStrictContract(t *testing.T) {
+	a := hardeningTestApp(t)
+	// Exact payload produced by sessionServerSafe(): no tasksCollapsed field.
+	valid := `{"id":"c1","workspace":"/w","title":"","state":"idle","createdAt":1,"updatedAt":1,"events":[]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "http://127.0.0.1/api/conversation", strings.NewReader(valid))
+	req.Header.Set("Content-Type", "application/json")
+	a.conversationAPI(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid conversation PUT = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+
+	// An unknown property must still be rejected.
+	unknown := `{"id":"c2","workspace":"/w","title":"","state":"idle","createdAt":1,"updatedAt":1,"events":[],"tasksCollapsed":false}`
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPut, "http://127.0.0.1/api/conversation", strings.NewReader(unknown))
+	req2.Header.Set("Content-Type", "application/json")
+	a.conversationAPI(rec2, req2)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("unknown-property conversation PUT = %d, want 400 (%s)", rec2.Code, rec2.Body.String())
+	}
+}

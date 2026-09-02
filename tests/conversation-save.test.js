@@ -308,4 +308,16 @@ async function bootSimulation(ctx, localStore) {
     assert.strictEqual(putCalls(ctx3).length, 0, 'retry boot must issue zero conversation PUTs');
     console.log('ok - partial_migration_preserves_rejected_and_retries_without_duplication');
   }
+
+  await test(async function task_collapsed_preference_is_local_only(ctx) {
+    run(ctx, `serverReady=true; sessions={}; sessions['a']={id:'a',workspace:'/w1',events:[],createdAt:1,tasksCollapsed:true}; activeId='a';`);
+    run(ctx, `addEvent('a','user','hello')`);
+    await settle();
+    const puts = putCalls(ctx);
+    assert.strictEqual(puts.length, 1, 'expected exactly one PUT');
+    const body = JSON.parse(puts[0].body);
+    assert.ok(!('tasksCollapsed' in body), 'tasksCollapsed must not be sent to the server conversation endpoint');
+    // The preference must still be retained in browser-local storage.
+    assert.strictEqual(run(ctx, `sessions['a'].tasksCollapsed`), true, 'tasksCollapsed lost in local session state');
+  });
 })();
