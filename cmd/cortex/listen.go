@@ -10,8 +10,9 @@ import (
 	"strings"
 )
 
-// Default host and port for the shared Stackyard host/port standard. Cortex's
-// default listener is 127.0.0.1:7331; both remain configurable.
+// Default Cortex host and port used by the shared project configuration
+// pattern. Cortex's default listener is 127.0.0.1:7331; both remain
+// configurable.
 const (
 	defaultHost = "127.0.0.1"
 	defaultPort = "7331"
@@ -41,33 +42,35 @@ func validatePort(p string) error {
 }
 
 // resolveHostPort computes the effective bind host and port. Precedence per
-// field is CLI flag > environment variable > default. A port that is present
-// but empty, malformed, zero, negative or greater than 65535 is an error; an
-// empty host value is rejected rather than silently meaning "all interfaces".
+// field is CLI flag > environment variable > default. Values are trimmed once
+// and the canonical trimmed form is returned, so surrounding whitespace cannot
+// leak into the listener string. A port that is present but empty, malformed,
+// zero, negative or greater than 65535 is an error; an empty host value is
+// rejected rather than silently meaning "all interfaces".
 func resolveHostPort(hostFlag, portFlag string, hostSet, portSet bool) (host, port string, err error) {
 	host = defaultHost
 	if hostSet {
-		if strings.TrimSpace(hostFlag) == "" {
+		host = strings.TrimSpace(hostFlag)
+		if host == "" {
 			return "", "", errors.New("--host is set but empty")
 		}
-		host = hostFlag
 	} else if v, ok := os.LookupEnv("CORTEX_HOST"); ok {
-		if strings.TrimSpace(v) == "" {
+		host = strings.TrimSpace(v)
+		if host == "" {
 			return "", "", errors.New("CORTEX_HOST is set but empty")
 		}
-		host = v
 	}
 	port = defaultPort
 	if portSet {
 		if err := validatePort(portFlag); err != nil {
 			return "", "", fmt.Errorf("--port: %w", err)
 		}
-		port = portFlag
+		port = strings.TrimSpace(portFlag)
 	} else if v, ok := os.LookupEnv("CORTEX_PORT"); ok {
 		if err := validatePort(v); err != nil {
 			return "", "", fmt.Errorf("CORTEX_PORT: %w", err)
 		}
-		port = v
+		port = strings.TrimSpace(v)
 	}
 	return host, port, nil
 }

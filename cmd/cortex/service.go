@@ -100,14 +100,14 @@ type serviceOptions struct {
 }
 
 // listener returns the resolved HTTP listen address recorded in the unit: the
-// legacy listen address when set, otherwise the host/port pair joined safely
-// (so IPv6 hosts are bracketed). Values are validated by the installer before
-// the unit is rendered.
+// legacy listen address when set, otherwise the trimmed host/port pair joined
+// safely (so IPv6 hosts are bracketed). Values are canonicalized before being
+// written so surrounding whitespace can never leak into the unit.
 func (o serviceOptions) listener() string {
 	if o.listen != "" {
 		return o.listen
 	}
-	return net.JoinHostPort(o.host, o.port)
+	return net.JoinHostPort(strings.TrimSpace(o.host), strings.TrimSpace(o.port))
 }
 
 func userUnitPath(unitName string) string {
@@ -466,8 +466,8 @@ func renderCortexUnitBody(exe string, opts serviceOptions) string {
 	if opts.listen != "" {
 		b.WriteString(" " + systemdQuote("--listen") + " " + systemdQuote(opts.listen))
 	} else {
-		b.WriteString(" " + systemdQuote("--host") + " " + systemdQuote(opts.host))
-		b.WriteString(" " + systemdQuote("--port") + " " + systemdQuote(opts.port))
+		b.WriteString(" " + systemdQuote("--host") + " " + systemdQuote(strings.TrimSpace(opts.host)))
+		b.WriteString(" " + systemdQuote("--port") + " " + systemdQuote(strings.TrimSpace(opts.port)))
 	}
 	b.WriteString(" " + systemdQuote("--root") + " " + systemdQuote(opts.root))
 	b.WriteString(" " + systemdQuote("--data") + " " + systemdQuote(opts.data))

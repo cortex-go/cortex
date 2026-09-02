@@ -192,6 +192,23 @@ func TestBuildCortexUnitHostPort(t *testing.T) {
 	}
 }
 
+func TestBuildCortexUnitHostPortCanonical(t *testing.T) {
+	// Whitespace-surrounded host/port must never leak into the unit metadata or
+	// ExecStart; only the canonical trimmed values are recorded.
+	opts := serviceOptions{host: "  127.0.0.1  ", port: "  7401  ", root: "/home/nick", data: "/home/nick/.config/cortex"}
+	unit := buildCortexUnit("/usr/local/bin/cortex", opts)
+	for _, want := range []string{`"--host" "127.0.0.1"`, `"--port" "7401"`, `# cortex-listen: 127.0.0.1:7401`} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("canonical unit missing %q\n%s", want, unit)
+		}
+	}
+	for _, bad := range []string{`"  127.0.0.1  "`, `"  7401  "`, `# cortex-listen:   127.0.0.1:7401`} {
+		if strings.Contains(unit, bad) {
+			t.Fatalf("unit leaked untrimmed value %q\n%s", bad, unit)
+		}
+	}
+}
+
 func unitWithMeta(listen, health string) string {
 	body := renderCortexUnitBody("/usr/local/bin/cortex", testOpts(listen))
 	content := "# cortex-listen: " + listen + "\n# cortex-health: " + health + "\n" + body

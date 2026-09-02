@@ -164,3 +164,62 @@ func TestValidatePort(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveListenerTrimsWhitespace(t *testing.T) {
+	// Whitespace-surrounded CLI values must resolve canonically.
+	h, p, l, hs, ps, ls := listenerFlags("--host", "  127.0.0.1  ", "--port", "  7401  ")
+	host, port, err := resolveHostPort(h, p, hs, ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "127.0.0.1" || port != "7401" {
+		t.Fatalf("cli trimmed host/port = %q/%q want 127.0.0.1/7401", host, port)
+	}
+	addr, err := resolveListener(h, p, l, hs, ps, ls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr != "127.0.0.1:7401" {
+		t.Fatalf("cli listener = %q want 127.0.0.1:7401", addr)
+	}
+
+	// Whitespace-surrounded environment values must resolve canonically.
+	t.Setenv("CORTEX_HOST", "  0.0.0.0  ")
+	t.Setenv("CORTEX_PORT", "  7402  ")
+	h, p, l, hs, ps, ls = listenerFlags()
+	host, port, err = resolveHostPort(h, p, hs, ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "0.0.0.0" || port != "7402" {
+		t.Fatalf("env trimmed host/port = %q/%q want 0.0.0.0/7402", host, port)
+	}
+	addr, err = resolveListener(h, p, l, hs, ps, ls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr != "0.0.0.0:7402" {
+		t.Fatalf("env listener = %q want 0.0.0.0:7402", addr)
+	}
+}
+
+func TestResolveListenerWhitespaceOnlyFails(t *testing.T) {
+	// Whitespace-only values are empty after trimming and must fail.
+	h, p, l, hs, ps, ls := listenerFlags("--host", "   ", "--port", "   ")
+	if _, err := resolveListener(h, p, l, hs, ps, ls); err == nil {
+		t.Fatal("whitespace-only --host/--port accepted")
+	}
+	t.Setenv("CORTEX_HOST", "   ")
+	t.Setenv("CORTEX_PORT", "   ")
+	h, p, l, hs, ps, ls = listenerFlags()
+	if _, err := resolveListener(h, p, l, hs, ps, ls); err == nil {
+		t.Fatal("whitespace-only CORTEX_HOST/CORTEX_PORT accepted")
+	}
+	// Whitespace-only host with a valid port must still fail.
+	t.Setenv("CORTEX_HOST", "   ")
+	t.Setenv("CORTEX_PORT", "7401")
+	h, p, l, hs, ps, ls = listenerFlags()
+	if _, err := resolveListener(h, p, l, hs, ps, ls); err == nil {
+		t.Fatal("whitespace-only host accepted with valid port")
+	}
+}
