@@ -450,6 +450,41 @@ test('stopAgent cancel timeout followed by running is unconfirmed not rejected',
   if (!msg.includes('Could not confirm the stop')) throw new Error('unconfirmed toast = ' + msg);
 });
 
+// Warning vs failure: a completed_with_process_error terminal event maps to a
+// distinct warning kind and summary, never the generic error kind.
+test('warning SSE terminal event maps to warning kind and summary', async () => {
+  const ctx = loadContext();
+  const ev = { type: 'warning', data: { outcome: 'completed_with_process_error', message: 'OpenCode exited with status 1 after completing.' } };
+  if (run(ctx, 'eventKind(EV)', { EV: ev }) !== 'warning') throw new Error('warning kind not mapped');
+  const sum = run(ctx, 'summarize(EV)', { EV: ev });
+  if (!sum.includes('exit')) throw new Error('warning summary missing: ' + sum);
+});
+
+// Warning vs failure: eventNode renders warning and error with distinct classes.
+test('eventNode renders warning and error with distinct classes', async () => {
+  const ctx = loadContext();
+  const w = run(ctx, 'eventNode({kind:"warning",text:"W",name:"run:r1:completed_with_process_error"})');
+  const e = run(ctx, 'eventNode({kind:"error",text:"E",name:"run:r1:failed"})');
+  if (!String(w.className).includes('event warning')) throw new Error('warning class missing: ' + w.className);
+  if (!String(e.className).includes('event error')) throw new Error('error class missing');
+  if (w.className === e.className) throw new Error('warning and error must render differently');
+});
+
+// Warning survives conversation reload without degrading into an Error block.
+test('real syncServerConversations preserves warning state after reload', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: 'completed_with_process_error', currentRunId: 'run-1', events: [{ kind: 'warning', text: 'OpenCode exited with status 1 after completing.', name: 'run:run-1:completed_with_process_error' }] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, 'sessions={};activeId="a";serverReady=true');
+  await run(ctx, 'syncServerConversations()');
+  if (run(ctx, "sessions['a'].state") !== 'completed_with_process_error') throw new Error('warning state lost on reload');
+  if (run(ctx, "sessions['a'].busy")) throw new Error('spinner not cleared on reload');
+  const kinds = run(ctx, "sessions['a'].events.map(e=>e.kind).join(',')");
+  if (kinds.includes('error')) throw new Error('warning degraded to error on reload: ' + kinds);
+  if (!kinds.includes('warning')) throw new Error('warning kind missing on reload: ' + kinds);
+});
+
 (async function runAll() {
   let pass = 0, fail = 0;
   for (const { name, fn } of __tests) {

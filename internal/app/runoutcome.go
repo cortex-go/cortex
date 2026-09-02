@@ -55,6 +55,12 @@ type runState struct {
 	seq      uint64
 	errSeq   uint64
 	causeSeq uint64
+	// stopSeq records the sequence at which the main session's valid completion
+	// evidence (a step_finish with reason "stop") was observed. It is drawn from
+	// the same observation sequence as errSeq so the classifier can establish
+	// whether an error occurred before or after completion. Zero means no valid
+	// completion evidence was seen.
+	stopSeq uint64
 	// providerErrSeq records the sequence at which an authoritative main-session
 	// provider failure (e.g. insufficient balance) was observed. It is separate
 	// from the local cause machine so provider failures and local cancellation
@@ -68,6 +74,7 @@ type runStateSnapshot struct {
 	cause          runCause
 	errSeq         uint64
 	causeSeq       uint64
+	stopSeq        uint64
 	providerErrSeq uint64
 	sealed         bool
 }
@@ -160,6 +167,17 @@ func (s *runState) recordErrorAt(seq uint64) {
 	}
 }
 
+// recordStopAt promotes a candidate valid-completion (step_finish "stop")
+// observation captured earlier to the recorded stop sequence, preserving its
+// chronological position relative to errors.
+func (s *runState) recordStopAt(seq uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if seq > 0 && s.stopSeq == 0 {
+		s.stopSeq = seq
+	}
+}
+
 // recordProviderFailureAt promotes a candidate provider failure captured
 // earlier to the recorded provider sequence, preserving chronological order.
 func (s *runState) recordProviderFailureAt(seq uint64) {
@@ -180,7 +198,7 @@ func (s *runState) seal() {
 func (s *runState) snapshot() runStateSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return runStateSnapshot{cause: s.cause, errSeq: s.errSeq, causeSeq: s.causeSeq, providerErrSeq: s.providerErrSeq, sealed: s.sealed}
+	return runStateSnapshot{cause: s.cause, errSeq: s.errSeq, causeSeq: s.causeSeq, stopSeq: s.stopSeq, providerErrSeq: s.providerErrSeq, sealed: s.sealed}
 }
 
 // exitStatus describes the raw process termination facts. Exit code and signal
@@ -195,21 +213,36 @@ type exitStatus struct {
 // classifyRun applies the authoritative outcome precedence. The first matching
 // rule wins; a nonzero process exit always remains evidence of a problem.
 //
+// Error and completion evidence share one observation sequence (runState.seq):
+// a main-session error observed before valid completion (or with no valid
+// completion at all) is a genuine failure, while an error observed after the
+// main-session step_finish is post-completion evidence and never fails the
+// produced answer.
+//
 // Chronological precedence for provider failures: an authoritative main-session
 // provider error observed before an accepted local termination cause produces
 // failed with the provider cause. A local stop/request cancellation/output
 // limit/shutdown accepted before the provider error keeps its local outcome.
 func classifyRun(state runStateSnapshot, stdoutError bool, validStop bool, exit exitStatus, providerCause runCause) runOutcome {
-	// Provider failure observed with no local cause, or before the local cause.
+	// Provider failure observed with no local cause, or before the local cause,
+	// and before valid completion evidence.
 	if providerCause != "" {
-		if state.cause == causeNone || (state.causeSeq > 0 && state.providerErrSeq < state.causeSeq) {
-			return outcomeFailed
+		if state.stopSeq == 0 || state.providerErrSeq < state.stopSeq {
+			if state.cause == causeNone || (state.causeSeq > 0 && state.providerErrSeq < state.causeSeq) {
+				return outcomeFailed
+			}
 		}
 	}
-	// 1. Authoritative stdout error observed before the local cause (or with
-	//    no local cause at all) forces failure, regardless of any later stop.
-	if stdoutError && (state.cause == causeNone || (state.errSeq > 0 && state.causeSeq > 0 && state.errSeq < state.causeSeq)) {
-		return outcomeFailed
+	// Authoritative stdout error observed before valid completion evidence (or
+	// with no completion evidence at all) forces failure, regardless of any
+	// later stop. An error after the stop is post-completion evidence.
+	if stdoutError {
+		beforeStop := state.stopSeq == 0 || (state.errSeq > 0 && state.errSeq < state.stopSeq)
+		if beforeStop {
+			if state.cause == causeNone || (state.errSeq > 0 && state.causeSeq > 0 && state.errSeq < state.causeSeq) {
+				return outcomeFailed
+			}
+		}
 	}
 	switch state.cause {
 	case causeOutputLimit:
@@ -227,9 +260,11 @@ func classifyRun(state runStateSnapshot, stdoutError bool, validStop bool, exit 
 	if exit.signaled {
 		return outcomeFailed
 	}
-	// 6. Ordinary non-zero exit code with valid completion evidence and no
-	//    stdout error: the response completed but OpenCode reported a problem.
-	if exit.exited && exit.exitCode != 0 && validStop && !stdoutError {
+	// 6. Ordinary non-zero exit code with valid completion evidence: the
+	//    response completed but OpenCode reported a problem. A pre-completion
+	//    stdout error already forced failure above; a post-completion error is
+	//    process evidence retained as a warning, never a failed answer.
+	if exit.exited && exit.exitCode != 0 && validStop {
 		return outcomeCompletedWError
 	}
 	// 7. Ordinary non-zero exit without valid completion evidence.
@@ -237,7 +272,7 @@ func classifyRun(state runStateSnapshot, stdoutError bool, validStop bool, exit 
 		return outcomeFailed
 	}
 	// 8. Clean exit with completion evidence.
-	if exit.exited && exit.exitCode == 0 && validStop && !stdoutError {
+	if exit.exited && exit.exitCode == 0 && validStop {
 		return outcomeCompleted
 	}
 	// 9. Clean exit without required completion evidence.

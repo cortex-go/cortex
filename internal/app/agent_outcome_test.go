@@ -154,7 +154,7 @@ func runDiagnosticsFromDB(t *testing.T, a *App, runID string) diagnostics {
 
 func terminalEventType(events []map[string]any) string {
 	for _, ev := range events {
-		if t, _ := ev["type"].(string); t == "done" || t == "error" || t == "cancelled" || t == "truncated" {
+		if t, _ := ev["type"].(string); t == "done" || t == "error" || t == "warning" || t == "cancelled" || t == "truncated" {
 			return t
 		}
 	}
@@ -317,12 +317,28 @@ func TestClassifyRunPrecedence(t *testing.T) {
 			want:        outcomeFailed,
 		},
 		{
-			name:        "stdout error before cause failed",
-			state:       runStateSnapshot{errSeq: 1, causeSeq: 2},
+			name:        "stdout error before stop failed",
+			state:       runStateSnapshot{errSeq: 1, stopSeq: 2},
 			stdoutError: true,
 			validStop:   true,
 			exit:        exitStatus{exited: true, exitCode: 0},
 			want:        outcomeFailed,
+		},
+		{
+			name:        "stdout error after stop exit0 completed",
+			state:       runStateSnapshot{errSeq: 2, stopSeq: 1},
+			stdoutError: true,
+			validStop:   true,
+			exit:        exitStatus{exited: true, exitCode: 0},
+			want:        outcomeCompleted,
+		},
+		{
+			name:        "stdout error after stop exit1 completed_with_process_error",
+			state:       runStateSnapshot{errSeq: 2, stopSeq: 1},
+			stdoutError: true,
+			validStop:   true,
+			exit:        exitStatus{exited: true, exitCode: 1},
+			want:        outcomeCompletedWError,
 		},
 		{
 			name:        "stdout error after stop cancelled",
@@ -440,7 +456,8 @@ func TestAgentRunExit0ValidStopCompletes(t *testing.T) {
 
 // TestAgentRunExitNonZeroValidStopIsCompletedWithProcessError verifies that a
 // valid final stop followed by a non-zero exit produces
-// completed_with_process_error, never a plain completion.
+// completed_with_process_error delivered as a distinct warning event, never a
+// plain completion and never the generic Error presentation.
 func TestAgentRunExitNonZeroValidStopIsCompletedWithProcessError(t *testing.T) {
 	fake := newFakeOpenCode(t)
 	a := agentTestApp(t, fake)
@@ -449,8 +466,8 @@ func TestAgentRunExitNonZeroValidStopIsCompletedWithProcessError(t *testing.T) {
 	stderr := "level=INFO message=exiting loop\nlevel=INFO message=disposing instance\n"
 	fake.invoke(t, stdout, stderr, 1, `{"info":{"id":"ses_x"},"messages":[{"info":{"role":"assistant","finish":"stop"},"parts":[{"type":"text","text":"final"}]}]}`)
 	events := runAgentRequest(t, a, ws, fake)
-	if got := terminalEventType(events); got != "error" {
-		t.Fatalf("terminal event = %q want error", got)
+	if got := terminalEventType(events); got != "warning" {
+		t.Fatalf("terminal event = %q want warning", got)
 	}
 	var runID string
 	for _, ev := range events {
@@ -474,12 +491,13 @@ func TestAgentRunExitNonZeroValidStopIsCompletedWithProcessError(t *testing.T) {
 }
 
 // TestAgentRunStdoutErrorForcesFailure verifies an authoritative stdout error
-// event overrides terminal-stop evidence.
+// event observed before valid completion is a genuine failure even when a
+// stop follows.
 func TestAgentRunStdoutErrorForcesFailure(t *testing.T) {
 	fake := newFakeOpenCode(t)
 	a := agentTestApp(t, fake)
 	ws := workspaceUnderRoot(t, a)
-	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n{\"type\":\"error\",\"sessionID\":\"ses_x\",\"error\":{\"name\":\"ProviderError\",\"data\":{\"message\":\"stream failed\"}}}\n"
+	stdout := "{\"type\":\"error\",\"sessionID\":\"ses_x\",\"error\":{\"name\":\"ProviderError\",\"data\":{\"message\":\"stream failed\"}}}\n{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
 	fake.invoke(t, stdout, "", 1, `{"info":{"id":"ses_x"},"messages":[]}`)
 	events := runAgentRequest(t, a, ws, fake)
 	var runID string
@@ -494,6 +512,102 @@ func TestAgentRunStdoutErrorForcesFailure(t *testing.T) {
 	d := runDiagnosticsFromDB(t, a, runID)
 	if d.StdoutError != "stream failed" {
 		t.Fatalf("stdoutError = %q want stream failed", d.StdoutError)
+	}
+}
+
+// TestAgentRunPostStopErrorIsNotFailure verifies a valid main-session
+// step_finish followed by a later wrapper error is post-completion evidence:
+// the produced answer is not failed and the raw error does not survive as a
+// separate Error block in the transcript.
+func TestAgentRunPostStopErrorIsNotFailure(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n{\"type\":\"error\",\"sessionID\":\"ses_x\",\"error\":{\"name\":\"LifecycleError\",\"data\":{\"message\":\"level=INFO message=exiting loop\\nlevel=INFO message=disposing instance\"}}}\n"
+	fake.invoke(t, stdout, "", 1, `{"info":{"id":"ses_x"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	if got := terminalEventType(events); got != "warning" {
+		t.Fatalf("terminal event = %q want warning", got)
+	}
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeCompletedWError) {
+		t.Fatalf("persisted state = %q want completed_with_process_error", state)
+	}
+	merged, err := a.loadConversationMerged("conv1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range merged {
+		if ev.Kind == "error" {
+			t.Fatalf("post-completion error survived as a raw Error block: %+v", ev)
+		}
+	}
+	d := runDiagnosticsFromDB(t, a, runID)
+	if d.Outcome != string(outcomeCompletedWError) {
+		t.Fatalf("diagnostics outcome = %q", d.Outcome)
+	}
+	if len(d.Warnings) == 0 || !strings.Contains(strings.Join(d.Warnings, " "), "exiting loop") {
+		t.Fatalf("post-completion error not retained as a warning: %+v", d.Warnings)
+	}
+}
+
+// TestAgentRunExit1NoValidStopFails verifies a nonzero exit without valid
+// completion evidence is a genuine failure, never a warning.
+func TestAgentRunExit1NoValidStopFails(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	stdout := "{\"type\":\"text\",\"sessionID\":\"ses_x\",\"part\":{\"type\":\"text\",\"text\":\"partial\"}}\n"
+	fake.invoke(t, stdout, "", 1, `{"info":{"id":"ses_x"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeFailed) {
+		t.Fatalf("exit 1 without valid stop state = %q want failed", state)
+	}
+}
+
+// TestAgentRunWarningSurvivesReload verifies a completed_with_process_error
+// terminal event is persisted as a warning and survives the conversation
+// reload path without degrading into a generic Error block or failed state.
+func TestAgentRunWarningSurvivesReload(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n{\"type\":\"error\",\"sessionID\":\"ses_x\",\"error\":{\"name\":\"LifecycleError\",\"data\":{\"message\":\"level=INFO message=exiting loop\"}}}\n"
+	fake.invoke(t, stdout, "", 1, `{"info":{"id":"ses_x"},"messages":[]}`)
+	runAgentRequest(t, a, ws, fake)
+	var state string
+	if err := a.db.QueryRow("SELECT state FROM conversations WHERE id=?", "conv1").Scan(&state); err != nil {
+		t.Fatalf("read conversation state: %v", err)
+	}
+	if state != string(outcomeCompletedWError) {
+		t.Fatalf("reload state = %q want completed_with_process_error", state)
+	}
+	merged, err := a.loadConversationMerged("conv1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundWarning := false
+	for _, ev := range merged {
+		if ev.Kind == "error" {
+			t.Fatalf("warning run reloaded as a raw Error block: %+v", ev)
+		}
+		if ev.Kind == "warning" {
+			foundWarning = true
+		}
+	}
+	if !foundWarning {
+		t.Fatal("warning terminal event missing after reload")
 	}
 }
 
