@@ -408,6 +408,11 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 			// post-completion error must never survive as a raw Error block.
 			kind, text, name := normalizedEvent(raw)
 			if kind != "" && kind != "error" {
+				// Redact configured credentials from every normalized event text
+				// (assistant, tool incl. todowrite output/errors, file) before
+				// persistence so the durable transcript never bypasses output
+				// sanitization.
+				text = a.redactSecrets(text)
 				if err := a.persistAgentRunEvent(runID, kind, text, name, seq, time.Now().UnixMilli()); err != nil {
 					persistFailed = true
 					persistErr = err.Error()
@@ -436,7 +441,11 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			rewriteImageURLs(raw, clientSession)
-			if err := writeEvent(w, flusher, "opencode", raw); err != nil {
+			// The live forwarded event obeys the same secret-redaction contract
+			// as the durable transcript, so a completed todowrite carrying the
+			// secret in state.input/state.output/errors never reaches the
+			// browser raw.
+			if err := writeEvent(w, flusher, "opencode", a.sanitizeAgentEvent(raw, 0)); err != nil {
 				deliveryErr = err
 			}
 		} else {
@@ -1682,6 +1691,37 @@ func (a *App) taskSnapshot(raw map[string]any) string {
 		return ""
 	}
 	return string(b)
+}
+
+// sanitizeAgentEvent recursively redacts configured credentials from every
+// string in an OpenCode event before it is forwarded to the browser, mirroring
+// the durable-transcript sanitization so no path can bypass output redaction.
+// Depth and cardinality limits keep untrusted payloads bounded.
+func (a *App) sanitizeAgentEvent(v any, depth int) any {
+	if depth > 32 {
+		return "[depth limit]"
+	}
+	switch x := v.(type) {
+	case string:
+		return a.redactSecrets(x)
+	case []any:
+		if len(x) > 1024 {
+			x = x[:1024]
+		}
+		out := make([]any, len(x))
+		for i := range x {
+			out[i] = a.sanitizeAgentEvent(x[i], depth+1)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			out[k] = a.sanitizeAgentEvent(val, depth+1)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 func normalizeTaskStatus(s string) string {

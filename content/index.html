@@ -7,6 +7,7 @@
 <div class="agent-body">
 <div id="feed" class="feed"><div class="empty"><span class="orb">C</span><strong>What do you want to build?</strong><span>Choose a workspace, then give Cortex a development task.</span></div></div>
 <button id="newActivity" class="new-activity" hidden type="button">New activity ↓</button>
+<button id="taskReopen" class="task-reopen" hidden type="button">Tasks</button>
 <aside id="taskPanel" class="task-panel" hidden><div class="task-head"><span>Tasks</span><span id="taskProgress" class="task-progress"></span><button id="taskToggle" class="task-toggle" type="button" title="Hide tasks">×</button></div><div id="taskList" class="task-list"></div></aside>
 </div>
 <div id="composerResize" class="composer-resize" title="Drag the border to resize prompt area"></div><form id="agentForm"><textarea id="prompt" placeholder="Implement, investigate, fix, test… · drop or paste images"></textarea><div id="attachments" class="attachments" hidden></div><div id="wsUnavailable" class="ws-unavailable" hidden></div><div id="migrationNotice" class="migration-notice" hidden></div><div class="compose-row"><button type="button" id="copy" class="secondary">Copy session</button><span id="activity" class="activity" hidden><i></i></span><button type="button" id="retryMigration" class="secondary" hidden>Retry import</button><button type="button" id="stop" class="secondary" hidden>Stop</button><button id="run">Run agent</button></div></form>

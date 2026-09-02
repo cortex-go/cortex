@@ -575,6 +575,69 @@ test('background task snapshot does not increment unread', async () => {
   if (run(ctx, "sessions['b'].unread") !== 1) throw new Error('real activity should increment unread');
 });
 
+// Per-session collapsed task panel: closing it survives subsequent events,
+// rerenders and tab switching; explicit reopen restores the latest snapshot.
+test('task panel close collapses per-session and events/rerender/tab do not reopen', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0},b:{id:'b',events:[],busy:false,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('panel should be open before close');
+  run(ctx, 'setTasksCollapsed(true)');
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('panel not hidden after close');
+  if (run(ctx, "sessions['a'].tasksCollapsed") !== true) throw new Error('collapsed flag not set');
+  if (run(ctx, "$('#taskReopen').hidden")) throw new Error('reopen badge should be visible');
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'opencode', data: { type: 'text', part: { type: 'text', text: 'hello' } } } });
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('a transcript event reopened the panel');
+  run(ctx, 'renderFeed()');
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('a rerender reopened the panel');
+  run(ctx, "activeId='b';renderAll()");
+  run(ctx, "activeId='a';renderAll()");
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('tab switching reopened the panel');
+  run(ctx, 'setTasksCollapsed(false)');
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('explicit reopen did not show the panel');
+  if (run(ctx, "$('#taskList').children.length") !== 1) throw new Error('reopen should render the snapshot');
+});
+
+// Task snapshots keep updating while collapsed and reopening shows the latest.
+test('task snapshots update while collapsed and reopen shows latest', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  run(ctx, 'setTasksCollapsed(true)');
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"one","status":"pending","priority":"high"},{"content":"two","status":"completed","priority":"low"}]' } } });
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('a later snapshot reopened the panel');
+  if (run(ctx, "sessions['a'].tasksCollapsed") !== true) throw new Error('collapsed preference lost');
+  run(ctx, 'setTasksCollapsed(false)');
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('panel did not reopen');
+  if (run(ctx, "$('#taskList').children.length") !== 2) throw new Error('latest snapshot rows = ' + run(ctx, "$('#taskList').children.length"));
+  if (run(ctx, "sessions['a'].tasksCollapsed") !== false) throw new Error('collapsed not cleared on reopen');
+});
+
+// An empty authoritative snapshot clears tasks even while collapsed.
+test('empty authoritative snapshot clears tasks while collapsed', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  run(ctx, 'setTasksCollapsed(true)');
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[]' } } });
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('panel not hidden after empty clear');
+  if (run(ctx, "$('#taskList').children.length") !== 0) throw new Error('tasks not cleared');
+  if (!run(ctx, "$('#taskReopen').hidden")) throw new Error('reopen badge should hide after clear');
+});
+
+// Synchronization must not reopen a collapsed task panel.
+test('synchronization preserves collapsed task panel', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: 'completed', currentRunId: 'run-1', events: [{ kind: 'task', text: '[{"content":"alpha","status":"pending","priority":"high"}]', name: '' }] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0,tasksCollapsed:true}};activeId='a';serverReady=true");
+  await run(ctx, 'syncServerConversations()');
+  if (run(ctx, "sessions['a'].tasksCollapsed") !== true) throw new Error('collapsed flag lost on sync');
+  run(ctx, 'renderFeed()');
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('sync reopened a collapsed panel');
+});
+
 (async function runAll() {
   let pass = 0, fail = 0;
   for (const { name, fn } of __tests) {

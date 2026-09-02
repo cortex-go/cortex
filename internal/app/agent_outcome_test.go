@@ -1367,26 +1367,28 @@ func TestAgentRunTodowriteStreamsTaskSnapshotAndToolEvent(t *testing.T) {
 	}
 }
 
-// TestAgentRunTaskSnapshotRedactsCredentials verifies task content is redacted
-// before the snapshot is marshalled, so the streamed and durable snapshots are
-// byte-identical, never expose a configured credential (including when the
-// credential is surrounded by JSON-sensitive quotes/backslashes), keep ordinary
-// content unchanged, remain valid JSON, and the raw forwarded tool event still
-// obeys the existing passthrough policy.
+// TestAgentRunTaskSnapshotRedactsCredentials verifies a realistic completed
+// todowrite event carrying the configured credential in both
+// state.input.todos[].content and state.output never exposes it in any
+// streamed event, any durable event, merged reload data, or the rendered task
+// snapshot. The streamed and durable task snapshots are byte-identical and
+// valid JSON; ordinary non-secret content is unchanged.
 func TestAgentRunTaskSnapshotRedactsCredentials(t *testing.T) {
 	fake := newFakeOpenCode(t)
 	a := agentTestApp(t, fake)
 	ws := workspaceUnderRoot(t, a)
 	key := "sk-test-secret-key-abcdef"
 	secretContent := `leaked ` + key + ` in a"b\c payload`
+	todoOutput := `[{"content":"` + key + `","status":"completed"}]`
 	raw := map[string]any{
 		"type": "tool_use", "sessionID": "ses_x",
 		"part": map[string]any{
 			"tool": "todowrite",
-			"state": map[string]any{"status": "completed", "input": map[string]any{"todos": []any{
-				map[string]any{"content": secretContent, "status": "pending", "priority": "high"},
-				map[string]any{"content": "ordinary text", "status": "pending", "priority": "low"},
-			}}},
+			"state": map[string]any{
+				"status": "completed",
+				"input":  map[string]any{"todos": []any{map[string]any{"content": secretContent, "status": "pending", "priority": "high"}, map[string]any{"content": "ordinary text", "status": "pending", "priority": "low"}}},
+				"output": todoOutput,
+			},
 		},
 	}
 	eventJSON, err := json.Marshal(raw)
@@ -1397,25 +1399,18 @@ func TestAgentRunTaskSnapshotRedactsCredentials(t *testing.T) {
 	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
 	events := runAgentRequest(t, a, ws, fake)
 	var streamed string
-	toolForwarded := false
 	for _, ev := range events {
-		switch ev["type"] {
-		case "task":
+		rawJSON, _ := json.Marshal(ev)
+		if strings.Contains(string(rawJSON), key) {
+			t.Fatalf("credential leaked in a streamed event: %s", rawJSON)
+		}
+		if ev["type"] == "task" {
 			d, _ := ev["data"].(map[string]any)
 			streamed, _ = d["snapshot"].(string)
-		case "opencode":
-			d, _ := ev["data"].(map[string]any)
-			p, _ := d["part"].(map[string]any)
-			if p["tool"] == "todowrite" {
-				toolForwarded = true
-			}
 		}
 	}
 	if streamed == "" {
 		t.Fatal("no streamed task snapshot")
-	}
-	if strings.Contains(streamed, key) {
-		t.Fatalf("credential leaked in streamed snapshot: %s", streamed)
 	}
 	var todos []map[string]string
 	if err := json.Unmarshal([]byte(streamed), &todos); err != nil {
@@ -1430,15 +1425,15 @@ func TestAgentRunTaskSnapshotRedactsCredentials(t *testing.T) {
 	if todos[1]["content"] != "ordinary text" {
 		t.Fatalf("non-secret content changed: %q", todos[1]["content"])
 	}
-	if !toolForwarded {
-		t.Fatal("raw todowrite tool event not forwarded")
-	}
 	merged, err := a.loadConversationMerged("conv1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var durable string
 	for _, ev := range merged {
+		if strings.Contains(ev.Text, key) {
+			t.Fatalf("credential leaked in a durable event: %+v", ev)
+		}
 		if ev.Kind == "task" {
 			durable = ev.Text
 		}
@@ -1446,11 +1441,13 @@ func TestAgentRunTaskSnapshotRedactsCredentials(t *testing.T) {
 	if durable == "" {
 		t.Fatal("no durable task event")
 	}
-	if strings.Contains(durable, key) {
-		t.Fatalf("credential leaked in durable snapshot: %s", durable)
-	}
 	if streamed != durable {
 		t.Fatalf("streamed and durable snapshots differ:\nstream=%s\ndurable=%s", streamed, durable)
+	}
+	// Merged reload data must be free of the credential and valid.
+	var todosReload []map[string]string
+	if err := json.Unmarshal([]byte(durable), &todosReload); err != nil {
+		t.Fatalf("durable snapshot not valid JSON: %v", err)
 	}
 }
 
