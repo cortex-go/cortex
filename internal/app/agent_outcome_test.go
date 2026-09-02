@@ -1249,6 +1249,8 @@ func TestAgentRunShutdownTimesOutAndLeavesStale(t *testing.T) {
 }
 
 func TestTaskSnapshotValidation(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
 	valid := map[string]any{"type": "tool_use", "part": map[string]any{
 		"tool": "todowrite",
 		"state": map[string]any{"input": map[string]any{"todos": []any{
@@ -1257,7 +1259,7 @@ func TestTaskSnapshotValidation(t *testing.T) {
 			map[string]any{"content": "third", "status": "completed", "priority": "medium"},
 		}}},
 	}}
-	snap := taskSnapshot(valid)
+	snap := a.taskSnapshot(valid)
 	if snap == "" {
 		t.Fatal("valid todowrite snapshot not extracted")
 	}
@@ -1271,7 +1273,7 @@ func TestTaskSnapshotValidation(t *testing.T) {
 
 	// Non-todowrite tool: no snapshot.
 	other := map[string]any{"type": "tool_use", "part": map[string]any{"tool": "bash", "state": map[string]any{"input": map[string]any{"command": "ls"}}}}
-	if got := taskSnapshot(other); got != "" {
+	if got := a.taskSnapshot(other); got != "" {
 		t.Fatal("non-todowrite produced a task snapshot")
 	}
 
@@ -1282,7 +1284,7 @@ func TestTaskSnapshotValidation(t *testing.T) {
 			map[string]any{"content": "x", "status": "weird", "priority": "urgent"},
 		}}},
 	}}
-	if got := taskSnapshot(unknown); got != "" {
+	if got := a.taskSnapshot(unknown); got != "" {
 		var todos2 []map[string]string
 		if err := json.Unmarshal([]byte(got), &todos2); err == nil && len(todos2) == 1 {
 			if todos2[0]["status"] != "pending" || todos2[0]["priority"] != "medium" {
@@ -1300,20 +1302,20 @@ func TestTaskSnapshotValidation(t *testing.T) {
 			map[string]any{"content": strings.Repeat("a", 600), "status": "pending"},
 		}}},
 	}}
-	if got := taskSnapshot(oversize); got != "" {
+	if got := a.taskSnapshot(oversize); got != "" {
 		t.Fatal("oversized content should be dropped")
 	}
 
 	// Malformed (todos not an array) returns empty.
 	malformed := map[string]any{"type": "tool_use", "part": map[string]any{"tool": "todowrite", "state": map[string]any{"input": map[string]any{"todos": "nope"}}}}
-	if got := taskSnapshot(malformed); got != "" {
+	if got := a.taskSnapshot(malformed); got != "" {
 		t.Fatal("malformed todowrite produced a snapshot")
 	}
 
 	// A valid empty todos array is an authoritative clear operation ("[]"),
 	// never an empty marker that is silently ignored.
 	empty := map[string]any{"type": "tool_use", "part": map[string]any{"tool": "todowrite", "state": map[string]any{"input": map[string]any{"todos": []any{}}}}}
-	if got := taskSnapshot(empty); got != "[]" {
+	if got := a.taskSnapshot(empty); got != "[]" {
 		t.Fatalf("valid empty todos = %q want []", got)
 	}
 }
@@ -1362,6 +1364,93 @@ func TestAgentRunTodowriteStreamsTaskSnapshotAndToolEvent(t *testing.T) {
 	}
 	if taskCount != 1 {
 		t.Fatalf("durable task snapshots = %d want 1", taskCount)
+	}
+}
+
+// TestAgentRunTaskSnapshotRedactsCredentials verifies task content is redacted
+// before the snapshot is marshalled, so the streamed and durable snapshots are
+// byte-identical, never expose a configured credential (including when the
+// credential is surrounded by JSON-sensitive quotes/backslashes), keep ordinary
+// content unchanged, remain valid JSON, and the raw forwarded tool event still
+// obeys the existing passthrough policy.
+func TestAgentRunTaskSnapshotRedactsCredentials(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	key := "sk-test-secret-key-abcdef"
+	secretContent := `leaked ` + key + ` in a"b\c payload`
+	raw := map[string]any{
+		"type": "tool_use", "sessionID": "ses_x",
+		"part": map[string]any{
+			"tool": "todowrite",
+			"state": map[string]any{"status": "completed", "input": map[string]any{"todos": []any{
+				map[string]any{"content": secretContent, "status": "pending", "priority": "high"},
+				map[string]any{"content": "ordinary text", "status": "pending", "priority": "low"},
+			}}},
+		},
+	}
+	eventJSON, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := string(eventJSON) + "\n{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var streamed string
+	toolForwarded := false
+	for _, ev := range events {
+		switch ev["type"] {
+		case "task":
+			d, _ := ev["data"].(map[string]any)
+			streamed, _ = d["snapshot"].(string)
+		case "opencode":
+			d, _ := ev["data"].(map[string]any)
+			p, _ := d["part"].(map[string]any)
+			if p["tool"] == "todowrite" {
+				toolForwarded = true
+			}
+		}
+	}
+	if streamed == "" {
+		t.Fatal("no streamed task snapshot")
+	}
+	if strings.Contains(streamed, key) {
+		t.Fatalf("credential leaked in streamed snapshot: %s", streamed)
+	}
+	var todos []map[string]string
+	if err := json.Unmarshal([]byte(streamed), &todos); err != nil {
+		t.Fatalf("redacted snapshot is not valid JSON: %v (%s)", err, streamed)
+	}
+	if len(todos) != 2 {
+		t.Fatalf("todos = %d want 2", len(todos))
+	}
+	if !strings.Contains(todos[0]["content"], "[redacted]") || strings.Contains(todos[0]["content"], key) {
+		t.Fatalf("credential not redacted: %q", todos[0]["content"])
+	}
+	if todos[1]["content"] != "ordinary text" {
+		t.Fatalf("non-secret content changed: %q", todos[1]["content"])
+	}
+	if !toolForwarded {
+		t.Fatal("raw todowrite tool event not forwarded")
+	}
+	merged, err := a.loadConversationMerged("conv1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var durable string
+	for _, ev := range merged {
+		if ev.Kind == "task" {
+			durable = ev.Text
+		}
+	}
+	if durable == "" {
+		t.Fatal("no durable task event")
+	}
+	if strings.Contains(durable, key) {
+		t.Fatalf("credential leaked in durable snapshot: %s", durable)
+	}
+	if streamed != durable {
+		t.Fatalf("streamed and durable snapshots differ:\nstream=%s\ndurable=%s", streamed, durable)
 	}
 }
 
