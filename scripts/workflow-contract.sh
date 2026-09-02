@@ -102,11 +102,16 @@ BEGIN {
   if (in_jobs) {
     if (content ~ /^permissions:/) { job_perms_seen=1; print "job-level permissions: block present (escalation risk)" > "/dev/stderr"; next }
     if (content ~ /^-[ \t]*uses:[ \t]*[^ \t]+/) {
-      ref=content; sub(/^-[ \t]*uses:[ \t]*/, "", ref); sub(/^.*@/, "", ref)
+      # Retain the complete uses: value (action identity plus pinned SHA) so a
+      # lookalike action (e.g. attacker/not-setup-go@<sha>) cannot masquerade
+      # as the pinned setup-go step by reusing its SHA.
+      full=content; sub(/^-[ \t]*uses:[ \t]*/, "", full)
+      ref=full; sub(/^.*@/, "", ref)
       uses_count++
       if (ref !~ /^[0-9a-fA-F]{40}$/) { bad=1; print "uses: reference is not a full 40-hex SHA: " content > "/dev/stderr" }
-      # The pinned setup-go step must be followed by go-version-file: go.mod.
-      if (index(ref, "0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32")>0) in_setupgo=1
+      # The go-version-file: go.mod contract applies only to the exact
+      # actions/setup-go action pinned to the immutable SHA.
+      if (full=="actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32") { in_setupgo=1 }
       else in_setupgo=0
       next
     }
