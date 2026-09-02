@@ -1,6 +1,11 @@
 name: Hardening contract
 
-on: [push, pull_request]
+# Read-only verification on every push to main and on pull requests. The only
+# permission is contents:read; nothing here builds a release or writes back.
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 permissions:
   contents: read
@@ -9,18 +14,52 @@ jobs:
   hardening:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # Pinned to immutable commit SHAs, consistent with repository policy.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
         with:
           go-version-file: go.mod
           cache: true
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
-      - run: go test ./...
-      - run: go test -race ./...
-      - run: go vet ./...
-      - run: go build -trimpath -o /tmp/cortex ./cmd/cortex
-      - run: node --check content/assets/js/script.js
-      - run: node tests/markdown-render-smoke.js
-      - run: tests/release-smoke.sh
+
+      - name: gofmt clean (maintained Go files)
+        run: |
+          fail=0
+          for f in $(git ls-files '*.go'); do
+            if [ -n "$(gofmt -l "$f")" ]; then
+              echo "gofmt: $f needs formatting"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
+      - name: go test -race
+        run: go test -race ./...
+      - name: go build -trimpath
+        run: go build -trimpath -o /tmp/cortex ./cmd/cortex
+      - name: node --check source JavaScript
+        run: node --check content/assets/js/script.js
+      - name: node --check generated JavaScript
+        run: node --check public/assets/js/script.js
+      - name: agent UX suite
+        run: node tests/agent-ux.test.js
+      - name: conversation-save suite
+        run: node tests/conversation-save.test.js
+      - name: markdown render smoke
+        run: node tests/markdown-render-smoke.js
+      - name: generated JS byte parity
+        run: diff -q content/assets/js/script.js public/assets/js/script.js
+      - name: generated CSS byte parity
+        run: diff -q content/assets/css/style.css public/assets/css/style.css
+      - name: release smoke
+        run: tests/release-smoke.sh
+      - name: git diff --check
+        run: git diff --check
+      - name: workflow contract
+        run: scripts/workflow-contract.sh
