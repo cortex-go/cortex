@@ -371,11 +371,17 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 					if typ == "step_finish" {
 						if reason, _ := raw["part"].(map[string]any)["reason"].(string); reason != "" {
 							ev.lastReason = reason
-							ev.stopObs = obs
-							// Valid-completion evidence is captured in the same
-							// observation sequence as errors so the classifier
-							// can order error-before-stop vs error-after-stop.
-							ev.stopSeq = run.state.nextSeq()
+							// stopObs/stopSeq are genuine completion evidence only
+							// for reason=="stop": non-terminal step_finish reasons
+							// must never be treated as valid completion by the
+							// error-ordering classifier.
+							if reason == "stop" {
+								ev.stopObs = obs
+								// Valid-completion evidence is captured in the same
+								// observation sequence as errors so the classifier
+								// can order error-before-stop vs error-after-stop.
+								ev.stopSeq = run.state.nextSeq()
+							}
 						}
 					}
 				}

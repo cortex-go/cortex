@@ -611,6 +611,75 @@ func TestAgentRunWarningSurvivesReload(t *testing.T) {
 	}
 }
 
+// TestAgentRunNonStopFinishErrorNoValidStopFailsWithErrorBlock verifies a
+// non-terminal step_finish is not completion evidence: an error after it with
+// no genuine stop still fails, and the genuine error remains in the durable
+// transcript (it is never suppressed as if it were post-completion).
+func TestAgentRunNonStopFinishErrorNoValidStopFailsWithErrorBlock(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"max_turns\"}}\n{\"type\":\"error\",\"sessionID\":\"ses_x\",\"error\":{\"data\":{\"message\":\"stream failed\"}}}\n"
+	fake.invoke(t, stdout, "", 1, `{"info":{"id":"ses_x"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeFailed) {
+		t.Fatalf("non-stop finish then error state = %q want failed", state)
+	}
+	merged, err := a.loadConversationMerged("conv1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundErr := false
+	for _, ev := range merged {
+		if ev.Kind == "error" && strings.Contains(ev.Text, "stream failed") {
+			foundErr = true
+		}
+	}
+	if !foundErr {
+		t.Fatal("genuine error was suppressed from the durable transcript")
+	}
+}
+
+// TestAgentRunNonStopFinishErrorThenStopFails verifies an error that precedes
+// a genuine stop is a failure even when a non-terminal step_finish appeared
+// before the error: only reason=="stop" is completion evidence.
+func TestAgentRunNonStopFinishErrorThenStopFails(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	stdout := "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"max_turns\"}}\n{\"type\":\"error\",\"sessionID\":\"ses_x\",\"error\":{\"data\":{\"message\":\"stream failed\"}}}\n{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 1, `{"info":{"id":"ses_x"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	var runID string
+	for _, ev := range events {
+		if id, _ := ev["data"].(map[string]any)["runID"].(string); id != "" {
+			runID = id
+		}
+	}
+	if state := runStateFromDB(t, a, runID); state != string(outcomeFailed) {
+		t.Fatalf("error before genuine stop state = %q want failed", state)
+	}
+	merged, err := a.loadConversationMerged("conv1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundErr := false
+	for _, ev := range merged {
+		if ev.Kind == "error" && strings.Contains(ev.Text, "stream failed") {
+			foundErr = true
+		}
+	}
+	if !foundErr {
+		t.Fatal("error before genuine stop suppressed from the durable transcript")
+	}
+}
+
 // TestAgentRunUnexpectedSignalIsFailed verifies a killed process with no local
 // cause is never presented as a user cancellation.
 func TestAgentRunUnexpectedSignalIsFailed(t *testing.T) {
