@@ -638,6 +638,62 @@ test('synchronization preserves collapsed task panel', async () => {
   if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('sync reopened a collapsed panel');
 });
 
+// Switching to an empty session clears the previous session's task panel and
+// reopen badge; switching back restores that session's correct state.
+test('switching to empty session clears stale task panel', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0},b:{id:'b',events:[],busy:false,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('panel should be visible for A');
+  run(ctx, "activeId='b';renderAll()");
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('A task panel remained on empty session B');
+  if (!run(ctx, "$('#taskReopen').hidden")) throw new Error('A reopen badge remained on empty session B');
+  run(ctx, "activeId='a';renderAll()");
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('switching back to A did not restore its task panel');
+});
+
+// Switching to an empty session clears a collapsed task panel's reopen badge too.
+test('switching to empty session clears collapsed reopen badge', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0},b:{id:'b',events:[],busy:false,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  run(ctx, 'setTasksCollapsed(true)');
+  if (run(ctx, "$('#taskReopen').hidden")) throw new Error('reopen badge should be visible for collapsed A');
+  run(ctx, "activeId='b';renderAll()");
+  if (!run(ctx, "$('#taskReopen').hidden")) throw new Error('A reopen badge remained on empty session B');
+  run(ctx, "activeId='a';renderAll()");
+  if (run(ctx, "$('#taskReopen').hidden")) throw new Error('switching back to A did not restore its reopen badge');
+});
+
+// Collapsed preference survives a reload (persist + reconstruct via loadSessions).
+test('collapsed task panel survives reload', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  run(ctx, 'setTasksCollapsed(true)');
+  const stored = ctx.localStorage.getItem('cortex.sessions.v1');
+  if (!stored || !stored.includes('tasksCollapsed')) throw new Error('tasksCollapsed not persisted locally');
+  run(ctx, 'loadSessions()');
+  if (run(ctx, "sessions['a'].tasksCollapsed") !== true) throw new Error('collapsed not restored on reload');
+  run(ctx, 'renderAll()');
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('collapsed panel reopened after reload');
+});
+
+// Reopening persists and survives reload too.
+test('reopened task panel survives reload', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  run(ctx, 'setTasksCollapsed(true)');
+  run(ctx, 'setTasksCollapsed(false)');
+  const stored = ctx.localStorage.getItem('cortex.sessions.v1');
+  if (!stored || !stored.includes('"tasksCollapsed":false')) throw new Error('reopen not persisted');
+  run(ctx, 'loadSessions()');
+  if (run(ctx, "sessions['a'].tasksCollapsed") !== false) throw new Error('open state not restored on reload');
+  run(ctx, 'renderAll()');
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('reopened panel hidden after reload');
+});
+
 (async function runAll() {
   let pass = 0, fail = 0;
   for (const { name, fn } of __tests) {
