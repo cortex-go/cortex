@@ -31,6 +31,12 @@ func newFakeOpenCode(t *testing.T) *fakeOpenCode {
 	t.Helper()
 	dir := t.TempDir()
 	f := &fakeOpenCode{dir: dir, path: filepath.Join(dir, "opencode")}
+	// Write a default executable immediately so exec.LookPath("opencode")
+	// succeeds in every environment (including CI with no host opencode).
+	// invoke rewrites the script for each scenario.
+	if err := os.WriteFile(f.path, []byte("#!/bin/bash\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return f
 }
