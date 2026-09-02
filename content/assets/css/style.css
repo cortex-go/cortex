@@ -37,6 +37,7 @@ main{display:block;min-height:0;overflow:hidden;background:#151716;padding:22px}
 *::-webkit-scrollbar-thumb{background:#46514b;border:3px solid #151817;border-radius:999px;min-height:44px}
 *::-webkit-scrollbar-thumb:hover{background:#59665f}
 *::-webkit-scrollbar-corner{background:#151817}
+.feed::-webkit-scrollbar{width:16px}
 
 /* Session menu, Warden-style composer resizing, and workspace hover polish. */
 .new-session-wrap{position:relative;display:flex}

@@ -485,6 +485,96 @@ test('real syncServerConversations preserves warning state after reload', async 
   if (!kinds.includes('warning')) throw new Error('warning kind missing on reload: ' + kinds);
 });
 
+// Live task pipeline: the real stream-consumption function opens the task
+// panel for a normalized task SSE event before terminal completion or reload.
+test('streamed task event opens the task panel immediately', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  const ev = { type: 'task', data: { snapshot: '[{"content":"alpha","status":"in_progress","priority":"high"},{"content":"beta","status":"pending","priority":"low"}]' } };
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: ev });
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('task panel did not open from streamed event');
+  const rows = run(ctx, "$('#taskList').children.length");
+  if (rows !== 2) throw new Error('task rows = ' + rows);
+});
+
+// Updating the todo list replaces the displayed snapshot (no accumulation).
+test('a later todowrite snapshot replaces the displayed list', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  const ev1 = { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } };
+  const ev2 = { type: 'task', data: { snapshot: '[{"content":"one","status":"pending","priority":"high"},{"content":"two","status":"completed","priority":"low"},{"content":"three","status":"pending","priority":"medium"}]' } };
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: ev1 });
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: ev2 });
+  const rows = run(ctx, "$('#taskList').children.length");
+  if (rows !== 3) throw new Error('replacement rows = ' + rows);
+});
+
+// A valid empty snapshot clears and hides the panel.
+test('valid empty todos snapshot clears and hides the panel', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('panel should be open before clear');
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[]' } } });
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('panel not hidden after clear');
+  const rows = run(ctx, "$('#taskList').children.length");
+  if (rows !== 0) throw new Error('task list not cleared: ' + rows);
+});
+
+// Malformed snapshot text never opens the panel.
+test('malformed task payload is ignored', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: 'not-json' } } });
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('malformed payload opened the panel');
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '{"a":1}' } } });
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('non-array payload opened the panel');
+});
+
+// Task events are excluded from transcript rendering.
+test('task events never render as transcript rows', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  if (run(ctx, "$('#feed').children.length") !== 0) throw new Error('task event leaked into the feed');
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'opencode', data: { type: 'tool_use', part: { tool: 'todowrite', state: { status: 'completed', input: { todos: [] } } } } } });
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'opencode', data: { type: 'text', part: { type: 'text', text: 'hello' } } } });
+  const rows = run(ctx, "$('#feed').children.length");
+  if (rows !== 2) throw new Error('transcript rows = ' + rows);
+  const hasTaskRow = run(ctx, "[...$('#feed').children].some(c=>String(c.className).includes('event task'))");
+  if (hasTaskRow) throw new Error('a task row was rendered in the feed');
+});
+
+// Reload restores the latest non-empty snapshot without rendering JSON rows.
+test('reload restores task snapshot without feed JSON rows', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: 'completed', currentRunId: 'run-1', events: [
+      { kind: 'assistant', text: 'answer', name: '' },
+      { kind: 'task', text: '[{"content":"alpha","status":"in_progress","priority":"high"}]', name: '' },
+    ] }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, 'sessions={};activeId="a";serverReady=true');
+  await run(ctx, 'syncServerConversations()');
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('task panel not restored on reload');
+  const rows = run(ctx, "$('#taskList').children.length");
+  if (rows !== 1) throw new Error('restored task rows = ' + rows);
+  const feedRows = run(ctx, "$('#feed').children.length");
+  if (feedRows !== 1) throw new Error('feed rows = ' + feedRows);
+  const hasTaskRow = run(ctx, "[...$('#feed').children].some(c=>String(c.className).includes('event task'))");
+  if (hasTaskRow) throw new Error('a task row was rendered after reload');
+});
+
+// Background-session task updates must not create a second unread transcript item.
+test('background task snapshot does not increment unread', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:false,followBottom:true,unread:0},b:{id:'b',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("b", sessions["b"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  if (run(ctx, "sessions['b'].unread") !== 0) throw new Error('task snapshot incremented unread: ' + run(ctx, "sessions['b'].unread"));
+  run(ctx, 'consumeAgentEvent("b", sessions["b"], EV, new Set())', { EV: { type: 'text', data: { type: 'text', part: { type: 'text', text: 'real activity' } } } });
+  if (run(ctx, "sessions['b'].unread") !== 1) throw new Error('real activity should increment unread');
+});
+
 (async function runAll() {
   let pass = 0, fail = 0;
   for (const { name, fn } of __tests) {

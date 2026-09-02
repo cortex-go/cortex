@@ -1309,6 +1309,60 @@ func TestTaskSnapshotValidation(t *testing.T) {
 	if got := taskSnapshot(malformed); got != "" {
 		t.Fatal("malformed todowrite produced a snapshot")
 	}
+
+	// A valid empty todos array is an authoritative clear operation ("[]"),
+	// never an empty marker that is silently ignored.
+	empty := map[string]any{"type": "tool_use", "part": map[string]any{"tool": "todowrite", "state": map[string]any{"input": map[string]any{"todos": []any{}}}}}
+	if got := taskSnapshot(empty); got != "[]" {
+		t.Fatalf("valid empty todos = %q want []", got)
+	}
+}
+
+// TestAgentRunTodowriteStreamsTaskSnapshotAndToolEvent verifies the live task
+// pipeline: a todowrite tool_use is persisted exactly once as a durable task
+// snapshot, streamed as a normalized server-owned task event, and the ordinary
+// tool event is still forwarded to the transcript.
+func TestAgentRunTodowriteStreamsTaskSnapshotAndToolEvent(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	todowrite := "{\"type\":\"tool_use\",\"sessionID\":\"ses_x\",\"part\":{\"tool\":\"todowrite\",\"state\":{\"status\":\"completed\",\"input\":{\"todos\":[{\"content\":\"alpha\",\"status\":\"in_progress\",\"priority\":\"high\"},{\"content\":\"beta\",\"status\":\"pending\",\"priority\":\"low\"}]}}}}\n"
+	stdout := todowrite + "{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n"
+	fake.invoke(t, stdout, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
+	events := runAgentRequest(t, a, ws, fake)
+	taskEvents := 0
+	toolStreamed := false
+	for _, ev := range events {
+		switch ev["type"] {
+		case "task":
+			taskEvents++
+		case "opencode":
+			d, _ := ev["data"].(map[string]any)
+			p, _ := d["part"].(map[string]any)
+			if p["tool"] == "todowrite" {
+				toolStreamed = true
+			}
+		}
+	}
+	if taskEvents != 1 {
+		t.Fatalf("streamed task events = %d want 1", taskEvents)
+	}
+	if !toolStreamed {
+		t.Fatal("ordinary todowrite tool event not streamed")
+	}
+	merged, err := a.loadConversationMerged("conv1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskCount := 0
+	for _, ev := range merged {
+		if ev.Kind == "task" {
+			taskCount++
+		}
+	}
+	if taskCount != 1 {
+		t.Fatalf("durable task snapshots = %d want 1", taskCount)
+	}
 }
 
 // --- fault-injection: terminal persistence must fail closed ---

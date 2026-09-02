@@ -420,7 +420,9 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 				seq++
 			}
 			// A valid todowrite snapshot is persisted as its own authoritative
-			// task event so the task panel restores after reload.
+			// task event so the task panel restores after reload, and streamed
+			// as a normalized server-owned task event so the live panel opens
+			// without waiting for terminal completion.
 			if tasks := taskSnapshot(raw); tasks != "" {
 				if err := a.persistAgentRunEvent(runID, "task", tasks, "", seq, time.Now().UnixMilli()); err != nil {
 					persistFailed = true
@@ -429,6 +431,9 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				seq++
+				if err := writeEvent(w, flusher, "task", map[string]any{"snapshot": tasks, "sessionID": sessionID}); err != nil {
+					deliveryErr = err
+				}
 			}
 			rewriteImageURLs(raw, clientSession)
 			if err := writeEvent(w, flusher, "opencode", raw); err != nil {
@@ -1638,6 +1643,12 @@ func taskSnapshot(raw map[string]any) string {
 	}
 	if len(items) > 100 {
 		items = items[:100]
+	}
+	// A valid todowrite with an empty todos list is an authoritative clear
+	// operation: it must reach the frontend so a stale panel is hidden rather
+	// than retained.
+	if len(items) == 0 {
+		return "[]"
 	}
 	out := make([]map[string]string, 0, len(items))
 	for _, it := range items {
