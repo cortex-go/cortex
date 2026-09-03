@@ -210,7 +210,7 @@ func TestBuildCortexUnit(t *testing.T) {
 	if strings.Contains(unit, "sh -c") {
 		t.Fatal("unit must not use a shell wrapper")
 	}
-	for _, want := range []string{`"--listen" "127.0.0.1:9000"`, `"--root" "/home/nick"`, `"--data" "/home/nick/.config/cortex"`, `"--public-origin" "https://cortex.example.com"`, `"--trust-proxy"`, `Environment=HOME=%h`, `Environment=GH_CONFIG_DIR="/home/nick/.config/gh"`, `# cortex-listen: 127.0.0.1:9000`, `# cortex-health: /api/health`, `WantedBy=default.target`} {
+	for _, want := range []string{`"--listen" "127.0.0.1:9000"`, `"--root" "/home/nick"`, `"--data" "/home/nick/.config/cortex"`, `"--public-origin" "https://cortex.example.com"`, `"--trust-proxy"`, `Environment=HOME=%h`, `Environment=PATH=%h/.opencode/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin`, `Environment=GH_CONFIG_DIR="/home/nick/.config/gh"`, `# cortex-listen: 127.0.0.1:9000`, `# cortex-health: /api/health`, `WantedBy=default.target`} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing %q\n%s", want, unit)
 		}

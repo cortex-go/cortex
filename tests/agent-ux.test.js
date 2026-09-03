@@ -838,6 +838,34 @@ test('a new run that fails before producing tasks keeps the list cleared', async
   if (latest !== '[]') throw new Error('failed run did not leave the authoritative empty snapshot: ' + latest);
   if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('panel reopened after a failed run');
   if (!run(ctx, "$('#taskButton').hidden")) throw new Error('Tasks control must stay hidden after a failed run');
+  if (run(ctx, "sessions['a'].busy")) throw new Error('a rejected run request must become terminal locally');
+  if (run(ctx, "sessions['a'].state") !== 'failed') throw new Error('a rejected run request must record failed state');
+  if (!run(ctx, "$('#stop').hidden")) throw new Error('Stop must hide when no agent process was started');
+});
+
+test('OpenCode preflight rejection does not leave an unstoppable running session', async () => {
+  const message = "OpenCode is not installed or not in Cortex's PATH";
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/run') return Promise.resolve({ ok: false, status: 503, statusText: 'Service Unavailable', text: async () => message });
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],busy:false,followBottom:true,unread:0}};activeId='a'");
+  await run(ctx, 'runAgent("do it")');
+  await settle(30);
+  if (run(ctx, "sessions['a'].busy")) throw new Error('OpenCode preflight rejection left the session busy');
+  if (run(ctx, "sessions['a'].state") !== 'failed') throw new Error('OpenCode preflight rejection did not set failed state');
+  if (!run(ctx, "$('#stop').hidden")) throw new Error('Stop remained visible without a server run');
+  const errors = run(ctx, "sessions['a'].events.filter(e=>e.kind==='error').map(e=>e.text)");
+  if (!errors.includes(message)) throw new Error('OpenCode rejection was not shown in the transcript');
+});
+
+test('running agent leaves prompt editable but disables submission', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],busy:true,followBottom:true,unread:0,draft:''}};activeId='a';renderSession()");
+  if (run(ctx, "$('#prompt').disabled")) throw new Error('prompt must remain editable during a run');
+  if (!run(ctx, "$('#run').disabled")) throw new Error('Run agent must remain disabled during a run');
+  run(ctx, "$('#prompt').value='next request'");
+  if (run(ctx, "$('#prompt').value") !== 'next request') throw new Error('draft could not be edited during a run');
 });
 
 test('a new run shows its own fresh task snapshot', async () => {

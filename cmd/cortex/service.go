@@ -558,6 +558,13 @@ func renderCortexUnitBody(exe string, opts serviceOptions) string {
 	b.WriteString("Restart=on-failure\n")
 	b.WriteString("RestartSec=3\n")
 	b.WriteString("Environment=HOME=%h\n")
+	// A systemd user service does not read the user's interactive shell
+	// profile. Include OpenCode's official per-user install directory and the
+	// usual per-user/system binary directories explicitly so the service sees
+	// the same separately-installed opencode binary after login or reboot.
+	// %h is intentionally left as a systemd specifier here (not escaped as a
+	// literal percent) and the value contains no whitespace requiring quoting.
+	b.WriteString("Environment=PATH=%h/.opencode/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n")
 	if opts.ghDir != "" {
 		b.WriteString("Environment=GH_CONFIG_DIR=" + systemdEnvValue(opts.ghDir) + "\n")
 	}

@@ -41,6 +41,9 @@ function flatText(node){
   return parts.join('');
 }
 const src=fs.readFileSync('content/assets/js/script.js','utf8');
+const page=fs.readFileSync('content/index.html','utf8');
+if(!page.includes('<textarea id="prompt"></textarea>'))throw new Error('prompt textarea must be empty');
+if(page.includes('Implement, investigate')||page.includes('drop or paste images'))throw new Error('prompt placeholder returned');
 
 // ---- Inline + block markdown rendering (also covers tool events) ----
 const ctx=load(src,'function isToolEventText','function renderFeed');
