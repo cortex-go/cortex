@@ -57,6 +57,16 @@ func (f *fakeOpenCode) invoke(t *testing.T, stdout, stderr string, exitCode int,
 		t.Fatal(err)
 	}
 	script := `#!/bin/bash
+# Record the working directory and argv only for the real run invocation
+# (which carries --dir), not for ` + "`opencode --version`" + ` diagnostics or
+# ` + "`opencode export`" + ` recovery, so a workspace test can prove where the
+# agent process actually executed.
+has_dir=0
+for a in "$@"; do [ "$a" = "--dir" ] && has_dir=1; done
+if [ "$has_dir" = "1" ]; then
+  pwd > "` + filepath.Join(f.dir, "record.pwd") + `"
+  printf '%s\n' "$@" > "` + filepath.Join(f.dir, "record.args") + `"
+fi
 if [ "$1" = "export" ]; then
   cat "` + filepath.Join(f.dir, "export.txt") + `"
   exit 0
@@ -2166,5 +2176,49 @@ func TestReplacementDoesNotRemoveClientAuthoredText(t *testing.T) {
 	}
 	if !foundWor || !foundHello {
 		t.Fatalf("assistant transcript = %+v should contain both client 'wor' and 'hello world'", assistant)
+	}
+}
+
+// TestWorkspaceLessRunExecutesInConfiguredRoot proves a workspace-less run is
+// accepted, executes inside the configured Cortex root, and keeps the explicit
+// empty "use default root" state in the conversation record so the browser and
+// SQLite agree that no specific workspace was selected.
+func TestWorkspaceLessRunExecutesInConfiguredRoot(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	fake.invoke(t, `{"type":"step_finish","sessionID":"ses_x","part":{"reason":"stop"}}`, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
+	a := agentTestApp(t, fake)
+	events := runAgentRequest(t, a, "", fake)
+	if got := terminalEventType(events); got != "done" {
+		t.Fatalf("expected a done terminal event, got %q", got)
+	}
+	pwdBytes, err := os.ReadFile(filepath.Join(fake.dir, "record.pwd"))
+	if err != nil {
+		t.Fatalf("fake opencode did not record its working directory: %v", err)
+	}
+	got := strings.TrimSpace(string(pwdBytes))
+	if got != a.root {
+		t.Fatalf("workspace-less run executed in %q, want the configured root %q", got, a.root)
+	}
+	var ws string
+	if err := a.db.QueryRow("SELECT workspace FROM conversations WHERE id='conv1'").Scan(&ws); err != nil || ws != "" {
+		t.Fatalf("default-root conversation workspace stored %q err=%v; want empty", ws, err)
+	}
+}
+
+// TestExplicitWorkspaceRunStoresResolvedPath verifies an explicitly selected
+// workspace still executes and is stored as its resolved absolute path, so the
+// default-root state only applies to genuinely workspace-less runs.
+func TestExplicitWorkspaceRunStoresResolvedPath(t *testing.T) {
+	fake := newFakeOpenCode(t)
+	fake.invoke(t, `{"type":"step_finish","sessionID":"ses_x","part":{"reason":"stop"}}`, "", 0, `{"info":{"id":"ses_x"},"messages":[]}`)
+	a := agentTestApp(t, fake)
+	ws := workspaceUnderRoot(t, a)
+	events := runAgentRequest(t, a, ws, fake)
+	if got := terminalEventType(events); got != "done" {
+		t.Fatalf("expected a done terminal event, got %q", got)
+	}
+	var stored string
+	if err := a.db.QueryRow("SELECT workspace FROM conversations WHERE id='conv1'").Scan(&stored); err != nil || stored != ws {
+		t.Fatalf("explicit workspace stored %q err=%v; want %q", stored, err, ws)
 	}
 }

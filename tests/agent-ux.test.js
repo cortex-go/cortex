@@ -78,6 +78,9 @@ function makeContext(fetchImpl) {
       setItem(k, v) { this._d[k] = String(v); },
       removeItem(k) { delete this._d[k]; },
     },
+    AbortController,
+    TextDecoder: require('util').TextDecoder,
+    TextEncoder: require('util').TextEncoder,
     setTimeout,
     clearTimeout,
     crypto: { randomUUID: () => 'id-' + Math.random().toString(36).slice(2) },
@@ -585,7 +588,8 @@ test('task panel close collapses per-session and events/rerender/tab do not reop
   run(ctx, 'setTasksCollapsed(true)');
   if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('panel not hidden after close');
   if (run(ctx, "sessions['a'].tasksCollapsed") !== true) throw new Error('collapsed flag not set');
-  if (run(ctx, "$('#taskReopen').hidden")) throw new Error('reopen badge should be visible');
+  if (run(ctx, "$('#taskButton').hidden")) throw new Error('Tasks control should be visible when collapsed');
+  if (run(ctx, "$('#taskButton').getAttribute('aria-expanded')") !== 'false') throw new Error('collapsed Tasks control must report aria-expanded=false');
   run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'opencode', data: { type: 'text', part: { type: 'text', text: 'hello' } } } });
   if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('a transcript event reopened the panel');
   run(ctx, 'renderFeed()');
@@ -622,7 +626,7 @@ test('empty authoritative snapshot clears tasks while collapsed', async () => {
   run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[]' } } });
   if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('panel not hidden after empty clear');
   if (run(ctx, "$('#taskList').children.length") !== 0) throw new Error('tasks not cleared');
-  if (!run(ctx, "$('#taskReopen').hidden")) throw new Error('reopen badge should hide after clear');
+  if (!run(ctx, "$('#taskButton').hidden")) throw new Error('Tasks control should hide after an empty clear');
 });
 
 // Synchronization must not reopen a collapsed task panel.
@@ -647,7 +651,7 @@ test('switching to empty session clears stale task panel', async () => {
   if (run(ctx, "$('#taskPanel').hidden")) throw new Error('panel should be visible for A');
   run(ctx, "activeId='b';renderAll()");
   if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('A task panel remained on empty session B');
-  if (!run(ctx, "$('#taskReopen').hidden")) throw new Error('A reopen badge remained on empty session B');
+  if (!run(ctx, "$('#taskButton').hidden")) throw new Error('A Tasks control remained on empty session B');
   run(ctx, "activeId='a';renderAll()");
   if (run(ctx, "$('#taskPanel').hidden")) throw new Error('switching back to A did not restore its task panel');
 });
@@ -658,11 +662,11 @@ test('switching to empty session clears collapsed reopen badge', async () => {
   run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0},b:{id:'b',events:[],busy:false,followBottom:true,unread:0}};activeId='a'");
   run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
   run(ctx, 'setTasksCollapsed(true)');
-  if (run(ctx, "$('#taskReopen').hidden")) throw new Error('reopen badge should be visible for collapsed A');
+  if (run(ctx, "$('#taskButton').hidden")) throw new Error('Tasks control should be visible for collapsed A');
   run(ctx, "activeId='b';renderAll()");
-  if (!run(ctx, "$('#taskReopen').hidden")) throw new Error('A reopen badge remained on empty session B');
+  if (!run(ctx, "$('#taskButton').hidden")) throw new Error('A Tasks control remained on empty session B');
   run(ctx, "activeId='a';renderAll()");
-  if (run(ctx, "$('#taskReopen').hidden")) throw new Error('switching back to A did not restore its reopen badge');
+  if (run(ctx, "$('#taskButton').hidden")) throw new Error('switching back to A did not restore its Tasks control');
 });
 
 // Collapsed preference survives a reload (persist + reconstruct via loadSessions).
@@ -694,6 +698,244 @@ test('reopened task panel survives reload', async () => {
   if (run(ctx, "sessions['a'].tasksCollapsed") !== false) throw new Error('open state not restored on reload');
   run(ctx, 'renderAll()');
   if (run(ctx, "$('#taskPanel').hidden")) throw new Error('reopened panel hidden after reload');
+});
+
+// streamResponse returns a fake fetch response whose body yields the given
+// NDJSON lines, so runAgent can be driven through the real streaming loop.
+function streamResponse(lines) {
+  let i = 0;
+  const enc = new TextEncoder();
+  return {
+    ok: true,
+    status: 200,
+    body: {
+      getReader: () => ({
+        read: async () => (i < lines.length ? { value: enc.encode(lines[i++] + '\n'), done: false } : { value: undefined, done: true }),
+      }),
+    },
+    text: async () => '',
+  };
+}
+
+// --- UX: a new run clears the previous run's task list. ---
+
+test('new run clears an open task list from the previous run', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/run') return Promise.resolve(streamResponse(['{"type":"run","data":{"runID":"run-2"}}', '{"type":"done","data":{"outcome":"completed"}}']));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],busy:false,followBottom:true,unread:0,currentRunId:'run-1'}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"in_progress","priority":"high"}]' } } });
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('task panel should be open before the new run');
+  await run(ctx, 'runAgent("do it")');
+  await settle(30);
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('task panel not cleared when a new run starts');
+  if (!run(ctx, "$('#taskButton').hidden")) throw new Error('Tasks control must hide until the new run emits tasks');
+  const latest = run(ctx, "sessions['a'].events.filter(e=>e.kind==='task').pop().text");
+  if (latest !== '[]') throw new Error('no authoritative empty snapshot appended: ' + latest);
+  if (run(ctx, "sessions['a'].events.filter(e=>e.kind==='task').length") < 2) throw new Error('transcript history must not be deleted');
+});
+
+test('new run clears a collapsed task list and its preference', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/run') return Promise.resolve(streamResponse(['{"type":"run","data":{"runID":"run-2"}}', '{"type":"done","data":{"outcome":"completed"}}']));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],busy:false,followBottom:true,unread:0,currentRunId:'run-1'}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  run(ctx, 'setTasksCollapsed(true)');
+  if (run(ctx, "sessions['a'].tasksCollapsed") !== true) throw new Error('collapsed not set');
+  await run(ctx, 'runAgent("do it")');
+  await settle(30);
+  if (run(ctx, "sessions['a'].tasksCollapsed") !== false) throw new Error('collapsed preference not cleared for the new run');
+  if (run(ctx, "uiPrefs.collapsed['a']") === true) throw new Error('collapsed UI preference not cleared for the new run');
+});
+
+test('a new run that fails before producing tasks keeps the list cleared', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/run') return Promise.resolve({ ok: false, status: 500, text: async () => 'boom' });
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],busy:false,followBottom:true,unread:0,currentRunId:'run-1'}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  await run(ctx, 'runAgent("do it")');
+  await settle(30);
+  const latest = run(ctx, "sessions['a'].events.filter(e=>e.kind==='task').pop().text");
+  if (latest !== '[]') throw new Error('failed run did not leave the authoritative empty snapshot: ' + latest);
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('panel reopened after a failed run');
+  if (!run(ctx, "$('#taskButton').hidden")) throw new Error('Tasks control must stay hidden after a failed run');
+});
+
+test('a new run shows its own fresh task snapshot', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/run') return Promise.resolve(streamResponse([
+      '{"type":"run","data":{"runID":"run-3"}}',
+      '{"type":"task","data":{"snapshot":"[{\\"content\\":\\"fresh\\",\\"status\\":\\"in_progress\\",\\"priority\\":\\"high\\"}]"}}',
+      '{"type":"done","data":{"outcome":"completed"}}',
+    ]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],busy:false,followBottom:true,unread:0,currentRunId:'run-1'}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"old","status":"pending","priority":"high"}]' } } });
+  await run(ctx, 'runAgent("do it")');
+  await settle(30);
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('fresh snapshot did not open the panel');
+  const latest = run(ctx, "sessions['a'].events.filter(e=>e.kind==='task').pop().text");
+  if (!latest.includes('fresh')) throw new Error('fresh snapshot not applied: ' + latest);
+  if (run(ctx, "$('#taskButton').getAttribute('aria-expanded')") !== 'true') throw new Error('open panel must report aria-expanded=true');
+});
+
+test('background-session task snapshots do not affect the active session list', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:false,followBottom:true,unread:0},b:{id:'b',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'renderAll()');
+  run(ctx, 'consumeAgentEvent("b", sessions["b"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"beta","status":"pending","priority":"high"}]' } } });
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('background task opened the active session panel');
+  if (run(ctx, "$('#taskList').children.length") !== 0) throw new Error('background tasks leaked into the active list');
+  if (!run(ctx, "$('#taskButton').hidden")) throw new Error('Tasks control must stay hidden for a session with no snapshot');
+});
+
+test('stale task events from an older run do not repopulate a newer run', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'resetTaskStateForNewRun("a")');
+  run(ctx, "sessions['a'].currentRunId='run-2'");
+  // A stale task event from the superseded run-1 arrives late.
+  run(ctx, 'addEvent("a","task","[{\\"content\\":\\"old run\\",\\"status\\":\\"pending\\"}]","",{runID:"run-1"})');
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('a stale old-run task event reopened the newer run panel');
+  if (!run(ctx, "$('#taskButton').hidden")) throw new Error('stale events must not reveal the Tasks control');
+  const latest = run(ctx, "(latestTaskEvent(sessions['a'])||{}).text");
+  if (latest !== '[]') throw new Error('stale event must not become the authoritative snapshot: ' + latest);
+});
+
+// --- UX: unsent prompt drafts and attachments are session-specific. ---
+
+test('unsent prompts are session-specific across tab switches', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:'',attachments:[]},c:{id:'c',workspace:'/w',events:[],createdAt:3,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `$('#prompt').value='draft A'`);
+  run(ctx, 'setActiveSession("b")');
+  if (run(ctx, `$('#prompt').value`) !== '') throw new Error('B must start with an empty draft');
+  run(ctx, `$('#prompt').value='draft B'`);
+  run(ctx, 'setActiveSession("c")');
+  run(ctx, `$('#prompt').value='draft C'`);
+  run(ctx, 'setActiveSession("a")');
+  if (run(ctx, `$('#prompt').value`) !== 'draft A') throw new Error('A draft not restored: ' + run(ctx, `$('#prompt').value`));
+  run(ctx, 'setActiveSession("b")');
+  if (run(ctx, `$('#prompt').value`) !== 'draft B') throw new Error('B draft not restored');
+  run(ctx, 'setActiveSession("c")');
+  if (run(ctx, `$('#prompt').value`) !== 'draft C') throw new Error('C draft not restored');
+  run(ctx, 'setActiveSession("a")');
+  if (run(ctx, `$('#prompt').value`) !== 'draft A') throw new Error('A draft not restored on switch back');
+  const ui = run(ctx, `localStorage.getItem('cortex.ui.v1')`);
+  if (ui && ui.includes('draft')) throw new Error('draft leaked into browser storage');
+});
+
+test('submitting a prompt clears only the submitted session draft', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/agent/run') return Promise.resolve(streamResponse(['{"type":"run","data":{"runID":"r1"}}', '{"type":"done","data":{"outcome":"completed"}}']));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'unsent A',attachments:[]},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:'unsent B',attachments:[]}};activeId='a'");
+  run(ctx, `$('#prompt').value='unsent A'`);
+  run(ctx, 'setActiveSession("b")');
+  run(ctx, 'setActiveSession("a")');
+  if (run(ctx, "sessions['a'].draft") !== 'unsent A') throw new Error('draft A not captured');
+  if (run(ctx, "sessions['b'].draft") !== 'unsent B') throw new Error('draft B must be untouched');
+  run(ctx, '$("#agentForm").onsubmit({preventDefault(){}})');
+  await settle(40);
+  if (run(ctx, "sessions['a'].draft") !== '') throw new Error('submitting must clear only the submitted session draft');
+  if (run(ctx, "sessions['b'].draft") !== 'unsent B') throw new Error('another session draft was cleared by a submit');
+});
+
+test('closing a session removes its transient draft', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'unsent A'},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:''}};activeId='a'");
+  run(ctx, `$('#prompt').value='unsent A'`);
+  await run(ctx, 'closeSession("a")');
+  if (run(ctx, `$('#prompt').value`) !== '') throw new Error('closing the active session left its draft in the composer');
+  const archived = run(ctx, `closedSessions.find(s=>s.id==='a')`);
+  if (archived && archived.draft) throw new Error('draft persisted in the archived record');
+});
+
+test('image attachments stay with their session', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `attachments.push({id:'img1',name:'a.png',dataUrl:'data:image/png;base64,AAAA',thumb:'data:image/png;base64,BBBB',size:1})`);
+  run(ctx, 'setActiveSession("b")');
+  if (run(ctx, `attachments.length`) !== 0) throw new Error('attachments followed the user into session B');
+  if (run(ctx, `sessions['a'].attachments.length`) !== 1) throw new Error('attachments not retained on session A');
+  run(ctx, 'setActiveSession("a")');
+  if (run(ctx, `attachments.length`) !== 1) throw new Error('attachments not restored for session A');
+  if (run(ctx, `attachments[0].id`) !== 'img1') throw new Error('wrong attachment restored');
+});
+
+// --- UX: Tasks control in the composer row. ---
+
+test('Tasks control toggles the task panel and updates aria-expanded', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('panel should be open');
+  if (run(ctx, "$('#taskButton').getAttribute('aria-expanded')") !== 'true') throw new Error('open panel must report aria-expanded=true');
+  run(ctx, `$('#taskButton').onclick()`);
+  if (!run(ctx, "$('#taskPanel').hidden")) throw new Error('toggle did not close the panel');
+  if (run(ctx, "$('#taskButton').getAttribute('aria-expanded')") !== 'false') throw new Error('closed panel must report aria-expanded=false');
+  run(ctx, `$('#taskButton').onclick()`);
+  if (run(ctx, "$('#taskPanel').hidden")) throw new Error('toggle did not reopen the panel');
+  if (run(ctx, "$('#taskButton').getAttribute('aria-expanded')") !== 'true') throw new Error('reopened panel must report aria-expanded=true');
+});
+
+test('switching sessions updates the Tasks control for the selected session', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',events:[],busy:false,followBottom:true,unread:0},b:{id:'b',events:[],busy:false,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  if (run(ctx, "$('#taskButton').hidden")) throw new Error('A with tasks must show the Tasks control');
+  run(ctx, 'setActiveSession("b")');
+  run(ctx, 'renderAll()');
+  if (!run(ctx, "$('#taskButton').hidden")) throw new Error('B without tasks must hide the Tasks control');
+  run(ctx, 'setActiveSession("a")');
+  run(ctx, 'renderAll()');
+  if (run(ctx, "$('#taskButton').hidden")) throw new Error('A Tasks control must return when switching back');
+});
+
+// --- UX: workspace-less runs use the configured default root. ---
+
+test('a workspace-less session can run against the default root', async () => {
+  let sent = null;
+  const ctx = loadContext((url, opt) => {
+    if (url === '/api/agent/run') {
+      sent = JSON.parse(opt.body);
+      return Promise.resolve(streamResponse(['{"type":"run","data":{"runID":"r1"}}', '{"type":"done","data":{"outcome":"completed"}}']));
+    }
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'',events:[],busy:false,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'renderAll()');
+  if (run(ctx, "$('#run').disabled")) throw new Error('Run must be enabled for a workspace-less session');
+  if (run(ctx, "$('#workspaceLabel').textContent") !== 'Default workspace') throw new Error('label must read Default workspace');
+  await run(ctx, 'runAgent("do it")');
+  await settle(40);
+  if (!sent || sent.workspace !== '') throw new Error('workspace-less run must submit an empty workspace');
+});
+
+test('an unavailable explicitly selected workspace keeps Run disabled', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/gone',workspaceStatus:'missing',events:[],busy:false,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'renderAll()');
+  if (!run(ctx, "$('#run').disabled")) throw new Error('Run must stay disabled for an unavailable workspace');
+});
+
+test('reload restores a consistent default-workspace presentation', async () => {
+  const ctx = loadContext((url) => {
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', workspace: '', workspaceStatus: 'available', state: 'completed', archivedAt: 0, events: [{ kind: 'user', text: 'hi', name: '' }], createdAt: 1, updatedAt: 2 }]));
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={};activeId='';serverReady=true");
+  await run(ctx, 'syncServerConversations()');
+  if (run(ctx, "sessions['a'].workspace") !== '') throw new Error('server-stored empty workspace must stay the default-root state');
+  if (run(ctx, "$('#workspaceLabel').textContent") !== 'Default workspace') throw new Error('default workspace label not restored');
+  if (run(ctx, "$('#run').disabled")) throw new Error('Run must be enabled after restoring a default-workspace session');
 });
 
 (async function runAll() {

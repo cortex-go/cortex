@@ -8,7 +8,11 @@ function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');se
 async function api(url,opt={}){opt={...opt,headers:{...(opt.headers||{})}};const method=(opt.method||'GET').toUpperCase();if(!['GET','HEAD','OPTIONS'].includes(method)&&authState?.csrf)opt.headers['X-Cortex-CSRF']=authState.csrf;const r=await fetch(url,opt);if(!r.ok)throw Error((await r.text()).trim()||r.statusText);return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
 function sid(){return crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)}
 function sessionTitle(s){if(s.title)return s.title;if(s.workspace)return s.workspace.split('/').filter(Boolean).pop()||s.workspace;return 'New session'}
-function sessionSafe(s){return{id:s.id,workspace:s.workspace||'',workspaceStatus:s.workspaceStatus||'',title:s.title||'',provider:s.provider||'',model:s.model||'',openCodeSession:s.openCodeSession||'',currentRunId:s.currentRunId||'',state:s.busy?'running':(s.state||'idle'),createdAt:s.createdAt||Date.now(),updatedAt:Date.now(),archivedAt:s.archivedAt||s.closedAt||0,events:s.events||[],tasksCollapsed:!!s.tasksCollapsed}}
+// serverEvents returns the transcript without transient, in-memory-only fields
+// (the run identity used for live task run-scoping). The server conversation
+// endpoint uses a strict decoder that rejects unknown event fields.
+function serverEvents(s){return (s.events||[]).map(e=>{const{runID,...rest}=e;return rest})}
+function sessionSafe(s){return{id:s.id,workspace:s.workspace||'',workspaceStatus:s.workspaceStatus||'',title:s.title||'',provider:s.provider||'',model:s.model||'',openCodeSession:s.openCodeSession||'',currentRunId:s.currentRunId||'',state:s.busy?'running':(s.state||'idle'),createdAt:s.createdAt||Date.now(),updatedAt:Date.now(),archivedAt:s.archivedAt||s.closedAt||0,events:serverEvents(s),tasksCollapsed:!!s.tasksCollapsed}}
 // sessionServerSafe is the browser-local UI view minus the task-panel collapsed
 // preference, which is intentionally local-only and must not be sent to the
 // server conversation endpoint (the Go decoder rejects unknown fields).
@@ -53,11 +57,11 @@ function loadSessions(){
 }
 function newSession(workspace='',render=true){
 	if(Object.keys(sessions).length>=32){toast('Close a session before opening another.');return null}
-  const id=sid();sessions[id]={id,workspace,title:'',openCodeSession:'',events:[],createdAt:Date.now(),busy:false,abort:null,followBottom:true,unread:0};activeId=id;saveSessions();saveSessionToServer(id);
+  const id=sid();sessions[id]={id,workspace,title:'',openCodeSession:'',events:[],createdAt:Date.now(),busy:false,abort:null,followBottom:true,unread:0,draft:'',attachments:[]};setActiveSession(id);saveSessions();saveSessionToServer(id);
   if(render)renderAll();
   return sessions[id]
 }
-function newSessionSameWorkspace(){const workspace=active()?.workspace||'';newSession(workspace);hideSessionMenu();if(!workspace)setTimeout(openWorkspacePicker,0)}
+function newSessionSameWorkspace(){const workspace=active()?.workspace||'';newSession(workspace);hideSessionMenu()}
 function newWorkspaceSession(){newSession('');hideSessionMenu();setTimeout(openWorkspacePicker,0)}
 async function closeSession(id){
   const s=sessions[id];if(!s)return;
@@ -77,24 +81,40 @@ async function closeSession(id){
   const fallbackWorkspace=s.workspace||'';
   delete sessions[id];
   if(!Object.keys(sessions).length){newSession(fallbackWorkspace,false)}
-  if(activeId===id)activeId=Object.keys(sessions)[0];
+  if(activeId===id){activeId=Object.keys(sessions)[0];setActiveSession(activeId,true)}
   saveSessions();saveSessionToServer(id);renderAll()
 }
 function restoreSession(id){
   const i=closedSessions.findIndex(x=>x.id===id);if(i<0)return;
   const restored=closedSessions.splice(i,1)[0];
   sessions[id]={...restored,busy:false,abort:null,archivedAt:0};delete sessions[id].closedAt;
-  activeId=id;saveSessions();saveSessionToServer(id);hideSessionMenu();renderAll()
+  setActiveSession(id);saveSessions();saveSessionToServer(id);hideSessionMenu();renderAll()
 }
 function active(){return sessions[activeId]}
-function renderTabs(){const box=$('#sessionTabs');box.innerHTML='';for(const s of Object.values(sessions)){const b=document.createElement('button');b.className='session-tab'+(s.id===activeId?' active':'');b.dataset.sessionId=s.id;const title=document.createElement('span');title.className='tab-title';title.textContent=sessionTitle(s);const spinner=document.createElement('span');spinner.className='tab-spinner'+(s.busy?'':' hidden');spinner.setAttribute('role','status');spinner.setAttribute('aria-label','Agent running');b.append(spinner,title);if(s.unread){const dot=document.createElement('span');dot.className='tab-unread';dot.textContent='●';dot.title=s.unread+' unseen events';b.append(dot)}const x=document.createElement('span');x.className='tab-close';x.textContent='×';x.onclick=e=>{e.stopPropagation();closeSession(s.id)};b.append(x);b.onclick=()=>{activeId=s.id;s.unread=0;saveUiPrefs();renderAll()};box.append(b)}}
+// setActiveSession makes id the active session and applies that session's
+// transient composer state: its unsent prompt draft and pending image
+// attachments. The previous session's draft and attachments are captured into
+// that session first, so no text or image crosses session boundaries. Drafts
+// and attachments are in-memory only and are never persisted to localStorage
+// or the server conversation record. The discard flag drops the leaving
+// session's composer state (used when archiving it).
+function setActiveSession(id,discard){
+  const prev=activeId&&sessions[activeId];
+  if(prev&&prev.id!==id&&!discard){prev.draft=$('#prompt').value;prev.attachments=attachments}
+  activeId=id;
+  const s=sessions[id];
+  attachments=s&&Array.isArray(s.attachments)?s.attachments:[];
+  $('#prompt').value=s&&typeof s.draft==='string'?s.draft:'';
+  renderAttachments()
+}
+function renderTabs(){const box=$('#sessionTabs');box.innerHTML='';for(const s of Object.values(sessions)){const b=document.createElement('button');b.className='session-tab'+(s.id===activeId?' active':'');b.dataset.sessionId=s.id;const title=document.createElement('span');title.className='tab-title';title.textContent=sessionTitle(s);const spinner=document.createElement('span');spinner.className='tab-spinner'+(s.busy?'':' hidden');spinner.setAttribute('role','status');spinner.setAttribute('aria-label','Agent running');b.append(spinner,title);if(s.unread){const dot=document.createElement('span');dot.className='tab-unread';dot.textContent='●';dot.title=s.unread+' unseen events';b.append(dot)}const x=document.createElement('span');x.className='tab-close';x.textContent='×';x.onclick=e=>{e.stopPropagation();closeSession(s.id)};b.append(x);b.onclick=()=>{setActiveSession(s.id);s.unread=0;saveUiPrefs();renderAll()};box.append(b)}}
 function renderRestoreSessions(){
   const box=$('#restoreSessions');box.innerHTML='';
   $('#restoreDivider').hidden=!closedSessions.length;
   for(const s of closedSessions.slice(0,8)){
     const b=document.createElement('button');b.type='button';b.className='restore-session';
     const title=document.createElement('strong');title.textContent='Restore '+sessionTitle(s);
-    const meta=document.createElement('span');meta.textContent=s.workspace||'No workspace';
+    const meta=document.createElement('span');meta.textContent=s.workspace||'Default workspace';
     b.append(title,meta);b.onclick=()=>restoreSession(s.id);box.append(b)
   }
 }
@@ -165,9 +185,26 @@ function technicalDetailsNode(runID){const wrap=document.createElement('details'
 function nearBottom(box){if(!box)return true;return box.scrollHeight-box.scrollTop-box.clientHeight<40}
 function followIfNeeded(s,box){if(!box)return;if(!s.followBottom&&!nearBottom(box)){return}box.scrollTop=box.scrollHeight;s.followBottom=true;$('#newActivity').hidden=true}
 function updateNewActivity(s){const box=$('#feed');if(!box)return;if(nearBottom(box)){box.scrollTop=box.scrollHeight;s.followBottom=true;$('#newActivity').hidden=true}else if(!$('#newActivity')?.hidden&&!s.followBottom){/* already shown */}}
-function renderFeed(){const s=active(),box=$('#feed');const wasNear=nearBottom(box);box.innerHTML='';if(!s.events.length){box.innerHTML='<div class="empty"><span class="orb">C</span><strong>What do you want to build?</strong><span>Choose a workspace, then give Cortex a development task.</span></div>';$('#newActivity').hidden=true;if($('#taskPanel')){$('#taskPanel').hidden=true}if($('#taskReopen')){$('#taskReopen').hidden=true}return}for(const ev of s.events){if(ev.kind==='task')continue;box.append(eventNode(ev))}if(wasNear){box.scrollTop=box.scrollHeight;s.followBottom=true;$('#newActivity').hidden=true}else if(s.followBottom){box.scrollTop=box.scrollHeight}renderTaskPanel(s);updateNewActivity(s)}// sessionSafe persists run state and current run id for the tab indicator.
-function renderTaskPanel(s){const panel=$('#taskPanel');if(!panel)return;const list=$('#taskList');const reopen=$('#taskReopen');const latest=[...s.events].reverse().find(e=>e.kind==='task');if(!latest){list.innerHTML='';panel.hidden=true;if(reopen)reopen.hidden=true;return}let todos=[];try{todos=JSON.parse(latest.text||'[]')}catch{todos=null}if(!Array.isArray(todos)){panel.hidden=true;if(reopen)reopen.hidden=true;return}if(!todos.length){list.innerHTML='';$('#taskProgress').textContent='0 of 0 completed';panel.hidden=true;if(reopen)reopen.hidden=true;return}if(s.tasksCollapsed){panel.hidden=true;if(reopen)reopen.hidden=false;return}panel.hidden=false;if(reopen)reopen.hidden=true;list.innerHTML='';const done=todos.filter(t=>t.status==='completed').length;const order={in_progress:0,pending:1,completed:2};const sorted=[...todos].sort((a,b)=>(order[a.status]??3)-(order[b.status]??3));for(const t of sorted){const row=document.createElement('div');row.className='task-row '+t.status;const mark=document.createElement('span');mark.className='task-mark';mark.textContent=t.status==='completed'?'✓':t.status==='in_progress'?'●':'·';mark.setAttribute('aria-hidden','true');const label=document.createElement('span');label.className='task-label';label.textContent=t.content;row.append(mark,label);list.append(row)}$('#taskProgress').textContent=`${done} of ${todos.length} completed`}
-function renderSession(){const s=active();$('#workspaceLabel').textContent=s.workspace||'Choose workspace';$('#run').disabled=s.busy||!s.workspace||workspaceUnavailable(s);$('#prompt').disabled=s.busy;$('#stop').hidden=!s.busy;$('#activity').hidden=!s.busy;$('#wsUnavailable').hidden=!workspaceUnavailable(s);$('#wsUnavailable').textContent=workspaceUnavailable(s)?('Workspace unavailable ('+s.workspaceStatus+') — choose a replacement to run.'):'';renderFeed()}
+function renderFeed(){const s=active(),box=$('#feed');const wasNear=nearBottom(box);box.innerHTML='';if(!s.events.length){box.innerHTML='<div class="empty"><span class="orb">C</span><strong>What do you want to build?</strong><span>Give Cortex a development task. Run uses the configured root until you choose a workspace.</span></div>';$('#newActivity').hidden=true;if($('#taskPanel')){$('#taskPanel').hidden=true}if($('#taskButton')){$('#taskButton').hidden=true}return}for(const ev of s.events){if(ev.kind==='task')continue;box.append(eventNode(ev))}if(wasNear){box.scrollTop=box.scrollHeight;s.followBottom=true;$('#newActivity').hidden=true}else if(s.followBottom){box.scrollTop=box.scrollHeight}renderTaskPanel(s);updateNewActivity(s)}
+// latestTaskEvent returns the authoritative current task snapshot for a
+// session: the latest durable task event that belongs to the session's current
+// run (an untagged event, or one whose run matches). While a new run's identity
+// is still unknown, only the untagged empty reset snapshot is accepted, so task
+// events from a different or superseded run can never reopen or repopulate a
+// newer run's list.
+function latestTaskEvent(s){
+  const currentRun=s.currentRunId||s.runID||'';
+  const events=s.events||[];
+  for(let i=events.length-1;i>=0;i--){
+    const e=events[i];if(e.kind!=='task')continue;
+    const r=e.runID||'';
+    if(currentRun){if(r&&r!==currentRun)continue}else if(r){continue}
+    return e
+  }
+  return null
+}
+function renderTaskPanel(s){const panel=$('#taskPanel');if(!panel)return;const list=$('#taskList');const btn=$('#taskButton');const latest=latestTaskEvent(s);if(!latest){list.innerHTML='';panel.hidden=true;if(btn)btn.hidden=true;return}let todos=[];try{todos=JSON.parse(latest.text||'[]')}catch{todos=null}if(!Array.isArray(todos)||!todos.length){list.innerHTML='';$('#taskProgress').textContent='0 of 0 completed';panel.hidden=true;if(btn)btn.hidden=true;return}if(s.tasksCollapsed){panel.hidden=true;if(btn){btn.hidden=false;btn.setAttribute('aria-expanded','false')}return}panel.hidden=false;if(btn){btn.hidden=false;btn.setAttribute('aria-expanded','true')}list.innerHTML='';const done=todos.filter(t=>t.status==='completed').length;const order={in_progress:0,pending:1,completed:2};const sorted=[...todos].sort((a,b)=>(order[a.status]??3)-(order[b.status]??3));for(const t of sorted){const row=document.createElement('div');row.className='task-row '+t.status;const mark=document.createElement('span');mark.className='task-mark';mark.textContent=t.status==='completed'?'✓':t.status==='in_progress'?'●':'·';mark.setAttribute('aria-hidden','true');const label=document.createElement('span');label.className='task-label';label.textContent=t.content;row.append(mark,label);list.append(row)}$('#taskProgress').textContent=`${done} of ${todos.length} completed`}
+function renderSession(){const s=active();$('#workspaceLabel').textContent=s.workspace||'Default workspace';$('#run').disabled=s.busy||workspaceUnavailable(s);$('#prompt').disabled=s.busy;$('#stop').hidden=!s.busy;$('#activity').hidden=!s.busy;$('#wsUnavailable').hidden=!workspaceUnavailable(s);$('#wsUnavailable').textContent=workspaceUnavailable(s)?('Workspace unavailable ('+s.workspaceStatus+') — choose a replacement to run.'):'';renderFeed()}
 function renderAll(){renderTabs();renderSession()}
 function addEvent(id,kind,text,name='',extra={}){const clean=String(text??'').trim();if(!clean)return;const s=sessions[id];if(!s)return;const ev={kind,text:clean,name,...extra};s.events.push(ev);if(s.events.length>500)s.events=s.events.slice(-500);saveSessionToServer(id);if(activeId===id){if(kind==='task'){renderTaskPanel(s);return}$('#feed .empty')?.remove();const wasNear=nearBottom($('#feed'));$('#feed').append(eventNode(ev));if(wasNear||s.followBottom){$('#feed').scrollTop=$('#feed').scrollHeight;s.followBottom=true;$('#newActivity').hidden=true}else{$('#newActivity').hidden=false}}else{if(kind==='task')return;s.unread=(s.unread||0)+1;renderTabs()}}
 async function loadSettings(){settings=await api('/api/settings');providers=settings.providers||[];const sel=$('#provider');sel.innerHTML='';for(const p of providers){const o=document.createElement('option');o.value=p.id;o.textContent=p.label+(p.configured?' · configured':'');sel.append(o)}sel.value=settings.activeProvider||providers[0]?.id||'';updateProviderUI()}
@@ -331,8 +368,20 @@ async function reconcileRunState(id, maxWaitMs){
     }
   }finally{reconcilePolls.delete(id)}
 }
-function consumeAgentEvent(id,s,ev,seenImages){const text=summarize(ev),raw=ev?.data?.data||ev?.data||{};if(ev.type==='run'&&raw.runID){s.runID=raw.runID;s.currentRunId=raw.runID}if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;if(ev.type==='task'&&typeof raw.snapshot==='string')addEvent(id,'task',raw.snapshot);const oc=raw.outcome||'';if(oc)s.state=oc;else if(ev.type==='done')s.state='completed';else if(ev.type==='warning')s.state='completed_with_process_error';else if(ev.type==='error')s.state='failed';else if(ev.type==='cancelled')s.state='cancelled';else if(ev.type==='truncated')s.state='truncated';if(ev.type==='done'||ev.type==='warning'||ev.type==='error'||ev.type==='cancelled'||ev.type==='truncated'){s.busy=false;s.abort=null};const termEvent={kind:eventKind(ev),text,name:'run:'+(raw.runID||s.runID)+':'+oc,outcome:oc,runID:raw.runID||s.runID};if(termEvent.text)addEvent(id,termEvent.kind,termEvent.text,termEvent.name,{outcome:oc,runID:termEvent.runID});if(ev.type==='recovered-images'){for(const im of (raw.images||[]))addGeneratedImage(id,im)}for(const im of extractImages(raw)){if(seenImages.has(im.url))continue;seenImages.add(im.url);addGeneratedImage(id,im)}}
-async function runAgent(prompt){const s=active();if(!s||s.busy||!s.workspace||workspaceUnavailable(s))return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();s.runID='';if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');const images=attachments.map(a=>({name:a.name,data:a.dataUrl}));for(const a of attachments)addEvent(id,'image',a.thumb,a.name);addEvent(id,'user',prompt);attachments=[];renderAttachments();renderAll();try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id,images}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';const seenImages=new Set();for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line);consumeAgentEvent(id,s,ev,seenImages);}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].abort=null;saveUiPrefs();saveSessionToServer(id);if(sessions[id]&&sessions[id].busy){reconcileRunState(id)}}if(activeId===id)renderAll();agentStatus()}}
+function consumeAgentEvent(id,s,ev,seenImages,streamRun){const text=summarize(ev),raw=ev?.data?.data||ev?.data||{};if(ev.type==='run'&&raw.runID){s.runID=raw.runID;s.currentRunId=raw.runID}if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;if(ev.type==='task'&&typeof raw.snapshot==='string')addEvent(id,'task',raw.snapshot,'',{runID:streamRun||''});const oc=raw.outcome||'';if(oc)s.state=oc;else if(ev.type==='done')s.state='completed';else if(ev.type==='warning')s.state='completed_with_process_error';else if(ev.type==='error')s.state='failed';else if(ev.type==='cancelled')s.state='cancelled';else if(ev.type==='truncated')s.state='truncated';if(ev.type==='done'||ev.type==='warning'||ev.type==='error'||ev.type==='cancelled'||ev.type==='truncated'){s.busy=false;s.abort=null};const termEvent={kind:eventKind(ev),text,name:'run:'+(raw.runID||s.runID)+':'+oc,outcome:oc,runID:raw.runID||s.runID};if(termEvent.text)addEvent(id,termEvent.kind,termEvent.text,termEvent.name,{outcome:oc,runID:termEvent.runID});if(ev.type==='recovered-images'){for(const im of (raw.images||[]))addGeneratedImage(id,im)}for(const im of extractImages(raw)){if(seenImages.has(im.url))continue;seenImages.add(im.url);addGeneratedImage(id,im)}}
+// resetTaskStateForNewRun clears the previous run's task snapshot when a new
+// run is accepted locally: it appends and persists an authoritative empty
+// snapshot so reload or reconciliation cannot resurrect the old tasks, hides
+// the task panel and its control, clears the collapsed/open preference, and
+// marks the current run unknown until the new run's identity is streamed. This
+// runs before any streamed event, including when the run later fails to start.
+function resetTaskStateForNewRun(id){
+  const s=sessions[id];if(!s)return;
+  delete uiPrefs.collapsed[id];s.tasksCollapsed=false;
+  s.currentRunId='';
+  addEvent(id,'task','[]','',{runID:''})
+}
+async function runAgent(prompt){const s=active();if(!s||s.busy||workspaceUnavailable(s))return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();s.runID='';s.draft='';resetTaskStateForNewRun(id);if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');const images=attachments.map(a=>({name:a.name,data:a.dataUrl}));for(const a of attachments)addEvent(id,'image',a.thumb,a.name);addEvent(id,'user',prompt);attachments=[];s.attachments=[];renderAttachments();renderAll();let streamRun='';try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id,images}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';const seenImages=new Set();for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line);if(ev.type==='run'&&ev.data?.runID)streamRun=ev.data.runID;consumeAgentEvent(id,s,ev,seenImages,streamRun);}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].abort=null;saveUiPrefs();saveSessionToServer(id);if(sessions[id]&&sessions[id].busy){reconcileRunState(id)}}if(activeId===id)renderAll();agentStatus()}}
 
 // stopAgent performs a server-side, authenticated Stop for the active run and
 // surfaces the distinct outcome: terminal stop, explicit rejection, accepted-
@@ -446,14 +495,15 @@ async function syncServerConversations(){
   serverReady=true;
   if(!Object.keys(sessions).length)newSession('',false);
   if(!sessions[activeId])activeId=Object.keys(sessions)[0];
+  setActiveSession(activeId);
   saveUiPrefs();renderAll()
 }
-async function boot(){const st=await api('/api/status');root=st.root;loadSessions();restoreComposerHeight();await Promise.all([loadSettings(),agentStatus(),syncServerConversations()]);if(!active()?.workspace)setTimeout(openWorkspacePicker,0)}
+async function boot(){const st=await api('/api/status');root=st.root;loadSessions();restoreComposerHeight();await Promise.all([loadSettings(),agentStatus(),syncServerConversations()])}
 $('#newSession').onclick=e=>{e.stopPropagation();toggleSessionMenu()};$('#newSameWorkspace').onclick=newSessionSameWorkspace;$('#newWorkspace').onclick=newWorkspaceSession;$('#workspaceBtn').onclick=openWorkspacePicker;$('#closeWorkspace').onclick=$('#cancelWorkspace').onclick=()=>$('#workspaceModal').hidden=true;$('#browserUp').onclick=()=>browse(parentPath(browserPath));$('#chooseWorkspace').onclick=chooseWorkspace;
 $('#composerResize').onpointerdown=startComposerResize;$('#composerResize').ondblclick=()=>{applyComposerHeight(150);setPref(COMPOSER_STORE,'150')};document.addEventListener('click',e=>{if(!e.target.closest('.new-session-wrap'))hideSessionMenu()});window.addEventListener('resize',()=>applyComposerHeight($('#agentForm').getBoundingClientRect().height));
-$('#agentForm').onsubmit=e=>{e.preventDefault();const p=$('#prompt').value.trim();if(!p)return;$('#prompt').value='';runAgent(p)};$('#prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('#agentForm').requestSubmit()}};$('#stop').onclick=()=>stopAgent();$('#copy').onclick=copySession;
+$('#agentForm').onsubmit=e=>{e.preventDefault();const s=active(),p=$('#prompt').value.trim();if(!p)return;$('#prompt').value='';if(s)s.draft='';runAgent(p)};$('#prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('#agentForm').requestSubmit()}};$('#stop').onclick=()=>stopAgent();$('#copy').onclick=copySession;
 $('#newActivity').onclick=()=>{const s=active();if(!s)return;const box=$('#feed');if(box){box.scrollTop=box.scrollHeight}s.followBottom=true;$('#newActivity').hidden=true};
-function setTasksCollapsed(c){const s=active();if(!s)return;s.tasksCollapsed=c;if(c)uiPrefs.collapsed[s.id]=true;else delete uiPrefs.collapsed[s.id];saveUiPrefs();renderTaskPanel(s)}$('#taskToggle').onclick=()=>setTasksCollapsed(true);$('#taskReopen').onclick=()=>setTasksCollapsed(false);
+function setTasksCollapsed(c){const s=active();if(!s)return;s.tasksCollapsed=c;if(c)uiPrefs.collapsed[s.id]=true;else delete uiPrefs.collapsed[s.id];saveUiPrefs();renderTaskPanel(s)}$('#taskToggle').onclick=()=>setTasksCollapsed(true);$('#taskButton').onclick=()=>{const s=active();if(s)setTasksCollapsed(!s.tasksCollapsed)};
 $('#feed').addEventListener('scroll',()=>{const s=active(),box=$('#feed');if(!box||!s)return;if(box.scrollTop+box.clientHeight>=box.scrollHeight-4){s.followBottom=true;$('#newActivity').hidden=true}else{s.followBottom=false}});
 document.addEventListener('selectionchange',()=>{const s=active();if(!s)return;s.followBottom=false});
 $('#prompt').addEventListener('paste',e=>{const files=[...(e.clipboardData?.items||[])].map(i=>i.getAsFile()).filter(Boolean).filter(f=>f.type&&f.type.startsWith('image/'));if(!files.length)return;let handled=false;for(const f of files)handled=addImage(f)||handled;if(handled)e.preventDefault()});

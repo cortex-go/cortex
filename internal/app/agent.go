@@ -213,7 +213,15 @@ func (a *App) agentRun(w http.ResponseWriter, r *http.Request) {
 	// Durable run creation happens before the process starts so an untracked
 	// OpenCode process is never launched if persistence fails. Once the
 	// durable row exists, every later failure finalizes it to a truthful state.
-	if err := a.startAgentRun(runID, clientSession, q.Prompt, workspace, providerID, modelID); err != nil {
+	// A workspace-less run resolves to the configured Cortex root for
+	// execution, but the conversation keeps the explicit empty "use default
+	// root" state verbatim so the browser and SQLite agree that no specific
+	// workspace was selected.
+	storedWorkspace := workspace
+	if strings.TrimSpace(q.Workspace) == "" {
+		storedWorkspace = ""
+	}
+	if err := a.startAgentRun(runID, clientSession, q.Prompt, storedWorkspace, providerID, modelID); err != nil {
 		if strings.Contains(err.Error(), "already running") {
 			http.Error(w, "agent is already running for this conversation", http.StatusConflict)
 		} else {

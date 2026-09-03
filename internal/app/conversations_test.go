@@ -6,6 +6,57 @@ import (
 	"testing"
 )
 
+// TestDefaultRootWorkspaceResolution verifies a workspace-less selection
+// resolves to the configured Cortex root and remains confined there: an empty
+// value is the explicit "use default root" state and can never be abused to
+// escape the root boundary.
+func TestDefaultRootWorkspaceResolution(t *testing.T) {
+	root := t.TempDir()
+	a, err := New(Options{Root: root, DataDir: filepath.Join(root, "data"), Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if got, err := a.resolve(""); err != nil || got != a.root {
+		t.Fatalf("resolve empty = %q err=%v want root %q", got, err, a.root)
+	}
+	if got, err := a.resolve("/"); err != nil || got != a.root {
+		t.Fatalf("resolve / = %q err=%v want root %q", got, err, a.root)
+	}
+	if _, err := a.resolve("../escape"); err == nil {
+		t.Fatal("empty/default workspace must never permit escape from the configured root")
+	}
+}
+
+// TestStartAgentRunStoresDefaultRootWorkspaceVerbatim verifies the conversation
+// record keeps the explicit empty default-root state for a workspace-less run
+// and the resolved absolute path for an explicit workspace.
+func TestStartAgentRunStoresDefaultRootWorkspaceVerbatim(t *testing.T) {
+	root := t.TempDir()
+	a, err := New(Options{Root: root, DataDir: filepath.Join(root, "data"), Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if err := a.startAgentRun("run-empty", "conv-empty", "p", "", "opencode", "deepseek-v4-flash"); err != nil {
+		t.Fatal(err)
+	}
+	var ws string
+	if err := a.db.QueryRow("SELECT workspace FROM conversations WHERE id='conv-empty'").Scan(&ws); err != nil || ws != "" {
+		t.Fatalf("default-root workspace stored %q err=%v; want empty", ws, err)
+	}
+	resolved := filepath.Join(root, "repo")
+	if err := os.MkdirAll(resolved, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.startAgentRun("run-explicit", "conv-explicit", "p", resolved, "opencode", "deepseek-v4-flash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.db.QueryRow("SELECT workspace FROM conversations WHERE id='conv-explicit'").Scan(&ws); err != nil || ws != resolved {
+		t.Fatalf("explicit workspace stored %q err=%v; want %q", ws, err, resolved)
+	}
+}
+
 func TestDurableConversationRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	a, err := New(Options{Root: root, DataDir: t.TempDir()})
