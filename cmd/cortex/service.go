@@ -686,7 +686,13 @@ func writeManagedUnit(path, content string) error {
 // resolveExecutable validates the executable path used in a unit. The supplied
 // path must already be absolute; empty, relative, transient (build-cache,
 // temp) paths and paths containing control characters are rejected so we never
-// install a broken or ephemeral unit.
+// install a broken or ephemeral unit. systemd refuses to load a unit whose
+// ExecStart executable path contains a double quote, single quote, backslash,
+// dollar sign, or leading/trailing whitespace ("Executable path contains
+// special characters"), and those characters cannot be encoded into a valid
+// ExecStart, so they are rejected up front rather than emitting a unit systemd
+// will refuse to start. The executable's parent directory feeds WorkingDirectory,
+// so this restriction also keeps that path free of unsafe forms.
 func resolveExecutable(exe string) (string, error) {
 	if strings.TrimSpace(exe) == "" {
 		return "", errors.New("empty executable path")
@@ -698,6 +704,15 @@ func resolveExecutable(exe string) (string, error) {
 		return "", err
 	}
 	abs := filepath.Clean(exe)
+	if strings.TrimSpace(abs) != abs {
+		return "", fmt.Errorf("executable path %q must not have leading or trailing whitespace", abs)
+	}
+	for _, c := range abs {
+		switch c {
+		case '"', '\'', '\\', '$':
+			return "", fmt.Errorf("executable path %q contains %q, which systemd rejects in an ExecStart executable path", abs, c)
+		}
+	}
 	if strings.HasPrefix(abs, os.TempDir()) {
 		return "", fmt.Errorf("executable path %q is transient; install cortex somewhere stable first", abs)
 	}
@@ -733,6 +748,60 @@ func healthCheck(url string) error {
 		return fmt.Errorf("expected a JSON object response: %v", err)
 	}
 	return nil
+}
+
+// installHealthDeadline and installHealthPollInterval bound the post-start
+// readiness verification of `service install`. They are overridable so tests
+// and the lifecycle exercise can drive the poll deterministically.
+var (
+	installHealthPollInterval = 250 * time.Millisecond
+	installHealthDeadline     = 15 * time.Second
+	// healthProbe is the HTTP liveness probe used by waitReady; tests override
+	// it so installs in the sandbox do not require a live listener.
+	healthProbe = healthCheck
+)
+
+// waitReady verifies, within a bounded deadline, that the installed unit
+// reaches the active state and answers its /api/health endpoint with a valid
+// JSON 2xx response. This is the install-time transactional health gate: a
+// systemctl start/restart can return zero before the process finishes
+// starting, and the process can then fail immediately, so install does not
+// report success until the service is demonstrably alive. It distinguishes an
+// immediate failed/inactive/not-found state, a state-query failure, a
+// deadline timeout, and an invalid health response, so the caller can roll
+// back the install transaction for every failure class.
+func (m *serviceManager) waitReady(listen string) error {
+	start := time.Now()
+	var lastHealthErr error
+	for {
+		st, err := m.queryState("is-active")
+		if err != nil {
+			return fmt.Errorf("cannot verify %s state after start: %w", m.unitName, err)
+		}
+		switch st {
+		case stateActive:
+			// A forked simple service reports active before its listener is
+			// bound, so a transient health failure is retried until the
+			// deadline rather than failing the install on the first poll.
+			if err := healthProbe("http://" + listen + cortexHealthPath); err != nil {
+				lastHealthErr = err
+			} else {
+				return nil
+			}
+		case stateInactive, stateUnknown:
+			return fmt.Errorf("%s is %q immediately after start; install failed", m.unitName, stateName(st))
+		default:
+			// Transitional states (activating, reloading, refreshing) are not
+			// terminal: keep polling until the deadline.
+		}
+		if time.Since(start) >= installHealthDeadline {
+			if lastHealthErr != nil {
+				return fmt.Errorf("service is active but its health check failed: %w", lastHealthErr)
+			}
+			return fmt.Errorf("%s did not become active and healthy within %s", m.unitName, installHealthDeadline)
+		}
+		time.Sleep(installHealthPollInterval)
+	}
 }
 
 // requireManaged verifies the unit file at the expected path is a valid
@@ -867,10 +936,24 @@ func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
 			}
 		}
 	}
-	active, _, _ := m.systemctl("is-active", m.unitName)
+	// Install-time transactional health gate: a start/restart job can return
+	// zero before the process finishes starting, so install must not report
+	// success until the unit is active and answers /api/health. Every failure
+	// class (immediate failure, state-query failure, timeout, invalid health
+	// response) triggers the same rollback as any other failed lifecycle step.
+	if err := m.waitReady(opts.listener()); err != nil {
+		if rb := m.rollbackInstall(priorUnit, hadUnit, priorEnabledWord, priorActiveWord); rb != "" {
+			return fmt.Errorf("%w%s", err, rb)
+		}
+		return err
+	}
+	active, err := m.queryState("is-active")
+	if err != nil {
+		return fmt.Errorf("cannot confirm %s active state after install: %w", m.unitName, err)
+	}
 	fmt.Fprintf(out, "unit:   %s\n", m.unitName)
 	fmt.Fprintf(out, "file:   %s\n", m.unitPath)
-	fmt.Fprintf(out, "state:  %s\n", strings.TrimSpace(active))
+	fmt.Fprintf(out, "state:  %s\n", active)
 	fmt.Fprintf(out, "url:    http://%s\n", opts.listener())
 	return nil
 }

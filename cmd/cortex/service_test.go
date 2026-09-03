@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,9 +15,20 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cortex-go/cortex/internal/app"
 )
+
+// init configures the install-time health gate for the sandbox: installs must
+// not require a live listener, and the readiness poll must be fast so every
+// test that reaches the health gate completes deterministically. Health-gate
+// tests override healthProbe and restore it via t.Cleanup.
+func init() {
+	healthProbe = func(string) error { return nil }
+	installHealthPollInterval = time.Millisecond
+	installHealthDeadline = 100 * time.Millisecond
+}
 
 type fakeRunner struct {
 	mu      sync.Mutex
@@ -71,6 +83,18 @@ func newFakeManager(t *testing.T) (*serviceManager, *fakeRunner, string) {
 	base := t.TempDir()
 	unitPath := filepath.Join(base, "systemd", "user", "cortex.service")
 	fr := &fakeRunner{}
+	// Default model: a freshly installed service is enabled and active, so the
+	// install transaction's readiness gate passes when a test does not override
+	// the runner before its setup install.
+	fr.handler = func(name string, args ...string) (string, int, error) {
+		switch {
+		case fr.contains(args, "is-active"):
+			return "active", 0, nil
+		case fr.contains(args, "is-enabled"):
+			return "enabled", 0, nil
+		}
+		return "", 0, nil
+	}
 	m := &serviceManager{unitName: "cortex.service", unitPath: unitPath, exe: "/usr/local/bin/cortex", run: fr}
 	return m, fr, base
 }
@@ -336,7 +360,22 @@ func TestSystemdAnalyzeVerifyRenderedUnit(t *testing.T) {
 		if err := os.WriteFile(path, []byte(unit), 0644); err != nil {
 			t.Fatal(err)
 		}
-		out, err := exec.Command(analyze, "--user", "verify", path).CombinedOutput()
+		// Bootstrap the user-manager environment: systemd-analyze --user needs a
+		// runtime directory to initialize a manager even in a headless build
+		// environment, so an isolated XDG_RUNTIME_DIR is provided.
+		runtimeDir := t.TempDir()
+		if err := os.Chmod(runtimeDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(analyze, "--user", "verify", path)
+		cmd.Env = append(os.Environ(), "XDG_RUNTIME_DIR="+runtimeDir)
+		out, err := cmd.CombinedOutput()
+		if err != nil && isVerifyInfraFailure(string(out)) {
+			// The manager itself could not initialize (no user bus/runtime
+			// directory); that is an infrastructure limitation, never an
+			// acceptance or rejection of the unit under test.
+			t.Skipf("systemd user manager cannot initialize here: %s", strings.TrimSpace(string(out)))
+		}
 		ok := err == nil && !strings.Contains(string(out), path)
 		return string(out), ok
 	}
@@ -374,6 +413,169 @@ func TestSystemdAnalyzeVerifyRenderedUnit(t *testing.T) {
 			t.Fatalf("verify did not report the WorkingDirectory path error\n%s", out)
 		}
 	})
+}
+
+// isVerifyInfraFailure reports whether a failed systemd-analyze invocation is
+// an environment limitation (no user manager, no runtime directory, no bus)
+// rather than a defect in the unit under test. Infrastructure initialization
+// failures must never be classified as acceptance or rejection of a unit.
+func isVerifyInfraFailure(out string) bool {
+	lower := strings.ToLower(out)
+	for _, m := range []string{
+		"failed to lookup runtimedirectory path",
+		"failed to initialize manager",
+		"failed to create manager",
+		"no such device or address",
+		"failed to connect to bus",
+		"cannot find any user bus",
+		"cannot access user bus",
+	} {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestIsVerifyInfraFailure(t *testing.T) {
+	for _, m := range []string{
+		"Failed to lookup RuntimeDirectory path: No such device or address",
+		"Failed to initialize manager: No such device or address",
+		"Failed to connect to bus: No such file or directory",
+	} {
+		if !isVerifyInfraFailure(m) {
+			t.Fatalf("infrastructure failure not recognized: %q", m)
+		}
+	}
+	for _, m := range []string{
+		"WorkingDirectory= path is not absolute: \"/usr/local/bin\"",
+		"cortex.service: Unit configuration has fatal error",
+		"",
+	} {
+		if isVerifyInfraFailure(m) {
+			t.Fatalf("unit defect misclassified as infrastructure failure: %q", m)
+		}
+	}
+}
+
+// TestSystemdPathRuntimeIdentity proves against a genuine systemd user manager
+// that quote, backslash, space and percent characters in a WorkingDirectory
+// and in ExecStart arguments resolve to the exact same paths and values at
+// runtime — not to a different path. A syntax-only assertion is insufficient
+// because systemd could in principle unescape a path value; this test starts a
+// real unit whose process records its working directory and argv. It is gated
+// on a usable user manager: in a headless environment with no user session it
+// skips, and the service-lifecycle CI job is the authoritative integration run.
+func TestSystemdPathRuntimeIdentity(t *testing.T) {
+	systemctl, err := exec.LookPath("systemctl")
+	if err != nil {
+		t.Skip("systemctl not installed; skipping runtime path identity check")
+	}
+	if out, err := exec.Command(systemctl, "--user", "is-system-running").CombinedOutput(); err != nil {
+		t.Skipf("no usable user systemd manager: %s", strings.TrimSpace(string(out)))
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no user home; skipping runtime path identity check")
+	}
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0700); err != nil {
+		t.Skipf("cannot create user unit directory: %v", err)
+	}
+
+	base := t.TempDir()
+	// A working directory whose name contains a quote, a backslash, a space and
+	// a percent sign. The executable itself lives at a clean path because
+	// systemd rejects quote/backslash in the ExecStart executable position.
+	wd := filepath.Join(base, `weird"dir\path 100%`)
+	if err := os.MkdirAll(wd, 0755); err != nil {
+		t.Fatal(err)
+	}
+	outFile := filepath.Join(base, "result.txt")
+	script := filepath.Join(base, "emit.sh")
+	scriptBody := "#!/bin/sh\nout=\"$1\"\nshift\npwd > \"$out\"\nfor a in \"$@\"; do printf '[%s]\\n' \"$a\" >> \"$out\"; done\n"
+	if err := os.WriteFile(script, []byte(scriptBody), 0755); err != nil {
+		t.Fatal(err)
+	}
+	unitName := "cortex-rtid.service"
+	unit := fmt.Sprintf(`[Unit]
+Description=runtime path identity probe
+
+[Service]
+Type=oneshot
+ExecStart=%s %s "arg with \"quote" "back\\slash"
+WorkingDirectory=%s
+`, script, outFile, wd)
+	unitPath := filepath.Join(unitDir, unitName)
+	if err := os.WriteFile(unitPath, []byte(unit), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command(systemctl, "--user", "stop", unitName).Run()
+		_ = os.Remove(unitPath)
+		_ = exec.Command(systemctl, "--user", "daemon-reload").Run()
+	})
+	if out, err := exec.Command(systemctl, "--user", "daemon-reload").CombinedOutput(); err != nil {
+		t.Skipf("cannot reload the user manager: %s", strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.Command(systemctl, "--user", "start", unitName).CombinedOutput(); err != nil {
+		t.Fatalf("cannot start the identity probe unit: %s\nunit:\n%s", strings.TrimSpace(string(out)), unit)
+	}
+	// oneshot start returns once the job completes; read the recorded result.
+	var data []byte
+	for i := 0; i < 20; i++ {
+		data, err = os.ReadFile(outFile)
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("identity probe produced no output: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	want := []string{wd, `[arg with "quote]`, `[back\slash]`}
+	if len(lines) != len(want) {
+		t.Fatalf("unexpected probe output %q, want %q", lines, want)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Fatalf("probe line %d = %q, want %q", i, lines[i], want[i])
+		}
+	}
+}
+
+func TestResolveExecutableRejectsUnsafeSystemdForms(t *testing.T) {
+	// Character and whitespace rejections happen before any filesystem check,
+	// so crafted absolute paths exercise them deterministically on every OS.
+	for _, exe := range []string{
+		`/home/nick/bin/weird"dir/cortex`,
+		`/home/nick/bin/back\slash/cortex`,
+		`/home/nick/bin/it's/cortex`,
+		`/home/nick/bin/$dir/cortex`,
+		" /home/nick/bin/cortex",
+		"/home/nick/bin/cortex ",
+		"/home/nick/bin/cortex\x00x",
+	} {
+		if _, err := resolveExecutable(exe); err == nil {
+			t.Fatalf("resolveExecutable accepted unsafe executable path %q", exe)
+		}
+	}
+	// Relative, non-existent and directory paths are rejected as before.
+	if _, err := resolveExecutable("relative/path"); err == nil {
+		t.Fatal("resolveExecutable accepted a relative path")
+	}
+	if _, err := resolveExecutable("/home/nick/bin/cortex"); err == nil {
+		t.Fatal("resolveExecutable accepted a non-existent executable")
+	}
+	base := t.TempDir()
+	dirExe := filepath.Join(base, "notafile")
+	if err := os.MkdirAll(dirExe, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveExecutable(dirExe); err == nil {
+		t.Fatal("resolveExecutable accepted a directory as the executable")
+	}
 }
 
 func readManagedUnitBytes(t *testing.T, data []byte) (unitMeta, error) {
@@ -511,6 +713,222 @@ func TestInstallInvalidUnitCleanRollback(t *testing.T) {
 	if _, statErr := os.Stat(m.unitPath); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatal("failed install left the unit file behind (state not retryable)")
 	}
+}
+
+// TestInstallHealthGate covers the install-time readiness verification: after
+// start/restart the install must require a valid active state and a successful
+// /api/health response within a bounded deadline, and must roll the install
+// transaction back for every failure class (immediate failure, state-query
+// failure, health timeout, invalid health response, not-found state). The real
+// health probe is exercised against an httptest server at the end.
+func TestInstallHealthGate(t *testing.T) {
+	origProbe, origDeadline, origInterval := healthProbe, installHealthDeadline, installHealthPollInterval
+	t.Cleanup(func() {
+		healthProbe, installHealthDeadline, installHealthPollInterval = origProbe, origDeadline, origInterval
+	})
+	installHealthPollInterval = time.Millisecond
+	installHealthDeadline = 80 * time.Millisecond
+
+	t.Run("delayed successful startup waits for active and health", func(t *testing.T) {
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		fr := fs.runner()
+		orig := fr.handler
+		healthCalls := 0
+		healthProbe = func(string) error { healthCalls++; return nil }
+		// Simulate delayed readiness: the first three is-active polls report a
+		// transitional state before the service becomes active.
+		activeCalls := 0
+		m.run = fr
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "is-active") {
+				activeCalls++
+				if activeCalls < 3 {
+					return "activating", exitForActive("activating"), nil
+				}
+				return "active", 0, nil
+			}
+			return orig(name, args...)
+		}
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatalf("delayed startup should install successfully: %v", err)
+		}
+		if healthCalls == 0 {
+			t.Fatal("health probe was never invoked after the service became active")
+		}
+	})
+
+	t.Run("immediate process failure after start fails and rolls back", func(t *testing.T) {
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		fr := fs.runner()
+		orig := fr.handler
+		healthProbe = func(string) error { return nil }
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "is-active") {
+				return "failed", exitForActive("failed"), nil
+			}
+			return orig(name, args...)
+		}
+		m.run = fr
+		err := m.install(testOpts("127.0.0.1:7331"), os.Stderr)
+		if err == nil {
+			t.Fatal("install reported success for a service that failed immediately")
+		}
+		if !strings.Contains(err.Error(), "immediately after start") {
+			t.Fatalf("immediate failure not attributed to the health gate: %v", err)
+		}
+		if _, statErr := os.Stat(m.unitPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatal("failed fresh install did not roll back the unit file")
+		}
+	})
+
+	t.Run("not-found state after start fails and rolls back", func(t *testing.T) {
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		fr := fs.runner()
+		orig := fr.handler
+		healthProbe = func(string) error { return nil }
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "is-active") {
+				return "not-found", exitForActive("not-found"), nil
+			}
+			return orig(name, args...)
+		}
+		m.run = fr
+		err := m.install(testOpts("127.0.0.1:7331"), os.Stderr)
+		if err == nil {
+			t.Fatal("install reported success for a not-found unit")
+		}
+		if _, statErr := os.Stat(m.unitPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatal("failed install did not roll back the unit file")
+		}
+	})
+
+	t.Run("active service with failing health fails and rolls back", func(t *testing.T) {
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		fr := fs.runner()
+		orig := fr.handler
+		healthProbe = func(string) error { return errors.New("boom: not healthy") }
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "is-active") {
+				return "active", 0, nil
+			}
+			return orig(name, args...)
+		}
+		m.run = fr
+		err := m.install(testOpts("127.0.0.1:7331"), os.Stderr)
+		if err == nil {
+			t.Fatal("install reported success with a failing health check")
+		}
+		if !strings.Contains(err.Error(), "health check failed") {
+			t.Fatalf("failing health not reported: %v", err)
+		}
+		if _, statErr := os.Stat(m.unitPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatal("failed install did not roll back the unit file")
+		}
+	})
+
+	t.Run("health timeout fails and rolls back", func(t *testing.T) {
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		fr := fs.runner()
+		orig := fr.handler
+		healthProbe = func(string) error { return nil }
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "is-active") {
+				return "activating", exitForActive("activating"), nil
+			}
+			return orig(name, args...)
+		}
+		m.run = fr
+		err := m.install(testOpts("127.0.0.1:7331"), os.Stderr)
+		if err == nil {
+			t.Fatal("install reported success for a service that never became ready")
+		}
+		if !strings.Contains(err.Error(), "did not become active and healthy") {
+			t.Fatalf("timeout not reported: %v", err)
+		}
+		if _, statErr := os.Stat(m.unitPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatal("timed-out install did not roll back the unit file")
+		}
+	})
+
+	t.Run("state-query failure fails and rolls back", func(t *testing.T) {
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		fr := fs.runner()
+		orig := fr.handler
+		healthProbe = func(string) error { return nil }
+		fr.handler = func(name string, args ...string) (string, int, error) {
+			if fr.contains(args, "is-active") {
+				return "", -1, errors.New("systemctl not found")
+			}
+			return orig(name, args...)
+		}
+		m.run = fr
+		err := m.install(testOpts("127.0.0.1:7331"), os.Stderr)
+		if err == nil {
+			t.Fatal("install reported success despite a state-query failure")
+		}
+		if !strings.Contains(err.Error(), "cannot verify cortex.service state after start") {
+			t.Fatalf("state-query failure not reported: %v", err)
+		}
+		if _, statErr := os.Stat(m.unitPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatal("failed install did not roll back the unit file")
+		}
+	})
+
+	t.Run("reinstall health failure restores the prior working install", func(t *testing.T) {
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		m.run = fs.runner()
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		priorUnit, _ := os.ReadFile(m.unitPath)
+		fs.setState("enabled", "active")
+		healthProbe = func(string) error { return errors.New("health broken") }
+		err := m.install(testOpts("127.0.0.1:7333"), os.Stderr)
+		if err == nil {
+			t.Fatal("reinstall reported success despite failing health")
+		}
+		after, _ := os.ReadFile(m.unitPath)
+		if string(after) != string(priorUnit) {
+			t.Fatal("failed reinstall did not restore the prior working unit")
+		}
+		ew, _, _ := m.systemctl("is-enabled", m.unitName)
+		aw, _, _ := m.systemctl("is-active", m.unitName)
+		if strings.TrimSpace(ew) != "enabled" || strings.TrimSpace(aw) != "active" {
+			t.Fatalf("rollback final state %q/%q want enabled/active", ew, aw)
+		}
+	})
+
+	t.Run("real health probe succeeds against a live endpoint", func(t *testing.T) {
+		hit := false
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == cortexHealthPath {
+				hit = true
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		t.Cleanup(srv.Close)
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		m.run = fs.runner()
+		healthProbe = healthCheck
+		opts := testOpts(strings.TrimPrefix(srv.URL, "http://"))
+		if err := m.install(opts, os.Stderr); err != nil {
+			t.Fatalf("install with a live healthy endpoint failed: %v", err)
+		}
+		if !hit {
+			t.Fatal("the install health gate never probed the live endpoint")
+		}
+	})
 }
 
 func TestValidateNoControl(t *testing.T) {

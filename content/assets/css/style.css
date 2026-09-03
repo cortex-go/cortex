@@ -65,7 +65,6 @@ main{display:block;min-height:0;overflow:hidden;background:#151716;padding:22px}
 .composer-resize:hover::after,.resizing-composer .composer-resize::after{background:#66736c}
 .resizing-composer,.resizing-composer *{cursor:ns-resize!important;user-select:none!important}
 .ws-unavailable{color:var(--amber);background:#2a2417;border:1px solid #5c4d22;border-radius:6px;padding:8px 11px;font-size:11px;line-height:1.45;margin-bottom:8px}
-.migration-notice{color:var(--amber);background:#2a2417;border:1px solid #5c4d22;border-radius:6px;padding:8px 11px;font-size:11px;line-height:1.45;margin-bottom:8px}
 .agent-card .compose-row{margin-top:8px}
 
 /* Authentication and security settings. */

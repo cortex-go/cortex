@@ -631,7 +631,7 @@ test('synchronization preserves collapsed task panel', async () => {
     if (url === '/api/conversations') return Promise.resolve(jsonOk([{ id: 'a', state: 'completed', currentRunId: 'run-1', events: [{ kind: 'task', text: '[{"content":"alpha","status":"pending","priority":"high"}]', name: '' }] }]));
     return Promise.resolve(jsonOk({}));
   });
-  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0,tasksCollapsed:true}};activeId='a';serverReady=true");
+  run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0,tasksCollapsed:true}};activeId='a';serverReady=true;uiPrefs={activeId:'a',collapsed:{a:true}}");
   await run(ctx, 'syncServerConversations()');
   if (run(ctx, "sessions['a'].tasksCollapsed") !== true) throw new Error('collapsed flag lost on sync');
   run(ctx, 'renderFeed()');
@@ -671,8 +671,10 @@ test('collapsed task panel survives reload', async () => {
   run(ctx, "sessions={a:{id:'a',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
   run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
   run(ctx, 'setTasksCollapsed(true)');
-  const stored = ctx.localStorage.getItem('cortex.sessions.v1');
-  if (!stored || !stored.includes('tasksCollapsed')) throw new Error('tasksCollapsed not persisted locally');
+  const stored = ctx.localStorage.getItem('cortex.ui.v1');
+  if (!stored || !stored.includes('"a":true')) throw new Error('collapsed preference not persisted in UI state');
+  if (stored.includes('"events"')) throw new Error('session transcript leaked into browser storage');
+  if (ctx.localStorage.getItem('cortex.sessions.v1') !== null) throw new Error('legacy session payload must never be written');
   run(ctx, 'loadSessions()');
   if (run(ctx, "sessions['a'].tasksCollapsed") !== true) throw new Error('collapsed not restored on reload');
   run(ctx, 'renderAll()');
@@ -686,8 +688,8 @@ test('reopened task panel survives reload', async () => {
   run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
   run(ctx, 'setTasksCollapsed(true)');
   run(ctx, 'setTasksCollapsed(false)');
-  const stored = ctx.localStorage.getItem('cortex.sessions.v1');
-  if (!stored || !stored.includes('"tasksCollapsed":false')) throw new Error('reopen not persisted');
+  const stored = ctx.localStorage.getItem('cortex.ui.v1');
+  if (!stored || !stored.includes('"collapsed":{}')) throw new Error('reopen not persisted as open state');
   run(ctx, 'loadSessions()');
   if (run(ctx, "sessions['a'].tasksCollapsed") !== false) throw new Error('open state not restored on reload');
   run(ctx, 'renderAll()');

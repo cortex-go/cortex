@@ -4,7 +4,9 @@
 # Exercises the full service contract against a genuine systemd user manager:
 #   install -> daemon reload -> enable/start -> active-state verification
 #   -> status (health) -> stop -> start -> restart
+#   -> special-path runtime identity (quote/backslash/space/percent args + cwd)
 #   -> injected start-limit failure -> reinstall recovery
+#   -> install-time health-gate failure (port conflict) -> retry
 #   -> uninstall -> fresh reinstall -> final uninstall
 #
 # The generated unit is additionally validated with `systemd-analyze --user
@@ -32,6 +34,7 @@ UNIT="$HOME/.config/systemd/user/cortex.service"
 ROOT=$(mktemp -d /tmp/cortex-lc-root.XXXXXX)
 DATA=$(mktemp -d /tmp/cortex-lc-data.XXXXXX)
 CRASH=$(mktemp /tmp/cortex-lc-crash.XXXXXX.sh)
+BLOCKER=
 cat > "$CRASH" <<'SH'
 #!/bin/sh
 exit 1
@@ -54,8 +57,10 @@ restore_bin() {
 }
 cleanup() {
   restore_bin 2>/dev/null || true
+  [ -n "$BLOCKER" ] && kill "$BLOCKER" 2>/dev/null || true
   rm -f "$BIN.save" "$CRASH"
   rm -rf "$ROOT" "$DATA"
+  rm -f ~/.config/systemd/user/cortex-rtid.service
   systemctl --user stop cortex.service >/dev/null 2>&1 || true
   systemctl --user disable cortex.service >/dev/null 2>&1 || true
   rm -f "$UNIT"
@@ -122,6 +127,42 @@ wait_active "start"
 "$BIN" service restart
 wait_active "restart"
 
+echo "== special-path runtime identity (WorkingDirectory + ExecStart args) =="
+SPROBE="$ROOT/special probe 100%"
+mkdir -p "$SPROBE"
+SPROUT="$ROOT/probe.out"
+cat > "$ROOT/emit.sh" <<'SH'
+#!/bin/sh
+out="$1"
+shift
+pwd > "$out"
+for a in "$@"; do printf '[%s]\n' "$a" >> "$out"; done
+SH
+chmod +x "$ROOT/emit.sh"
+# '%' must be doubled in the unit so systemd does not treat it as a specifier.
+SPROBE_ESCAPED=$(printf '%s' "$SPROBE" | sed 's/%/%%/g')
+# Build the unit with printf so the ExecStart backslash escapes reach systemd
+# verbatim (an unquoted heredoc would collapse them and change the runtime args).
+{
+  printf '[Unit]\nDescription=runtime path identity probe\n\n[Service]\nType=oneshot\n'
+  printf 'ExecStart=%s "%s" "arg with \\"quote" "back\\\\slash"\n' "$ROOT/emit.sh" "$SPROUT"
+  printf 'WorkingDirectory=%s\n' "$SPROBE_ESCAPED"
+} > ~/.config/systemd/user/cortex-rtid.service
+systemctl --user daemon-reload
+systemctl --user start cortex-rtid.service
+systemctl --user stop cortex-rtid.service
+rm -f ~/.config/systemd/user/cortex-rtid.service
+systemctl --user daemon-reload
+{
+  read -r wdline
+  read -r arg1
+  read -r arg2
+} < "$SPROUT"
+[ "$wdline" = "$SPROBE" ] || die "WorkingDirectory resolved differently at runtime: '$wdline' != '$SPROBE'"
+[ "$arg1" = '[arg with "quote]' ] || die "quote-containing argument changed at runtime: '$arg1'"
+[ "$arg2" = '[back\slash]' ] || die "backslash-containing argument changed at runtime: '$arg2'"
+rm -f "$SPROUT" "$ROOT/emit.sh"
+
 echo "== injected start-limit failure and reinstall recovery =="
 "$BIN" service stop >/dev/null
 overwrite_bin
@@ -137,6 +178,28 @@ restore_bin
 install >/dev/null
 wait_active "reinstall recovery"
 [ "$(systemctl --user is-active cortex.service)" = "active" ] || die "reinstall did not recover the service"
+
+echo "== install-time health gate failure (port conflict) then retry =="
+"$BIN" service uninstall >/dev/null
+if command -v python3 >/dev/null 2>&1; then
+  python3 -m http.server "$PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+  BLOCKER=$!
+  sleep 0.6
+  if "$BIN" service install --root "$ROOT" --data "$DATA" --port "$PORT" >/dev/null 2>&1; then
+    kill "$BLOCKER" 2>/dev/null || true
+    die "install succeeded although its listener port was already bound (health gate must fail)"
+  fi
+  kill "$BLOCKER" 2>/dev/null || true
+  wait "$BLOCKER" 2>/dev/null || true
+  BLOCKER=
+  [ -e "$UNIT" ] && die "failed health-gate install left the unit installed (state not retryable)"
+  # The port is free again: a fresh install must succeed. The service is left
+  # installed for the uninstall section below.
+  install >/dev/null
+  wait_active "install retry after health-gate failure"
+else
+  echo "python3 unavailable; skipping port-conflict health-gate exercise"
+fi
 
 echo "== uninstall =="
 "$BIN" service uninstall >/dev/null

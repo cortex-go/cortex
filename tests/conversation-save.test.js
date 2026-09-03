@@ -87,6 +87,7 @@ function makeContext(fetchImpl) {
     getItem(k) { return k in this.store ? this.store[k] : null; },
     setItem(k, v) { this.store[k] = String(v); },
     removeItem(k) { delete this.store[k]; },
+    clear() { this.store = {}; },
   };
   const ctx = {
     document,
@@ -181,10 +182,14 @@ async function test(t) {
   console.log('ok - ' + t.name);
 }
 
-// bootSimulation seeds browser localStorage and runs a fresh boot.
+// bootSimulation seeds the obsolete browser payload (if provided) and runs a
+// fresh boot load. It proves the obsolete payload is discarded without import,
+// and that a boot never PUTs authoritative conversations back to the server.
 async function bootSimulation(ctx, localStore) {
-  const payload = JSON.stringify({ activeId: 'a', sessions: localStore.sessions || {}, closedSessions: localStore.closedSessions || [] });
-  run(ctx, `localStorage.setItem('cortex.sessions.v1', ${JSON.stringify(payload)});`);
+  if (localStore) {
+    const payload = JSON.stringify({ activeId: 'a', sessions: localStore.sessions || {}, closedSessions: localStore.closedSessions || [] });
+    run(ctx, `localStorage.setItem('cortex.sessions.v1', ${JSON.stringify(payload)});`);
+  }
   run(ctx, `loadSessions()`);
   await runAsync(ctx, `syncServerConversations()`);
   await settle();
@@ -213,7 +218,7 @@ async function bootSimulation(ctx, localStore) {
   });
 
   await test(async function boot_synchronization_issues_zero_puts(ctx) {
-    run(ctx, `serverReady=false; sessions={}; closedSessions=[]; localStorage.removeItem('cortex.sessions.v1');`);
+    run(ctx, `serverReady=false; sessions={}; closedSessions=[];`);
     ctx.store.records.push(
       { id: 'valid', workspace: '/home/nick/repo', workspaceStatus: 'available', archivedAt: 0, events: [], createdAt: 1, updatedAt: 1 },
       { id: 'archived', workspace: '/home/nick/gone', workspaceStatus: 'missing', archivedAt: 123, events: [], createdAt: 1, updatedAt: 1 },
@@ -250,65 +255,6 @@ async function bootSimulation(ctx, localStore) {
     assert.strictEqual(run(ctx, `sessions['a'].workspace`), '/home/nick/real', 'replacement workspace must be recorded');
   });
 
-  // Partial legacy migration: A imports, B is rejected. B must stay recoverable
-  // locally, retry later, and never be silently dropped; A must not be
-  // duplicated or overwritten by a later boot.
-  {
-    const local = () => ({
-      sessions: {
-        a: { id: 'a', workspace: '/w1', events: [{ kind: 'user', text: 'A transcript' }], createdAt: 1, updatedAt: 1 },
-        b: { id: 'b', workspace: '/w2', events: [{ kind: 'user', text: 'B transcript' }], createdAt: 2, updatedAt: 2 },
-      },
-      closedSessions: [],
-    });
-    const server = { records: [], rejectIds: new Set(['b']) };
-    const ctx1 = loadContext(server);
-    await settle(10);
-    ctx1.fetchCalls.length = 0;
-    await bootSimulation(ctx1, local());
-    assert.deepStrictEqual(server.records.map((r) => r.id), ['a'], 'only the valid record imports on the first boot');
-    assert.strictEqual(run(ctx1, `sessions['a'].workspace`), '/w1', 'imported record must be present as the authoritative server copy');
-    assert.strictEqual(run(ctx1, `sessions['b'].migrationRejected`), true, 'rejected record must remain recoverable locally');
-    assert.strictEqual(run(ctx1, `sessions['b'].events[0].text`), 'B transcript', 'rejected record transcript must be preserved');
-    assert.strictEqual(ctx1.els.get('#migrationNotice').hidden, false, 'migration failure must be surfaced visibly');
-    assert.strictEqual(putCalls(ctx1).length, 0, 'boot must issue zero conversation PUTs');
-
-    // "Restart the browser": the server now holds A (non-empty), B is still
-    // rejected. A must not be re-imported (no duplication) and must not be
-    // overwritten by the stale local copy.
-    const ctx2 = loadContext(server);
-    await settle(10);
-    ctx2.fetchCalls.length = 0;
-    const persisted = run(ctx1, `localStorage.getItem('cortex.sessions.v1')`);
-    run(ctx2, `localStorage.setItem('cortex.sessions.v1', ${JSON.stringify(persisted)});`);
-    run(ctx2, `loadSessions()`);
-    await runAsync(ctx2, `syncServerConversations()`);
-    await settle();
-    const posted2 = ctx2.fetchCalls.filter((c) => c.method === 'POST' && c.url === '/api/conversations');
-    assert.deepStrictEqual(JSON.parse(posted2[0].body).conversations.map((c) => c.id), ['b'], 'already-imported A must not be re-posted');
-    assert.deepStrictEqual(server.records.map((r) => r.id), ['a'], 'retry must not duplicate the already-imported record');
-    assert.strictEqual(server.records[0].events.length, 1, 'imported record must not be overwritten by stale local state');
-    assert.strictEqual(run(ctx2, `sessions['b'].migrationRejected`), true, 'still-rejected record must stay recoverable');
-    assert.strictEqual(ctx2.els.get('#migrationNotice').hidden, false, 'migration failure must remain visible');
-    assert.strictEqual(putCalls(ctx2).length, 0, 'restart boot must issue zero conversation PUTs');
-
-    // The correction is accepted: retrying imports B with no duplication.
-    server.rejectIds.delete('b');
-    const ctx3 = loadContext(server);
-    await settle(10);
-    ctx3.fetchCalls.length = 0;
-    const persisted2 = run(ctx2, `localStorage.getItem('cortex.sessions.v1')`);
-    run(ctx3, `localStorage.setItem('cortex.sessions.v1', ${JSON.stringify(persisted2)});`);
-    run(ctx3, `loadSessions()`);
-    await runAsync(ctx3, `syncServerConversations()`);
-    await settle();
-    assert.strictEqual(run(ctx3, `sessions['b'].migrationRejected`), undefined, 'corrected record must import on retry');
-    assert.strictEqual(ctx3.els.get('#migrationNotice').hidden, true, 'migration notice must clear after full import');
-    assert.deepStrictEqual(server.records.map((r) => r.id), ['a', 'b'], 'retry must not duplicate any record');
-    assert.strictEqual(putCalls(ctx3).length, 0, 'retry boot must issue zero conversation PUTs');
-    console.log('ok - partial_migration_preserves_rejected_and_retries_without_duplication');
-  }
-
   await test(async function task_collapsed_preference_is_local_only(ctx) {
     run(ctx, `serverReady=true; sessions={}; sessions['a']={id:'a',workspace:'/w1',events:[],createdAt:1,tasksCollapsed:true}; activeId='a';`);
     run(ctx, `addEvent('a','user','hello')`);
@@ -317,7 +263,133 @@ async function bootSimulation(ctx, localStore) {
     assert.strictEqual(puts.length, 1, 'expected exactly one PUT');
     const body = JSON.parse(puts[0].body);
     assert.ok(!('tasksCollapsed' in body), 'tasksCollapsed must not be sent to the server conversation endpoint');
-    // The preference must still be retained in browser-local storage.
     assert.strictEqual(run(ctx, `sessions['a'].tasksCollapsed`), true, 'tasksCollapsed lost in local session state');
+    // The collapsed preference is retained as compact UI state, and no session
+    // transcript or metadata is ever written to browser storage.
+    run(ctx, `setTasksCollapsed(true)`);
+    const ui = run(ctx, `localStorage.getItem('cortex.ui.v1')`);
+    assert.ok(ui && ui.includes('"a":true'), 'collapsed preference not persisted as UI state');
+    assert.ok(!ui.includes('"events"'), 'session transcript leaked into browser storage');
+    assert.strictEqual(run(ctx, `localStorage.getItem('cortex.sessions.v1')`), null, 'session payload must never be written');
+  });
+
+  // A new session is created through the server API and only compact UI state
+  // reaches browser storage; the oversized session payload is never written.
+  await test(async function new_session_persists_to_server_not_browser_storage(ctx) {
+    run(ctx, `serverReady=true; sessions={}; closedSessions=[]; activeId='';`);
+    run(ctx, `newSession('/w1',false)`);
+    await settle();
+    const puts = putCalls(ctx);
+    assert.strictEqual(puts.length, 1, 'a new session must be persisted to the server');
+    const newId = run(ctx, `Object.keys(sessions)[0]`);
+    assert.strictEqual(JSON.parse(puts[0].body).id, newId, 'new session id must match the server PUT');
+    const ui = run(ctx, `localStorage.getItem('cortex.ui.v1')`);
+    assert.ok(!ui || !ui.includes('"events"'), 'session data must not be written to browser storage');
+    assert.strictEqual(run(ctx, `localStorage.getItem('cortex.sessions.v1')`), null, 'legacy session payload must not be written');
+  });
+
+  // A full/over-quota localStorage must never prevent creating or using a
+  // session, and must never surface an uncaught quota exception.
+  await test(async function quota_exhaustion_does_not_break_session_operations(ctx) {
+    run(ctx, `localStorage.setItem=(k,v)=>{throw new DOMException('Quota exceeded','QuotaExceededError')};`);
+    run(ctx, `serverReady=true; sessions={}; activeId='';`);
+    const created = run(ctx, `(function(){try{newSession('/w',false);return true}catch(e){return false}})()`);
+    assert.strictEqual(created, true, 'newSession must survive a quota-exhausted localStorage');
+    assert.ok(Object.keys(run(ctx, `sessions`)).length >= 1, 'session must be created despite the quota');
+    run(ctx, `addEvent(Object.keys(sessions)[0],'user','still usable')`);
+    await settle();
+    assert.ok(run(ctx, `sessions[Object.keys(sessions)[0]].events.length`) >= 1, 'session must remain usable');
+  });
+
+  // A throwing localStorage (disabled/denied storage) must never interrupt
+  // session operations.
+  await test(async function localStorage_totally_throwing_still_usable(ctx) {
+    run(ctx, `localStorage.getItem=()=>{throw new Error('storage disabled')};localStorage.setItem=()=>{throw new Error('storage disabled')};localStorage.removeItem=()=>{throw new Error('storage disabled')};`);
+    run(ctx, `serverReady=true; sessions={}; activeId='';`);
+    const created = run(ctx, `(function(){try{newSession('/w',false);return true}catch(e){return false}})()`);
+    assert.strictEqual(created, true, 'session creation must survive a throwing localStorage');
+    run(ctx, `addEvent(Object.keys(sessions)[0],'user','works')`);
+    await settle();
+    assert.strictEqual(putCalls(ctx).length, 1, 'server persistence must still work when browser storage throws');
+  });
+
+  // Conversations, transcripts and archived records are restored from SQLite
+  // after a browser reload / server restart, never from browser copies.
+  await test(async function reload_and_server_restart_restore_conversations_from_sqlite(ctx) {
+    const server = { records: [
+      { id: 'c1', title: 'First', workspace: '/home/nick/repo', state: 'completed', archivedAt: 0, events: [{ kind: 'user', text: 'hello', name: '' }, { kind: 'assistant', text: 'hi', name: '' }], createdAt: 1, updatedAt: 2 },
+      { id: 'c2', title: 'Old', workspace: '/gone', state: 'idle', archivedAt: 9, events: [], createdAt: 1, updatedAt: 2 },
+    ] };
+    const ctx1 = loadContext(server);
+    await settle(10);
+    await runAsync(ctx1, `syncServerConversations()`);
+    await settle();
+    assert.strictEqual(run(ctx1, `sessions['c1'] && sessions['c1'].events.length`), 2, 'transcript must be restored from the server');
+    assert.strictEqual(run(ctx1, `closedSessions.some(s=>s.id==='c2')`), true, 'archived conversation must be restored from the server');
+    const ui1 = run(ctx1, `localStorage.getItem('cortex.ui.v1')`);
+    assert.ok(!ui1 || !ui1.includes('"events"'), 'no transcript may be stored in the browser');
+    assert.strictEqual(run(ctx1, `localStorage.getItem('cortex.sessions.v1')`), null, 'legacy payload must be absent');
+    // A fresh browser context loading the same server state (a server restart)
+    // restores the identical conversations from SQLite alone.
+    const ctx2 = loadContext(server);
+    await settle(10);
+    await runAsync(ctx2, `syncServerConversations()`);
+    await settle();
+    assert.strictEqual(run(ctx2, `sessions['c1'] && sessions['c1'].events.length`), 2, 'reload must restore the transcript from SQLite');
+    assert.strictEqual(putCalls(ctx2).length, 0, 'restoring from the server must not PUT conversations back');
+  });
+
+  // Clearing browser storage must never delete or lose server-side
+  // conversations.
+  await test(async function clearing_browser_storage_does_not_lose_conversations(ctx) {
+    const server = { records: [
+      { id: 'c1', title: 'Keep', workspace: '/home/nick/repo', state: 'idle', archivedAt: 0, events: [{ kind: 'user', text: 'persisted', name: '' }], createdAt: 1, updatedAt: 2 },
+    ] };
+    const ctx1 = loadContext(server);
+    await settle(10);
+    await runAsync(ctx1, `syncServerConversations()`);
+    await settle();
+    run(ctx1, `localStorage.clear();`);
+    assert.strictEqual(run(ctx1, `localStorage.getItem('cortex.ui.v1')`), null, 'browser storage cleared');
+    const ctx2 = loadContext(server);
+    await settle(10);
+    await runAsync(ctx2, `syncServerConversations()`);
+    await settle();
+    assert.strictEqual(run(ctx2, `sessions['c1'] && sessions['c1'].events[0].text`), 'persisted', 'clearing browser storage must not lose conversations');
+  });
+
+  // The obsolete cortex.sessions.v1 payload and migration marker are removed on
+  // boot without being parsed, imported or written back anywhere.
+  await test(async function obsolete_cortex_sessions_v1_removed_without_import(ctx) {
+    const legacy = { activeId: 'legacy', sessions: { legacy: { id: 'legacy', workspace: '/w', events: [{ kind: 'user', text: 'old' }] } }, closedSessions: [] };
+    run(ctx, `localStorage.setItem('cortex.sessions.v1', ${JSON.stringify(JSON.stringify(legacy))});`);
+    run(ctx, `localStorage.setItem('cortex.sessions.migrated.sqlite.v1','1');`);
+    run(ctx, `loadSessions()`);
+    assert.strictEqual(run(ctx, `localStorage.getItem('cortex.sessions.v1')`), null, 'obsolete payload must be removed on boot');
+    assert.strictEqual(run(ctx, `localStorage.getItem('cortex.sessions.migrated.sqlite.v1')`), null, 'migration marker must be removed');
+    assert.strictEqual(run(ctx, `Object.keys(sessions).length`), 0, 'obsolete payload must never be imported into sessions');
+    const posted = ctx.fetchCalls.filter((c) => c.method === 'POST' && c.url === '/api/conversations');
+    assert.strictEqual(posted.length, 0, 'obsolete payload must not be migrated to the server');
+    const ui = run(ctx, `localStorage.getItem('cortex.ui.v1')`);
+    assert.ok(!ui || !ui.includes('legacy'), 'no legacy session data may be written to browser storage');
+  });
+
+  // Archiving and restoring flow through the server API: archive persists an
+  // archivedAt via PUT, and a reload restores it as a closed session; restoring
+  // clears archivedAt via PUT.
+  await test(async function archive_and_restore_persist_through_server(ctx) {
+    run(ctx, `serverReady=true; sessions={}; sessions['a']={id:'a',workspace:'/w1',events:[{kind:'user',text:'x',name:''}],createdAt:1}; closedSessions=[]; activeId='a';`);
+    run(ctx, `sessions['a'].busy=false; closeSession('a')`);
+    await settle();
+    const archivedPut = putCalls(ctx).find((p) => JSON.parse(p.body).id === 'a');
+    assert.ok(archivedPut, 'archive must be persisted to the server');
+    assert.ok(JSON.parse(archivedPut.body).archivedAt > 0, 'archive PUT must carry archivedAt');
+    assert.ok(run(ctx, `closedSessions.some(s=>s.id==='a')`), 'archived session must be in the closed list');
+    // Restore clears the archive via the server.
+    run(ctx, `restoreSession('a')`);
+    await settle();
+    const restorePut = putCalls(ctx).filter((p) => JSON.parse(p.body).id === 'a').pop();
+    assert.ok(restorePut, 'restore must be persisted to the server');
+    assert.ok(!JSON.parse(restorePut.body).archivedAt, 'restore PUT must clear archivedAt');
   });
 })();
