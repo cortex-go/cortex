@@ -1,5 +1,19 @@
 # Cortex
 
+Cortex is a self-hosted browser workspace and coding-agent interface.
+
+## Command line
+
+```sh
+cortex version
+cortex --version
+cortex service status
+```
+
+Unknown commands and unsupported options fail with a non-zero exit status.
+Run the binary without a subcommand to start the integrated server, or use
+`cortex serve` where that compatibility alias is supported.
+
 Cortex is a self-hosted, agent-first coding agent with a small Go backend and a Nift-built browser UI. It can run locally on a development machine or be hosted remotely, while OpenCode provides the underlying coding-agent execution loop.
 
 ## First version

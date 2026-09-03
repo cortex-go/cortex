@@ -10,15 +10,27 @@ import (
 	"github.com/cortex-go/cortex/internal/app"
 )
 
-var version = "0.1.0-dev"
+var version = "0.1.0"
 
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "version", "--version":
+			if len(os.Args) != 2 {
+				fmt.Fprintln(os.Stderr, "cortex:", os.Args[1], "takes no arguments")
+				os.Exit(2)
+			}
+			fmt.Fprintln(os.Stdout, version)
+			return
 		case "service":
 			os.Exit(runService(os.Args[2:], version))
 		case "serve":
 			os.Args = append(os.Args[:1], os.Args[2:]...)
+		default:
+			if os.Args[1][0] != '-' {
+				fmt.Fprintln(os.Stderr, "cortex: unknown command", os.Args[1])
+				os.Exit(2)
+			}
 		}
 	}
 	host := flag.String("host", "", "HTTP bind host (default 127.0.0.1; CORTEX_HOST overrides, CLI wins)")
@@ -29,6 +41,10 @@ func main() {
 	trustProxy := flag.Bool("trust-proxy", false, "trust forwarding headers from a direct loopback reverse proxy")
 	publicOrigin := flag.String("public-origin", "", "canonical external origin, for example https://cortex.example.com")
 	flag.Parse()
+	if flag.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "cortex: unexpected arguments:", flag.Args())
+		os.Exit(2)
+	}
 	addr, err := resolveListener(*host, *port, *listen, flagProvided(flag.CommandLine, "host"), flagProvided(flag.CommandLine, "port"), flagProvided(flag.CommandLine, "listen"))
 	if err != nil {
 		log.Fatal("cortex: " + err.Error())
