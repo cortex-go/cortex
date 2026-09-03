@@ -269,12 +269,16 @@ func restorableEnabledWord(word string) bool {
 
 // restorableActiveWord reports whether a prior is-active raw word can be
 // restored exactly by the rollback sequence. Running and stopped are
-// restorable (restart/stop); dead, unknown and not-found are not, because stop
-// produces inactive rather than those words, and transient/failed states
-// cannot be reproduced deterministically.
+// restorable (restart/stop). A start-limited "failed" state is restorable
+// because systemctl stop leaves a failed unit reporting failed, so a rollback
+// over it reproduces the exact prior word; the install also clears it
+// deterministically with reset-failed before starting. Dead, unknown and
+// not-found are not restorable, because stop produces inactive rather than
+// those words, and transient/failed-from-crash states cannot be reproduced
+// deterministically.
 func restorableActiveWord(word string) bool {
 	switch word {
-	case "active", "inactive":
+	case "active", "inactive", "failed":
 		return true
 	}
 	return false
@@ -315,8 +319,10 @@ func activeRestoreArgs(word, unit string) []string {
 }
 
 // systemctlTolerantMissing runs a systemctl operation that must exit zero,
-// tolerating systemd's "not loaded"/"not found" results that signal the unit
-// was already absent.
+// tolerating systemd's "not loaded"/"not found"/"does not exist" results that
+// signal the unit was already absent. "does not exist" is the wording systemd
+// uses when a unit file fails to load because of a fatal configuration error,
+// so a rollback over such a unit is still reported as clean.
 func (m *serviceManager) systemctlTolerantMissing(args ...string) error {
 	out, code, err := m.systemctl(args...)
 	if err != nil {
@@ -324,7 +330,7 @@ func (m *serviceManager) systemctlTolerantMissing(args ...string) error {
 	}
 	if code != 0 {
 		lower := strings.ToLower(strings.TrimSpace(out))
-		if strings.Contains(lower, "not loaded") || strings.Contains(lower, "not found") || strings.Contains(lower, "no such") {
+		if strings.Contains(lower, "not loaded") || strings.Contains(lower, "not found") || strings.Contains(lower, "no such") || strings.Contains(lower, "does not exist") {
 			return nil
 		}
 		return fmt.Errorf("systemctl %s exited %d: %s", strings.Join(args, " "), code, bounded(strings.TrimSpace(out)))
@@ -411,15 +417,23 @@ func validateNoControl(v, what string) error {
 	return nil
 }
 
-// systemdQuote escapes a value for a systemd ExecStart/Environment directive.
-func systemdQuote(s string) string {
+// systemdExecQuote quotes a single token for an ExecStart= command line.
+// Command lines are parsed with shell-like quoting, so double quotes group
+// whitespace. Per systemd.exec, complete ${VAR} sequences are expanded at
+// runtime, so every literal '$' is doubled ('$$') and every '%' is doubled
+// ('%%') so it is never read as a specifier prefix. Double quotes and
+// backslashes are backslash-escaped. Backticks and single quotes are literal
+// characters in systemd command lines and must not be escaped (a backslash
+// would be preserved as a stray character).
+func systemdExecQuote(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
 	for i := 0; i < len(s); i++ {
 		switch c := s[i]; c {
-		case '%':
-			b.WriteString("%%")
-		case '"', '\\', '$', '`':
+		case '%', '$':
+			b.WriteByte(c)
+			b.WriteByte(c)
+		case '"', '\\':
 			b.WriteByte('\\')
 			b.WriteByte(c)
 		default:
@@ -428,6 +442,60 @@ func systemdQuote(s string) string {
 	}
 	b.WriteByte('"')
 	return b.String()
+}
+
+// systemdEnvValue quotes the value of an Environment= assignment. Environment
+// lines are parsed like command lines (double quotes group whitespace and
+// backslash escapes quote/backslash), but environment values are never
+// dollar-expanded, so '$' and backticks are literal and must not be escaped.
+// '%' is doubled so it is never read as a specifier prefix.
+func systemdEnvValue(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '%':
+			b.WriteString("%%")
+		case '"', '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// systemdUnitPath escapes a value for a single-token systemd directive such as
+// WorkingDirectory=. Such directives are not shell-parsed: quote characters,
+// backslashes, spaces and other punctuation are literal path characters and
+// must not be quoted or escaped (surrounding quotes would become part of the
+// path). The only unit-file escape that applies is doubling '%' so a path
+// containing '%' is never misread as a specifier prefix.
+func systemdUnitPath(s string) string {
+	return strings.ReplaceAll(s, "%", "%%")
+}
+
+// classifySystemdFailure recognizes common systemd failure messages so the
+// install transaction can report the failure category instead of a generic
+// "systemctl exited 1" line. The categories distinguish an invalid generated
+// unit, a start-rate-limit refusal, and an unavailable systemd bus.
+func classifySystemdFailure(msg string) string {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "bad unit file setting"),
+		strings.Contains(lower, "fatal error"),
+		strings.Contains(lower, "not absolute"),
+		strings.Contains(lower, "unknown key"),
+		strings.Contains(lower, "invalid argument"):
+		return "generated unit is invalid"
+	case strings.Contains(lower, "start request repeated too quickly"):
+		return "start rate limit exceeded"
+	case strings.Contains(lower, "failed to connect to bus"), strings.Contains(lower, "connection refused"):
+		return "systemd bus unavailable"
+	}
+	return ""
 }
 
 // hostGHConfigDir resolves the host GitHub CLI configuration directory when
@@ -454,35 +522,44 @@ func hostGHConfigDir() string {
 }
 
 // renderCortexUnitBody renders the systemd directives (no managed header).
+// Every value is escaped according to the directive it appears in: ExecStart
+// tokens use command-line quoting, Environment values use assignment quoting,
+// and single-token path directives such as WorkingDirectory use unquoted path
+// escaping (no shell quoting ever applies to a path value). The finite restart
+// policy mirrors the approved crash-loop contract: StartLimitIntervalSec and
+// StartLimitBurst live in [Unit] and Restart/RestartSec in [Service].
 func renderCortexUnitBody(exe string, opts serviceOptions) string {
 	var b strings.Builder
 	b.WriteString("[Unit]\n")
 	b.WriteString("Description=Cortex coding agent\n")
 	b.WriteString("After=network-online.target\n")
-	b.WriteString("Wants=network-online.target\n\n")
+	b.WriteString("Wants=network-online.target\n")
+	b.WriteString("StartLimitIntervalSec=60\n")
+	b.WriteString("StartLimitBurst=5\n\n")
 	b.WriteString("[Service]\n")
 	b.WriteString("Type=simple\n")
-	b.WriteString("ExecStart=" + systemdQuote(exe))
+	b.WriteString("ExecStart=" + systemdExecQuote(exe))
 	if opts.listen != "" {
-		b.WriteString(" " + systemdQuote("--listen") + " " + systemdQuote(opts.listen))
+		b.WriteString(" " + systemdExecQuote("--listen") + " " + systemdExecQuote(opts.listen))
 	} else {
-		b.WriteString(" " + systemdQuote("--host") + " " + systemdQuote(strings.TrimSpace(opts.host)))
-		b.WriteString(" " + systemdQuote("--port") + " " + systemdQuote(strings.TrimSpace(opts.port)))
+		b.WriteString(" " + systemdExecQuote("--host") + " " + systemdExecQuote(strings.TrimSpace(opts.host)))
+		b.WriteString(" " + systemdExecQuote("--port") + " " + systemdExecQuote(strings.TrimSpace(opts.port)))
 	}
-	b.WriteString(" " + systemdQuote("--root") + " " + systemdQuote(opts.root))
-	b.WriteString(" " + systemdQuote("--data") + " " + systemdQuote(opts.data))
+	b.WriteString(" " + systemdExecQuote("--root") + " " + systemdExecQuote(opts.root))
+	b.WriteString(" " + systemdExecQuote("--data") + " " + systemdExecQuote(opts.data))
 	if opts.publicOrigin != "" {
-		b.WriteString(" " + systemdQuote("--public-origin") + " " + systemdQuote(opts.publicOrigin))
+		b.WriteString(" " + systemdExecQuote("--public-origin") + " " + systemdExecQuote(opts.publicOrigin))
 	}
 	if opts.trustProxy {
-		b.WriteString(" " + systemdQuote("--trust-proxy"))
+		b.WriteString(" " + systemdExecQuote("--trust-proxy"))
 	}
 	b.WriteString("\n")
-	b.WriteString("WorkingDirectory=" + systemdQuote(filepath.Dir(exe)) + "\n")
+	b.WriteString("WorkingDirectory=" + systemdUnitPath(filepath.Dir(exe)) + "\n")
 	b.WriteString("Restart=on-failure\n")
+	b.WriteString("RestartSec=3\n")
 	b.WriteString("Environment=HOME=%h\n")
 	if opts.ghDir != "" {
-		b.WriteString("Environment=GH_CONFIG_DIR=" + systemdQuote(opts.ghDir) + "\n")
+		b.WriteString("Environment=GH_CONFIG_DIR=" + systemdEnvValue(opts.ghDir) + "\n")
 	}
 	b.WriteString("\n[Install]\n")
 	b.WriteString("WantedBy=default.target\n")
@@ -607,14 +684,18 @@ func writeManagedUnit(path, content string) error {
 }
 
 // resolveExecutable validates the executable path used in a unit. The supplied
-// path must already be absolute; empty, relative or transient (build-cache,
-// temp) paths are rejected so we never install a broken or ephemeral unit.
+// path must already be absolute; empty, relative, transient (build-cache,
+// temp) paths and paths containing control characters are rejected so we never
+// install a broken or ephemeral unit.
 func resolveExecutable(exe string) (string, error) {
 	if strings.TrimSpace(exe) == "" {
 		return "", errors.New("empty executable path")
 	}
 	if !filepath.IsAbs(exe) {
 		return "", fmt.Errorf("executable path %q is not absolute", exe)
+	}
+	if err := validateNoControl(exe, "executable path"); err != nil {
+		return "", err
 	}
 	abs := filepath.Clean(exe)
 	if strings.HasPrefix(abs, os.TempDir()) {
@@ -664,6 +745,34 @@ func (m *serviceManager) requireManaged(verb string) error {
 		return fmt.Errorf("refusing to %s %s: %w", verb, m.unitName, err)
 	}
 	return nil
+}
+
+// installStepDef describes one lifecycle step of the install transaction. A
+// tolerant step (reset-failed) is allowed to report a missing/unloaded unit.
+type installStepDef struct {
+	verb     string
+	args     []string
+	tolerant bool
+}
+
+// installStep runs one install lifecycle step. Strict steps must exit zero;
+// tolerant steps accept systemd's absent-unit results. Recognizable failures
+// are reported with their category (invalid generated unit, start-rate-limit
+// refusal, unavailable bus) so the error distinguishes why the step failed.
+func (m *serviceManager) installStep(step installStepDef) error {
+	var err error
+	if step.tolerant {
+		err = m.systemctlTolerantMissing(step.args...)
+	} else {
+		err = m.systemctlSuccess(step.args...)
+	}
+	if err == nil {
+		return nil
+	}
+	if cat := classifySystemdFailure(err.Error()); cat != "" {
+		return fmt.Errorf("%s %s: %s: %w", step.verb, m.unitName, cat, err)
+	}
+	return fmt.Errorf("%s %s: %w", step.verb, m.unitName, err)
 }
 
 func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
@@ -719,34 +828,38 @@ func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
 			return err
 		}
 		// A changed unit must restart (not merely start) so the new
-		// configuration takes effect on an already-running process.
-		for _, step := range []struct {
-			verb string
-			args []string
-		}{
-			{"reloading systemd", []string{"daemon-reload"}},
-			{"enabling", []string{"enable", m.unitName}},
-			{"starting", []string{"restart", m.unitName}},
+		// configuration takes effect on an already-running process. reset-failed
+		// runs immediately before the start so a prior crash-loop that left the
+		// unit start-limited cannot refuse the restart; it is tolerant because a
+		// fresh unit is not loaded yet.
+		for _, step := range []installStepDef{
+			{"reloading systemd", []string{"daemon-reload"}, false},
+			{"enabling", []string{"enable", m.unitName}, false},
+			{"clearing previous failed state", []string{"reset-failed", m.unitName}, true},
+			{"starting", []string{"restart", m.unitName}, false},
 		} {
-			if err := m.systemctlSuccess(step.args...); err != nil {
+			if err := m.installStep(step); err != nil {
 				if rb := m.rollbackInstall(priorUnit, hadUnit, priorEnabledWord, priorActiveWord); rb != "" {
-					return fmt.Errorf("%s %s: %w%s", step.verb, m.unitName, err, rb)
+					return fmt.Errorf("%w%s", err, rb)
 				}
-				return fmt.Errorf("%s %s: %w", step.verb, m.unitName, err)
+				return err
 			}
 		}
 	} else {
 		// Unit bytes are unchanged: only perform the lifecycle work required
-		// to reach the documented installed state (enabled and active).
-		steps := [][]string{}
+		// to reach the documented installed state (enabled and active). A prior
+		// inactive unit that is still start-limited (for example after a
+		// crash-loop) must have its failed state cleared before start.
+		steps := []installStepDef{}
 		if priorEnabledWord != "enabled" {
-			steps = append(steps, []string{"enable", m.unitName})
+			steps = append(steps, installStepDef{"enabling", []string{"enable", m.unitName}, false})
 		}
 		if priorActiveWord != "active" {
-			steps = append(steps, []string{"start", m.unitName})
+			steps = append(steps, installStepDef{"clearing previous failed state", []string{"reset-failed", m.unitName}, true})
+			steps = append(steps, installStepDef{"starting", []string{"start", m.unitName}, false})
 		}
-		for _, args := range steps {
-			if err := m.systemctlSuccess(args...); err != nil {
+		for _, step := range steps {
+			if err := m.installStep(step); err != nil {
 				if rb := m.rollbackInstall(priorUnit, hadUnit, priorEnabledWord, priorActiveWord); rb != "" {
 					return fmt.Errorf("bringing %s to the installed state: %w%s", m.unitName, err, rb)
 				}
@@ -758,7 +871,7 @@ func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
 	fmt.Fprintf(out, "unit:   %s\n", m.unitName)
 	fmt.Fprintf(out, "file:   %s\n", m.unitPath)
 	fmt.Fprintf(out, "state:  %s\n", strings.TrimSpace(active))
-	fmt.Fprintf(out, "url:    http://%s\n", opts.listen)
+	fmt.Fprintf(out, "url:    http://%s\n", opts.listener())
 	return nil
 }
 

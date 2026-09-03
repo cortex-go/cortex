@@ -105,21 +105,67 @@ func activeHandler(fr *fakeRunner) func(name string, args ...string) (string, in
 	}
 }
 
-func TestSystemdQuote(t *testing.T) {
+func TestSystemdExecQuote(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"/usr/bin/cortex", `"/usr/bin/cortex"`},
 		{`C:\cortex\app`, `"C:\\cortex\\app"`},
-		{"has $dollar", `"has \$dollar"`},
+		{"has $dollar", `"has $$dollar"`},
+		{"expand ${FOO} here", `"expand $${FOO} here"`},
 		{`say "hi"`, `"say \"hi\""`},
 		{"100%", `"100%%"`},
+		{"a b  c", `"a b  c"`},
 	}
 	for _, c := range cases {
-		if got := systemdQuote(c.in); got != c.want {
-			t.Fatalf("systemdQuote(%q)=%q want %q", c.in, got, c.want)
+		if got := systemdExecQuote(c.in); got != c.want {
+			t.Fatalf("systemdExecQuote(%q)=%q want %q", c.in, got, c.want)
 		}
 	}
-	if got := systemdQuote("a`b"); got != "\"a\\`b\"" {
-		t.Fatalf("backtick not escaped: %q", got)
+	// Backticks and single quotes are literal in systemd command lines; a
+	// backslash before them would survive as a stray character, so they must
+	// not be escaped.
+	if got := systemdExecQuote("a`b"); got != "\"a`b\"" {
+		t.Fatalf("backtick must stay literal: %q", got)
+	}
+	if got := systemdExecQuote("it's"); got != `"it's"` {
+		t.Fatalf("single quote must stay literal: %q", got)
+	}
+}
+
+func TestSystemdEnvValue(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/home/nick/.config/gh", `"/home/nick/.config/gh"`},
+		{"/path with spaces", `"/path with spaces"`},
+		{`back\slash`, `"back\\slash"`},
+		{`say "hi"`, `"say \"hi\""`},
+		{"50%", `"50%%"`},
+		{"$USER stays literal", `"$USER stays literal"`},
+		{"a`b", "\"a`b\""},
+	}
+	for _, c := range cases {
+		if got := systemdEnvValue(c.in); got != c.want {
+			t.Fatalf("systemdEnvValue(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSystemdUnitPath(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/usr/local/bin", "/usr/local/bin"},
+		{"/home/nick/My Documents", "/home/nick/My Documents"},
+		{`/tmp/foo"bar`, `/tmp/foo"bar`},
+		{`/tmp/a\b`, `/tmp/a\b`},
+		{"/tmp/100%", "/tmp/100%%"},
+		{"/tmp/%h/secret", "/tmp/%%h/secret"},
+	}
+	for _, c := range cases {
+		if got := systemdUnitPath(c.in); got != c.want {
+			t.Fatalf("systemdUnitPath(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+	for _, in := range []string{"/usr/local/bin", "/home/nick/My Documents", `"/usr/local/bin"`} {
+		if got := systemdUnitPath(in); strings.Contains(got, "\"") && !strings.HasPrefix(got, "\"") {
+			t.Fatalf("systemdUnitPath(%q) introduced quotes: %q", in, got)
+		}
 	}
 }
 
@@ -149,6 +195,185 @@ func TestBuildCortexUnit(t *testing.T) {
 	if _, err := readManagedUnitBytes(t, []byte(unit)); err != nil {
 		t.Fatalf("built unit should validate: %v", err)
 	}
+}
+
+// TestBuildCortexUnitWorkingDirectoryNoQuotes is the regression for the real
+// Ubuntu install failure: WorkingDirectory must be an unquoted absolute path
+// equivalent to "WorkingDirectory=/usr/local/bin". Literal quote characters
+// around the value make systemd reject the unit ("path is not absolute"), which
+// made `cortex service install` fail with "bad unit file setting".
+func TestBuildCortexUnitWorkingDirectoryNoQuotes(t *testing.T) {
+	opts := testOpts("127.0.0.1:9000")
+	unit := buildCortexUnit("/usr/local/bin/cortex", opts)
+	if !strings.Contains(unit, "WorkingDirectory=/usr/local/bin\n") {
+		t.Fatalf("WorkingDirectory must be an unquoted absolute path\n%s", unit)
+	}
+	for _, bad := range []string{`WorkingDirectory="/usr/local/bin"`, `WorkingDirectory=\"/usr/local/bin\"`, `WorkingDirectory='"/usr/local/bin"'`} {
+		if strings.Contains(unit, bad) {
+			t.Fatalf("unit contains a quoted WorkingDirectory value %q\n%s", bad, unit)
+		}
+	}
+}
+
+// TestBuildCortexUnitRestartPolicy pins the approved finite restart policy in
+// its correct sections: StartLimitIntervalSec and StartLimitBurst in [Unit],
+// Restart and RestartSec in [Service]. The unit must never regress to unlimited
+// crash-loop restarting.
+func TestBuildCortexUnitRestartPolicy(t *testing.T) {
+	unit := buildCortexUnit("/usr/local/bin/cortex", testOpts("127.0.0.1:9000"))
+	unitSection := sectionContent(unit, "[Unit]")
+	serviceSection := sectionContent(unit, "[Service]")
+	for _, want := range []string{"StartLimitIntervalSec=60", "StartLimitBurst=5"} {
+		if !strings.Contains(unitSection, want) {
+			t.Fatalf("[Unit] section missing %q\n%s", want, unit)
+		}
+	}
+	for _, want := range []string{"Restart=on-failure", "RestartSec=3"} {
+		if !strings.Contains(serviceSection, want) {
+			t.Fatalf("[Service] section missing %q\n%s", want, unit)
+		}
+	}
+	for _, bad := range []string{"Restart=always", "StartLimitIntervalSec=0", "StartLimitBurst=0"} {
+		if strings.Contains(unit, bad) {
+			t.Fatalf("unit regressed to %q\n%s", bad, unit)
+		}
+	}
+}
+
+// sectionContent returns the body of a systemd unit section, or "" when the
+// section header is absent.
+func sectionContent(unit, header string) string {
+	lines := strings.Split(unit, "\n")
+	in := false
+	var b strings.Builder
+	for _, ln := range lines {
+		if strings.HasPrefix(ln, "[") && strings.HasSuffix(ln, "]") {
+			in = ln == header
+			continue
+		}
+		if in {
+			b.WriteString(ln)
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// TestBuildCortexUnitSpecialCharacters renders a unit whose executable,
+// workspace, data, and gh config paths contain systemd-sensitive characters
+// (spaces, quotes, backslashes, percent, dollar) and asserts each directive
+// escapes its value according to the directive's syntax: command-line quoting
+// for ExecStart, assignment quoting for Environment, and unquoted path escaping
+// for WorkingDirectory (which derives from the executable's parent directory).
+func TestBuildCortexUnitSpecialCharacters(t *testing.T) {
+	opts := serviceOptions{
+		host:         "127.0.0.1",
+		port:         "7331",
+		root:         `/home/nick/My Documents 100% cortex`,
+		data:         `/home/nick/.config/50% data "quoted"`,
+		publicOrigin: "https://cortex.example.com",
+		ghDir:        `/home/nick/.config/gh config`,
+	}
+	exe := `/usr/local/bin/My Cortex 100%/cortex`
+	unit := buildCortexUnit(exe, opts)
+
+	if !strings.Contains(unit, "WorkingDirectory=/usr/local/bin/My Cortex 100%%\n") {
+		t.Fatalf("WorkingDirectory must be the raw unquoted parent path with percent doubled\n%s", unit)
+	}
+	for _, want := range []string{
+		`ExecStart="/usr/local/bin/My Cortex 100%%/cortex"`,
+		`"--root" "/home/nick/My Documents 100%% cortex"`,
+		`"--data" "/home/nick/.config/50%% data \"quoted\""`,
+		`Environment=GH_CONFIG_DIR="/home/nick/.config/gh config"`,
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("unit missing %q\n%s", want, unit)
+		}
+	}
+	if strings.Contains(unit, `WorkingDirectory="/usr/local/bin`) {
+		t.Fatal("WorkingDirectory must not be quoted")
+	}
+}
+
+// TestSystemdAnalyzeVerifyRenderedUnit is a genuine Linux validation of the
+// rendered unit: it writes the generated unit to a temporary file and runs
+// `systemd-analyze --user verify` against it. The exit code is authoritative —
+// a string-only assertion is insufficient because the malformed WorkingDirectory
+// line looked superficially plausible. A deliberately buggy variant (quoted
+// WorkingDirectory) is verified to FAIL so the mechanism is proven to catch the
+// exact observed regression, not merely to accept any input.
+func TestSystemdAnalyzeVerifyRenderedUnit(t *testing.T) {
+	analyze, err := exec.LookPath("systemd-analyze")
+	if err != nil {
+		t.Skip("systemd-analyze not installed; skipping real systemd unit verification")
+	}
+	if _, err := os.Stat("/bin/true"); err != nil {
+		t.Skip("/bin/true unavailable; skipping real systemd unit verification")
+	}
+	// specialExe installs a real executable under a path containing spaces and
+	// a percent sign, so systemd-analyze's executable check passes while the
+	// working directory exercises systemd-sensitive characters.
+	specialExe := func(t *testing.T) string {
+		t.Helper()
+		dir := filepath.Join(t.TempDir(), "Cortex 100%")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		src, err := os.ReadFile("/bin/true")
+		if err != nil {
+			t.Fatal(err)
+		}
+		exe := filepath.Join(dir, "cortex")
+		if err := os.WriteFile(exe, src, 0755); err != nil {
+			t.Fatal(err)
+		}
+		return exe
+	}
+	writeAndVerify := func(t *testing.T, name, unit string) (string, bool) {
+		t.Helper()
+		dir := t.TempDir()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(unit), 0644); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command(analyze, "--user", "verify", path).CombinedOutput()
+		ok := err == nil && !strings.Contains(string(out), path)
+		return string(out), ok
+	}
+
+	opts := testOpts("127.0.0.1:7331")
+	opts.ghDir = "/home/nick/.config/gh"
+
+	t.Run("ordinary paths verify clean", func(t *testing.T) {
+		out, ok := writeAndVerify(t, "cortex.service", buildCortexUnit("/bin/true", opts))
+		if !ok {
+			t.Fatalf("systemd-analyze verify failed for the ordinary unit\n%s", out)
+		}
+	})
+	t.Run("special-character paths verify clean", func(t *testing.T) {
+		special := serviceOptions{
+			host:         "127.0.0.1",
+			port:         "7331",
+			root:         `/home/nick/My Documents 100% cortex`,
+			data:         `/home/nick/.config/50% data "quoted"`,
+			publicOrigin: "https://cortex.example.com",
+			ghDir:        `/home/nick/.config/gh config`,
+		}
+		out, ok := writeAndVerify(t, "cortex.service", buildCortexUnit(specialExe(t), special))
+		if !ok {
+			t.Fatalf("systemd-analyze verify failed for the special-character unit\n%s", out)
+		}
+	})
+	t.Run("quoted WorkingDirectory is rejected by verify", func(t *testing.T) {
+		buggy := strings.Replace(buildCortexUnit("/bin/true", opts), "WorkingDirectory=/bin", `WorkingDirectory="/bin"`, 1)
+		out, ok := writeAndVerify(t, "cortex.service", buggy)
+		if ok {
+			t.Fatalf("systemd-analyze verify accepted the quoted WorkingDirectory regression\n%s", out)
+		}
+		if !strings.Contains(out, "not absolute") {
+			t.Fatalf("verify did not report the WorkingDirectory path error\n%s", out)
+		}
+	})
 }
 
 func readManagedUnitBytes(t *testing.T, data []byte) (unitMeta, error) {
@@ -214,6 +439,78 @@ func unitWithMeta(listen, health string) string {
 	content := "# cortex-listen: " + listen + "\n# cortex-health: " + health + "\n" + body
 	sum := sha256.Sum256([]byte(content))
 	return cortexUnitMarker + "\n" + cortexManagedPrefix + "v1 sha256=" + hex.EncodeToString(sum[:]) + "\n" + content
+}
+
+func TestClassifySystemdFailure(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Failed to restart cortex.service: Unit cortex.service has a bad unit file setting.", "generated unit is invalid"},
+		{"cortex.service: Unit configuration has fatal error, unit will not be started.", "generated unit is invalid"},
+		{"WorkingDirectory= path is not absolute: \"/usr/local/bin\"", "generated unit is invalid"},
+		{"cortex.service: Unknown key 'Foo' in section [Service], ignoring.", "generated unit is invalid"},
+		{"cortex.service: Invalid argument", "generated unit is invalid"},
+		{"cortex.service: Start request repeated too quickly.", "start rate limit exceeded"},
+		{"Failed to connect to bus: No such file or directory", "systemd bus unavailable"},
+		{"Some other failure", ""},
+	}
+	for _, c := range cases {
+		if got := classifySystemdFailure(c.in); got != c.want {
+			t.Fatalf("classifySystemdFailure(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSystemctlTolerantMissingDoesNotExist(t *testing.T) {
+	fr := &fakeRunner{out: "Failed to disable unit cortex.service: Unit cortex.service does not exist.", code: 1}
+	m := &serviceManager{unitName: "cortex.service", run: fr}
+	if err := m.systemctlTolerantMissing("disable", m.unitName); err != nil {
+		t.Fatalf("'does not exist' must be tolerated as an absent unit: %v", err)
+	}
+	fr = &fakeRunner{out: "Failed to stop unit cortex.service: Unit cortex.service not loaded.", code: 1}
+	m.run = fr
+	if err := m.systemctlTolerantMissing("stop", m.unitName); err != nil {
+		t.Fatalf("'not loaded' must be tolerated: %v", err)
+	}
+	fr = &fakeRunner{out: "systemd is broken", code: 1}
+	m.run = fr
+	if err := m.systemctlTolerantMissing("stop", m.unitName); err == nil {
+		t.Fatal("a genuine failure must not be tolerated")
+	}
+}
+
+// TestInstallInvalidUnitCleanRollback reproduces the real Ubuntu failure: a
+// generated unit that systemd refuses to load. The install fails at restart
+// with "bad unit file setting", the rollback's stop/disable see the unloadable
+// unit as "does not exist" and must be tolerated as a clean absence, and the
+// reported error must distinguish the invalid generated unit while leaving a
+// retryable (unit-file-removed) state.
+func TestInstallInvalidUnitCleanRollback(t *testing.T) {
+	m, fr, _ := newFakeManager(t)
+	fr.handler = func(name string, args ...string) (string, int, error) {
+		switch {
+		case fr.contains(args, "daemon-reload"):
+			return "", 0, nil
+		case fr.contains(args, "enable"):
+			return "Created symlink", 0, nil
+		case fr.contains(args, "restart"):
+			return "Failed to restart cortex.service: Unit cortex.service has a bad unit file setting.", 1, nil
+		case fr.contains(args, "stop"), fr.contains(args, "disable"):
+			return "Failed to disable unit cortex.service: Unit cortex.service does not exist.", 1, nil
+		}
+		return "", 0, nil
+	}
+	err := m.install(testOpts("127.0.0.1:7331"), os.Stderr)
+	if err == nil {
+		t.Fatal("install with an unloadable unit did not fail")
+	}
+	if !strings.Contains(err.Error(), "generated unit is invalid") {
+		t.Fatalf("install did not classify the invalid generated unit: %v", err)
+	}
+	if strings.Contains(err.Error(), "rollback incomplete") {
+		t.Fatalf("rollback over an unloadable unit must be reported as clean: %v", err)
+	}
+	if _, statErr := os.Stat(m.unitPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatal("failed install left the unit file behind (state not retryable)")
+	}
 }
 
 func TestValidateNoControl(t *testing.T) {
@@ -435,7 +732,7 @@ func (f *fakeSystemd) runner() *fakeRunner {
 			return word, exitForActive(word), nil
 		}
 		// enable, enable --runtime, disable, mask, mask --runtime, start,
-		// restart, stop
+		// restart, stop, reset-failed
 		switch verb {
 		case "enable", "disable", "mask":
 			if containsStr(args, "--runtime") {
@@ -470,9 +767,22 @@ func (f *fakeSystemd) runner() *fakeRunner {
 			if f.mask || f.maskRT {
 				return "Failed to start unit: masked", 1, nil
 			}
+			if fail {
+				// A refused/unsuccessful start leaves the prior state intact.
+				return verb + " failed", 1, nil
+			}
 			f.active = "active"
+			f.overrideActive = ""
 		case "stop":
+			// Real systemd keeps a start-limited (failed) unit reporting failed
+			// after stop, so stop preserves the overrideActive failure word.
 			f.active = "inactive"
+		case "reset-failed":
+			if fail {
+				return "reset-failed failed", 1, nil
+			}
+			f.active = "inactive"
+			f.overrideActive = ""
 		}
 		if fail {
 			return verb + " failed", 1, nil
@@ -656,24 +966,30 @@ func TestInstallRollbackMatrix(t *testing.T) {
 	pairs := []struct {
 		enabled, active string
 		restorable      bool
+		failAt          string
 	}{
-		{"enabled", "active", true}, {"enabled", "inactive", true},
-		{"enabled-runtime", "active", true}, {"enabled-runtime", "inactive", true},
-		{"disabled", "active", true}, {"disabled", "inactive", true},
+		{"enabled", "active", true, "restart"}, {"enabled", "inactive", true, "restart"},
+		{"enabled-runtime", "active", true, "restart"}, {"enabled-runtime", "inactive", true, "restart"},
+		{"disabled", "active", true, "restart"}, {"disabled", "inactive", true, "restart"},
+		// A start-limited failed unit is restorable exactly: systemctl stop
+		// leaves it reporting failed. The injected failure happens at enable,
+		// before the install's reset-failed clears the failure, so rollback's
+		// stop reproduces the exact prior "failed" word.
+		{"enabled", "failed", true, "enable"}, {"disabled", "failed", true, "enable"},
 		// Refused: masked states (the install itself cannot enable a masked
 		// unit), not exact (dead/unknown/not-found active, not-found enabled),
-		// transient/failed, and unit-file enablement states.
-		{"enabled", "dead", false}, {"enabled", "unknown", false}, {"enabled", "not-found", false},
-		{"enabled-runtime", "failed", false}, {"enabled-runtime", "reloading", false},
-		{"disabled", "refreshing", false}, {"disabled", "activating", false},
-		{"disabled", "deactivating", false}, {"disabled", "maintenance", false},
-		{"masked", "active", false}, {"masked-runtime", "active", false},
-		{"masked", "failed", false},
-		{"not-found", "active", false}, {"not-found", "inactive", false},
-		{"static", "active", false}, {"alias", "active", false}, {"indirect", "active", false},
-		{"generated", "active", false}, {"linked", "active", false},
-		{"linked-runtime", "active", false}, {"transient", "active", false},
-		{"unknown", "active", false},
+		// transient, and unit-file enablement states.
+		{"enabled", "dead", false, "restart"}, {"enabled", "unknown", false, "restart"}, {"enabled", "not-found", false, "restart"},
+		{"enabled-runtime", "reloading", false, "restart"},
+		{"disabled", "refreshing", false, "restart"}, {"disabled", "activating", false, "restart"},
+		{"disabled", "deactivating", false, "restart"}, {"disabled", "maintenance", false, "restart"},
+		{"masked", "active", false, "restart"}, {"masked-runtime", "active", false, "restart"},
+		{"masked", "failed", false, "restart"},
+		{"not-found", "active", false, "restart"}, {"not-found", "inactive", false, "restart"},
+		{"static", "active", false, "restart"}, {"alias", "active", false, "restart"}, {"indirect", "active", false, "restart"},
+		{"generated", "active", false, "restart"}, {"linked", "active", false, "restart"},
+		{"linked-runtime", "active", false, "restart"}, {"transient", "active", false, "restart"},
+		{"unknown", "active", false, "restart"},
 	}
 	for _, p := range pairs {
 		t.Run("enabled="+p.enabled+"/active="+p.active, func(t *testing.T) {
@@ -695,19 +1011,19 @@ func TestInstallRollbackMatrix(t *testing.T) {
 				if string(after) != string(priorUnit) {
 					t.Fatal("refusal changed the unit file")
 				}
-				for _, forbid := range []string{"daemon-reload", "enable ", "mask ", "disable ", "restart ", "start ", "stop "} {
+				for _, forbid := range []string{"daemon-reload", "enable ", "mask ", "disable ", "restart ", "start ", "stop ", "reset-failed"} {
 					if fs.callsContain(forbid) {
 						t.Fatalf("refusal performed a lifecycle mutation (%q)\ncalls: %v", forbid, fs.calls)
 					}
 				}
 				return
 			}
-			// Restorable: fail the final lifecycle step, run rollback, and assert
+			// Restorable: fail a lifecycle step, run rollback, and assert
 			// the final raw state exactly matches the prior raw state.
-			fs.failVerb = "restart"
+			fs.failVerb = p.failAt
 			err := m.install(testOpts("127.0.0.1:7333"), os.Stderr)
 			if err == nil {
-				t.Fatalf("install should fail at restart for restorable pair (%q/%q)", p.enabled, p.active)
+				t.Fatalf("install should fail for restorable pair (%q/%q)", p.enabled, p.active)
 			}
 			after, _ := os.ReadFile(m.unitPath)
 			if string(after) != string(priorUnit) {
@@ -770,12 +1086,13 @@ func TestInstallRestoresEnablementLayers(t *testing.T) {
 // TestInstallReachesInstalledStateForAcceptedPriors proves every accepted prior
 // state lets the install reach the documented enabled-and-active state, so a
 // state is never accepted merely because rollback could recover from an install
-// that can never succeed.
+// that can never succeed. A start-limited failed prior must be recovered with
+// reset-failed before the service can start again.
 func TestInstallReachesInstalledStateForAcceptedPriors(t *testing.T) {
 	for _, p := range [][2]string{
-		{"enabled", "active"}, {"enabled", "inactive"},
+		{"enabled", "active"}, {"enabled", "inactive"}, {"enabled", "failed"},
 		{"enabled-runtime", "active"}, {"enabled-runtime", "inactive"},
-		{"disabled", "active"}, {"disabled", "inactive"},
+		{"disabled", "active"}, {"disabled", "inactive"}, {"disabled", "failed"},
 	} {
 		t.Run(p[0]+"/"+p[1], func(t *testing.T) {
 			m, _, _ := newFakeManager(t)
@@ -795,6 +1112,84 @@ func TestInstallReachesInstalledStateForAcceptedPriors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestInstallResetFailedRecovery proves the install clears a prior start-limit
+// failed state with reset-failed before starting, so a crash-looped unit can be
+// reinstalled without manual systemctl intervention. A reset-failed failure on
+// an unloaded unit (fresh install) is tolerated and reported distinctly when it
+// fails for a real reason.
+func TestInstallResetFailedRecovery(t *testing.T) {
+	t.Run("reinstall over a start-limited unit clears the failure", func(t *testing.T) {
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		m.run = fs.runner()
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fs.setState("enabled", "failed")
+		fs.calls = nil
+		if err := m.install(testOpts("127.0.0.1:7333"), os.Stderr); err != nil {
+			t.Fatalf("reinstall over a failed unit failed: %v", err)
+		}
+		if !fs.callsContain("reset-failed cortex.service") {
+			t.Fatalf("install did not reset the failed state\ncalls: %v", fs.calls)
+		}
+		if fs.activeWord() != "active" {
+			t.Fatalf("service did not reach active after reset-failed recovery, got %q", fs.activeWord())
+		}
+	})
+	t.Run("unchanged unit on a failed unit resets then starts", func(t *testing.T) {
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		m.run = fs.runner()
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fs.setState("enabled", "failed")
+		fs.calls = nil
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatalf("unchanged install over a failed unit failed: %v", err)
+		}
+		if !fs.callsContain("reset-failed cortex.service") || !fs.callsContain("start cortex.service") {
+			t.Fatalf("unchanged install did not reset and start\ncalls: %v", fs.calls)
+		}
+		if fs.callsContain("daemon-reload") {
+			t.Fatalf("unchanged install reloaded systemd needlessly\ncalls: %v", fs.calls)
+		}
+	})
+	t.Run("fresh install tolerates reset-failed on an unloaded unit", func(t *testing.T) {
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		fr := fs.runner()
+		m.run = fr
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatalf("fresh install failed: %v", err)
+		}
+		if !fs.callsContain("reset-failed cortex.service") {
+			t.Fatalf("fresh install did not call reset-failed\ncalls: %v", fs.calls)
+		}
+		if fs.activeWord() != "active" {
+			t.Fatalf("fresh install did not reach active, got %q", fs.activeWord())
+		}
+	})
+	t.Run("reset-failed hard failure is reported distinctly", func(t *testing.T) {
+		m, _, _ := newFakeManager(t)
+		fs := newFakeSystemd(m.unitPath)
+		m.run = fs.runner()
+		if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+			t.Fatal(err)
+		}
+		fs.setState("enabled", "inactive")
+		fs.failVerb = "reset-failed"
+		err := m.install(testOpts("127.0.0.1:7333"), os.Stderr)
+		if err == nil {
+			t.Fatal("install did not report the reset-failed failure")
+		}
+		if !strings.Contains(err.Error(), "clearing previous failed state") {
+			t.Fatalf("reset-failed failure not attributed to the reset step: %v", err)
+		}
+	})
 }
 
 func TestInstallFailureRestoresPriorState(t *testing.T) {

@@ -63,3 +63,32 @@ jobs:
         run: git diff --check
       - name: workflow contract
         run: scripts/workflow-contract.sh
+
+  service-lifecycle:
+    # Exercises the real systemd user-service contract on Linux: the script
+    # boots an isolated user manager when the runner has no login session, then
+    # installs, reloads, enables/starts, verifies active state and health,
+    # stops/starts/restarts, injects a start-limit failure and recovers via
+    # reinstall, uninstalls, and reinstalls. It also runs systemd-analyze
+    # --user verify over the generated unit so a malformed directive fails CI.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: install systemd analyze tooling
+        run: |
+          if ! command -v systemd-analyze >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y systemd-analyze
+          fi
+      - name: build cortex binary
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          go build -trimpath -o "$HOME/.local/bin/cortex" ./cmd/cortex
+      - name: real systemd service lifecycle
+        run: tests/service-lifecycle.sh
+      - name: git diff --check
+        run: git diff --check
