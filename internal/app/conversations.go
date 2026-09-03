@@ -27,11 +27,11 @@ type conversationEvent struct {
 	Text      string `json:"text"`
 	Name      string `json:"name,omitempty"`
 	CreatedAt int64  `json:"createdAt,omitempty"`
-	// RunID is a private server-only field carrying the owning run for
-	// server-owned events. It is excluded from JSON and used internally for
-	// run-scoped supersession so a replacement never removes assistant content
-	// from an unrelated run.
-	RunID string `json:"-"`
+	// RunID is the owning run identifier for task snapshot ownership. It is a
+	// validated opaque token (empty for client-authored events without a run),
+	// persisted so a reload can reject stale task events from a superseded run
+	// instead of treating them as the current run's tasks.
+	RunID string `json:"runId,omitempty"`
 }
 
 type conversation struct {
@@ -221,11 +221,18 @@ func (a *App) saveConversationTx(tx *sql.Tx, c *conversation) error {
 		if len(event.Text) > 1<<20 || len(event.Name) > 500 || event.Kind == "" {
 			return errors.New("invalid conversation event")
 		}
+		// The run identity is a validated opaque token. An empty value is the
+		// authoritative untagged state (client-authored events and the empty
+		// task reset); a non-empty value must be a well-formed record id so a
+		// browser cannot forge a run association or smuggle control data.
+		if event.RunID != "" && !validRecordID(event.RunID) {
+			return errors.New("invalid conversation event run id")
+		}
 		created := event.CreatedAt
 		if created <= 0 {
 			created = c.CreatedAt + int64(i)
 		}
-		if _, err = tx.Exec("INSERT INTO conversation_events(conversation_id,sequence,kind,text,name,created_at) VALUES(?,?,?,?,?,?)", c.ID, i, event.Kind, event.Text, event.Name, created); err != nil {
+		if _, err = tx.Exec("INSERT INTO conversation_events(conversation_id,sequence,kind,text,name,created_at,run_id) VALUES(?,?,?,?,?,?,?)", c.ID, i, event.Kind, event.Text, event.Name, created, event.RunID); err != nil {
 			return err
 		}
 	}
@@ -271,7 +278,7 @@ func (a *App) loadConversations(query string) ([]conversation, error) {
 }
 
 func (a *App) loadConversationEvents(id string) ([]conversationEvent, error) {
-	rows, err := a.db.Query("SELECT kind,text,name,created_at FROM conversation_events WHERE conversation_id = ? ORDER BY sequence", id)
+	rows, err := a.db.Query("SELECT kind,text,name,created_at,run_id FROM conversation_events WHERE conversation_id = ? ORDER BY sequence", id)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +286,7 @@ func (a *App) loadConversationEvents(id string) ([]conversationEvent, error) {
 	events := []conversationEvent{}
 	for rows.Next() {
 		var event conversationEvent
-		if err := rows.Scan(&event.Kind, &event.Text, &event.Name, &event.CreatedAt); err != nil {
+		if err := rows.Scan(&event.Kind, &event.Text, &event.Name, &event.CreatedAt, &event.RunID); err != nil {
 			return nil, err
 		}
 		events = append(events, event)

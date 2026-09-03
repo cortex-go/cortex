@@ -150,7 +150,7 @@ const ctx=load(src,'function isToolEventText','function renderFeed');
 
 // ---- Event classification used by the streaming run loop ----
 {
-  const ctx2=load(src,'function eventKind','function renderFeed');
+  const ctx2=load(src,'function eventData','function renderFeed');
   if(ctx2.eventKind({type:'error',data:{message:'x'}})!=='error')throw new Error('error classification');
   if(ctx2.eventKind({type:'done',data:{}})!=='done')throw new Error('done classification');
   if(ctx2.eventKind({type:'opencode',data:{type:'tool',part:{type:'tool',tool:'bash'}}})!=='tool')throw new Error('tool classification');
@@ -159,7 +159,7 @@ const ctx=load(src,'function isToolEventText','function renderFeed');
 
 // ---- summarize/toolText produce an un-prefixed ↳ header ----
 {
-  const ctx3=load(src,'function clipped','async function runAgent');
+  const ctx3=load(src,'function eventData','async function runAgent');
   const ev={type:'opencode',data:{type:'tool',part:{type:'tool',tool:'bash',state:{status:'failed',input:{command:'gh auth status'},output:'x'}}}};
   const text=ctx3.summarize(ev);
   if(!text.startsWith('↳ bash · failed'))throw new Error('summarize tool text wrong: '+JSON.stringify(text));

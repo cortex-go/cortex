@@ -938,6 +938,240 @@ test('reload restores a consistent default-workspace presentation', async () => 
   if (run(ctx, "$('#run').disabled")) throw new Error('Run must be enabled after restoring a default-workspace session');
 });
 
+// --- UX edge regressions: durable task run identity, blocked submits, and
+// attachment ownership. ---
+
+// A stateful fetch that mirrors SQLite conversation persistence: PUT records
+// the conversation, GET /api/conversations returns every stored record, so a
+// fresh browser context can reload from the "server".
+function sqliteMirror(store) {
+  return (url, opt = {}) => {
+    if (url === '/api/conversation' && (opt.method || 'GET').toUpperCase() === 'PUT') {
+      const body = JSON.parse(opt.body);
+      const idx = store.findIndex((r) => r.id === body.id);
+      if (idx >= 0) store[idx] = { ...store[idx], ...body };
+      else store.push(body);
+      return Promise.resolve(jsonOk({ ok: true }));
+    }
+    if (url === '/api/conversations') return Promise.resolve(jsonOk([...store]));
+    return Promise.resolve(jsonOk({}));
+  };
+}
+
+test('task run identity survives persistence and a fresh reload', async () => {
+  const store = [];
+  const ctx = loadContext(sqliteMirror(store));
+  run(ctx, "serverReady=true;sessions={a:{id:'a',workspace:'/w',events:[],busy:false,followBottom:true,unread:0,currentRunId:'run-1'}};activeId='a'");
+  // Run A emits a task snapshot.
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set(), "run-1")', { EV: { type: 'task', data: { snapshot: '[{"content":"run A","status":"pending","priority":"high"}]' } } });
+  // Run B begins: its empty reset is persisted.
+  run(ctx, 'resetTaskStateForNewRun("a")');
+  run(ctx, "sessions['a'].currentRunId='run-2'");
+  // A late Run A task snapshot arrives after Run B started.
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set(), "run-1")', { EV: { type: 'task', data: { snapshot: '[{"content":"late run A","status":"pending","priority":"high"}]' } } });
+  await settle(30);
+  // Confirm the run identity is durable in the persisted event stream: the
+  // server-owned task events must carry their owning run id (or empty reset).
+  const taskEvents = run(ctx, "sessions['a'].events.filter(e=>e.kind==='task')");
+  if (taskEvents.length < 3) throw new Error('expected task reset + snapshots, got ' + taskEvents.length);
+  if (taskEvents[0].runID !== 'run-1') throw new Error('run A snapshot lost its run identity in memory');
+  // Save to the server mirror and reload in a fresh context.
+  run(ctx, 'saveSessionToServer("a")');
+  await settle(200);
+  if (!store.length) throw new Error('conversation was not persisted');
+  // The persisted event schema must be strict-decoder safe: only known fields
+  // (kind, text, name, createdAt, runId), never transient outcome/runID.
+  const persisted = store[0].events || [];
+  for (const ev of persisted) {
+    if ('outcome' in ev) throw new Error('transient outcome leaked into the persisted event schema');
+    if ('runID' in ev) throw new Error('transient runID leaked into the persisted event schema');
+  }
+  const ctx2 = loadContext(sqliteMirror(store));
+  run(ctx2, "serverReady=true");
+  await run(ctx2, 'syncServerConversations()');
+  const restored = run(ctx2, "sessions['a']");
+  if (!restored) throw new Error('conversation not restored after reload');
+  // The reloaded task events must keep their run identity so the stale Run A
+  // snapshot cannot become authoritative for Run B.
+  const latest = run(ctx2, "(latestTaskEvent(sessions['a'])||{}).text");
+  if (latest !== '[]') throw new Error('stale run A snapshot became authoritative after reload: ' + latest);
+  if (!run(ctx2, "$('#taskPanel').hidden")) throw new Error('stale run A task list reopened the panel after reload');
+});
+
+test('nested run events keep their run association for task snapshots', async () => {
+  const ctx = loadContext((url, opt) => {
+    if (url === '/api/agent/run') {
+      // A nested run event (data.data.runID) must be captured by runAgent's
+      // normalized stream path and applied to the task snapshot that follows.
+      return Promise.resolve(streamResponse([
+        '{"type":"run","data":{"data":{"runID":"nested-run"}}}',
+        '{"type":"task","data":{"data":{"snapshot":"[{\\"content\\":\\"nested\\",\\"status\\":\\"in_progress\\",\\"priority\\":\\"high\\"}]"}}}',
+        '{"type":"done","data":{"outcome":"completed"}}',
+      ]));
+    }
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],busy:false,followBottom:true,unread:0}};activeId='a'");
+  await run(ctx, 'runAgent("do it")');
+  await settle(30);
+  if (run(ctx, "sessions['a'].currentRunId") !== 'nested-run') throw new Error('nested run identity not captured by runAgent');
+  if (run(ctx, "sessions['a'].runID") !== 'nested-run') throw new Error('nested run identity not stored on session');
+  const task = run(ctx, "sessions['a'].events.filter(e=>e.kind==='task').pop()");
+  if (!task || task.runID !== 'nested-run') throw new Error('task snapshot lost the nested run association');
+});
+
+test('Enter submit with an unavailable workspace preserves draft, textarea and attachments', async () => {
+  let runCalls = 0;
+  const ctx = loadContext((url, opt) => {
+    if (url === '/api/agent/run') {
+      runCalls++;
+      return Promise.resolve(streamResponse(['{"type":"run","data":{"runID":"r1"}}', '{"type":"done","data":{"outcome":"completed"}}']));
+    }
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/gone',workspaceStatus:'missing',events:[],createdAt:1,draft:'unsent',attachments:[{id:'img1',name:'a.png',dataUrl:'data:image/png;base64,AAAA',thumb:'t',size:1}],busy:false,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, `$('#prompt').value='unsent'`);
+  run(ctx, `$('#agentForm').onsubmit({preventDefault(){}})`);
+  await settle(30);
+  if (runCalls !== 0) throw new Error('an unavailable workspace must never start an agent request');
+  if (run(ctx, `$('#prompt').value`) !== 'unsent') throw new Error('textarea was erased by a blocked submit');
+  if (run(ctx, "sessions['a'].draft") !== 'unsent') throw new Error('draft was cleared by a blocked submit');
+  if (run(ctx, "sessions['a'].attachments.length") !== 1) throw new Error('attachments were cleared by a blocked submit');
+  // After selecting a replacement workspace, the same draft submits intact.
+  run(ctx, "sessions['a'].workspaceStatus='available'");
+  run(ctx, `$('#prompt').value='unsent'`);
+  run(ctx, `$('#agentForm').onsubmit({preventDefault(){}})`);
+  await settle(30);
+  if (runCalls !== 1) throw new Error('replacement workspace did not enable the run');
+  if (run(ctx, `$('#prompt').value`) !== '') throw new Error('submitted prompt not cleared from the textarea');
+});
+
+test('removing an attachment and clicking the active tab keeps it removed', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `setActiveAttachments([{id:'img1',name:'a.png',dataUrl:'d',thumb:'t',size:1},{id:'img2',name:'b.png',dataUrl:'d',thumb:'t',size:1}])`);
+  if (run(ctx, `sessions['a'].attachments.length`) !== 2) throw new Error('attachments not owned by session A');
+  // Remove one attachment through the rendered remove control.
+  run(ctx, `$('#attachments').children[0].children[2].onclick()`);
+  if (run(ctx, `attachments.length`) !== 1) throw new Error('remove control did not drop the attachment');
+  if (run(ctx, `sessions['a'].attachments.length`) !== 1) throw new Error('session A still holds the removed attachment');
+  // Clicking the already-active tab calls setActiveSession with the same id; a
+  // stale session array must not resurrect the removed attachment.
+  run(ctx, 'setActiveSession("a")');
+  if (run(ctx, `attachments.length`) !== 1) throw new Error('removed attachment reappeared after re-selecting the active tab');
+  if (run(ctx, `attachments[0].id`) !== 'img2') throw new Error('wrong attachment restored');
+});
+
+test('removing an attachment survives switching away and back', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `setActiveAttachments([{id:'img1',name:'a.png',dataUrl:'d',thumb:'t',size:1},{id:'img2',name:'b.png',dataUrl:'d',thumb:'t',size:1}])`);
+  run(ctx, `$('#attachments').children[0].children[2].onclick()`);
+  run(ctx, 'setActiveSession("b")');
+  if (run(ctx, `attachments.length`) !== 0) throw new Error('B must have no attachments');
+  run(ctx, 'setActiveSession("a")');
+  if (run(ctx, `attachments.length`) !== 1) throw new Error('removed attachment reappeared after switching back');
+  if (run(ctx, `attachments[0].id`) !== 'img2') throw new Error('wrong attachment restored after switching back');
+});
+
+test('removing one of several attachments keeps the rest', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `setActiveAttachments([{id:'img1',name:'a.png',dataUrl:'d',thumb:'t',size:1},{id:'img2',name:'b.png',dataUrl:'d',thumb:'t',size:1},{id:'img3',name:'c.png',dataUrl:'d',thumb:'t',size:1}])`);
+  run(ctx, `$('#attachments').children[1].children[2].onclick()`);
+  if (run(ctx, `attachments.length`) !== 2) throw new Error('expected two attachments after removal');
+  if (run(ctx, `attachments.map(a=>a.id).join(',')`) !== 'img1,img3') throw new Error('wrong attachments retained');
+  if (run(ctx, `sessions['a'].attachments.map(a=>a.id).join(',')`) !== 'img1,img3') throw new Error('session attachment state diverged');
+});
+
+test('submit after removal does not send the removed image', async () => {
+  let images = null;
+  const ctx = loadContext((url, opt) => {
+    if (url === '/api/agent/run') {
+      images = JSON.parse(opt.body).images || [];
+      return Promise.resolve(streamResponse(['{"type":"run","data":{"runID":"r1"}}', '{"type":"done","data":{"outcome":"completed"}}']));
+    }
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `setActiveAttachments([{id:'img1',name:'a.png',dataUrl:'data:image/png;base64,AAAA',thumb:'t',size:1},{id:'img2',name:'b.png',dataUrl:'data:image/png;base64,BBBB',thumb:'t',size:1}])`);
+  run(ctx, `$('#attachments').children[0].children[2].onclick()`);
+  await run(ctx, 'runAgent("do it")');
+  await settle(30);
+  if (!images || images.length !== 1) throw new Error('expected exactly one image in the request');
+  if (images[0].name !== 'b.png') throw new Error('the removed image was still sent: ' + JSON.stringify(images));
+});
+
+test('closing a session releases its pending attachment state', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'unsent',attachments:[]},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `setActiveAttachments([{id:'img1',name:'a.png',dataUrl:'d',thumb:'t',size:1}])`);
+  run(ctx, `$('#prompt').value='unsent'`);
+  await run(ctx, 'closeSession("a")');
+  if (run(ctx, `attachments.length`) !== 0) throw new Error('closing a session left its attachments in the composer');
+  if (run(ctx, `$('#prompt').value`) !== '') throw new Error('closing a session left its draft in the composer');
+  const archived = run(ctx, `closedSessions.find(s=>s.id==='a')`);
+  if (archived && archived.attachments && archived.attachments.length) throw new Error('attachment state persisted in the archived record');
+});
+
+// --- UX: layout grouping of the Tasks control and immediate preference save. ---
+
+test('Copy session and Tasks are grouped on the left in the compose row', async () => {
+  const html = require('fs').readFileSync(path.join(__dirname, '..', 'content', 'index.html'), 'utf8');
+  const css = require('fs').readFileSync(path.join(__dirname, '..', 'content', 'assets', 'css', 'style.css'), 'utf8');
+  const row = html.match(/<div class="compose-row">([\s\S]*?)<\/div><\/form>/);
+  if (!row) throw new Error('compose-row not found in index.html');
+  const actions = row[1].match(/<div class="compose-actions">([\s\S]*?)<\/div>/);
+  if (!actions) throw new Error('compose-actions group not found next to Copy session');
+  const copyIdx = actions[1].indexOf('id="copy"');
+  const tasksIdx = actions[1].indexOf('id="taskButton"');
+  if (copyIdx < 0) throw new Error('Copy session is not inside the compose-actions group');
+  if (tasksIdx < 0) throw new Error('Tasks control is not inside the compose-actions group');
+  if (tasksIdx < copyIdx) throw new Error('Tasks control must come directly after Copy session');
+  if (!actions[1].includes('aria-controls="taskPanel"')) throw new Error('Tasks control must carry aria-controls="taskPanel"');
+  if (!/\.compose-actions\{[^}]*margin-right:auto/.test(css)) throw new Error('compose-actions must own the right margin instead of #copy');
+  if (/\.compose-row\s*#copy\{[^}]*margin-right:auto/.test(css)) throw new Error('the obsolete #copy margin rule must be removed');
+});
+
+test('task reset persists the cleared collapsed preference immediately', async () => {
+  const ctx = loadContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  run(ctx, 'setTasksCollapsed(true)');
+  if (run(ctx, "uiPrefs.collapsed['a']") !== true) throw new Error('collapsed preference not set');
+  run(ctx, 'resetTaskStateForNewRun("a")');
+  if (run(ctx, "sessions['a'].tasksCollapsed") !== false) throw new Error('collapsed state not cleared');
+  if (run(ctx, "uiPrefs.collapsed['a']") === true) throw new Error('collapsed UI preference not cleared immediately');
+  const ui = run(ctx, `localStorage.getItem('cortex.ui.v1')`);
+  if (!ui || ui.includes('"a":true')) throw new Error('cleared collapsed preference not persisted immediately: ' + ui);
+});
+
+test('reload during a long-running agent cannot restore the previous collapsed preference', async () => {
+  const store = [];
+  const ctx = loadContext(sqliteMirror(store));
+  run(ctx, "serverReady=true;sessions={a:{id:'a',workspace:'/w',events:[],busy:true,followBottom:true,unread:0}};activeId='a'");
+  run(ctx, 'consumeAgentEvent("a", sessions["a"], EV, new Set())', { EV: { type: 'task', data: { snapshot: '[{"content":"alpha","status":"pending","priority":"high"}]' } } });
+  run(ctx, 'setTasksCollapsed(true)');
+  // A new run starts; the reset must persist the cleared preference before any
+  // reload, so the running agent cannot reopen the old collapsed state.
+  run(ctx, 'resetTaskStateForNewRun("a")');
+  run(ctx, "sessions['a'].currentRunId='run-2'");
+  const ui = run(ctx, `localStorage.getItem('cortex.ui.v1')`);
+  if (!ui || ui.includes('"a":true')) throw new Error('reset did not persist the cleared collapsed preference');
+  // Persist and reload: the running session must present the new run's task
+  // state (open/empty) rather than the previous run's collapsed preference.
+  run(ctx, 'saveSessionToServer("a")');
+  await settle(200);
+  const ctx2 = loadContext(sqliteMirror(store));
+  run(ctx2, "serverReady=true");
+  await run(ctx2, 'syncServerConversations()');
+  if (run(ctx2, "sessions['a'].tasksCollapsed")) throw new Error('previous collapsed preference leaked into the new run after reload');
+  // The running session's task list is the new run's empty reset, so the panel
+  // and its control are hidden/open rather than collapsed.
+  if (run(ctx2, "$('#taskPanel').hidden") !== true) throw new Error('empty reset snapshot must keep the panel hidden');
+  if (run(ctx2, "$('#taskButton').hidden") !== true) throw new Error('empty reset snapshot must keep the Tasks control hidden');
+});
+
 (async function runAll() {
   let pass = 0, fail = 0;
   for (const { name, fn } of __tests) {

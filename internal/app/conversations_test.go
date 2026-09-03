@@ -1,6 +1,9 @@
 package app
 
 import (
+	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -82,6 +85,84 @@ func TestDurableConversationRoundTrip(t *testing.T) {
 	items, _ = a.loadConversations("")
 	if items[0].ArchivedAt != 123 {
 		t.Fatalf("archive time = %d", items[0].ArchivedAt)
+	}
+}
+
+// TestConversationRunIdentitySurvivesReload proves task snapshot ownership is
+// durable: a task event tagged with an older run id persists its run identity
+// through SQLite and comes back untagged only when it was genuinely untagged.
+// After reload the authoritative empty reset still wins, and the stale older-run
+// event can never become the current run's task snapshot.
+func TestConversationRunIdentitySurvivesReload(t *testing.T) {
+	root := t.TempDir()
+	a, err := New(Options{Root: root, DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	c := conversation{ID: "conv-rid", Workspace: root, Events: []conversationEvent{
+		{Kind: "task", Text: `[{"content":"old run A","status":"pending"}]`, RunID: "run-A"},
+		{Kind: "task", Text: "[]", RunID: ""},
+		{Kind: "task", Text: `[{"content":"late run A","status":"pending"}]`, RunID: "run-A"},
+	}}
+	if err := a.saveConversation(&c); err != nil {
+		t.Fatal(err)
+	}
+	items, err := a.loadConversations("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 conversation, got %d", len(items))
+	}
+	var taskRuns []string
+	for _, e := range items[0].Events {
+		if e.Kind == "task" {
+			taskRuns = append(taskRuns, e.RunID)
+		}
+	}
+	want := []string{"run-A", "", "run-A"}
+	if len(taskRuns) != len(want) {
+		t.Fatalf("task run identities = %v, want %v", taskRuns, want)
+	}
+	for i := range want {
+		if taskRuns[i] != want[i] {
+			t.Fatalf("task run identity[%d] = %q, want %q (full %v)", i, taskRuns[i], want[i], taskRuns)
+		}
+	}
+	// The same store must reject a forged/non-validated run id.
+	bad := conversation{ID: "conv-bad", Workspace: root, Events: []conversationEvent{{Kind: "task", Text: "[]", RunID: "not a valid id!"}}}
+	if err := a.saveConversation(&bad); err == nil {
+		t.Fatal("an invalid run identity must be rejected before persistence")
+	}
+}
+
+// TestConversationRejectsForbiddenEventFields verifies the strict decoder still
+// rejects transient browser fields (e.g. the terminal outcome) that are not part
+// of the conversation event schema, while accepting the validated runId field.
+func TestConversationRejectsForbiddenEventFields(t *testing.T) {
+	root := t.TempDir()
+	a, err := New(Options{Root: root, DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	body := `{"id":"x","workspace":"/w","title":"","events":[{"kind":"task","text":"[]","name":"","runId":"abc"}]}`
+	req := httptest.NewRequest(http.MethodPut, "/api/conversation", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	var q conversation
+	if !decodeSized(rec, req, &q, 16<<20) {
+		t.Fatalf("valid schema with runId was rejected: %s", rec.Body.String())
+	}
+	if len(q.Events) != 1 || q.Events[0].RunID != "abc" {
+		t.Fatalf("runId not decoded: %#v", q.Events)
+	}
+	body2 := `{"id":"y","workspace":"/w","title":"","events":[{"kind":"done","text":"Done","name":"run:abc:completed","outcome":"completed"}]}`
+	req2 := httptest.NewRequest(http.MethodPut, "/api/conversation", bytes.NewReader([]byte(body2)))
+	rec2 := httptest.NewRecorder()
+	var q2 conversation
+	if decodeSized(rec2, req2, &q2, 16<<20) {
+		t.Fatal("an event carrying an unknown outcome field must be rejected by the strict decoder")
 	}
 }
 

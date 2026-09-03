@@ -1032,6 +1032,14 @@ func TestAgentRunMigrationAddsRunEventsAndColumns(t *testing.T) {
 			t.Fatalf("conversations.%s missing after migration", col)
 		}
 	}
+	// v5 adds the durable task run identity column to client conversation events.
+	var runIDCols int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('conversation_events') WHERE name='run_id'").Scan(&runIDCols); err != nil {
+		t.Fatal(err)
+	}
+	if runIDCols != 1 {
+		t.Fatal("conversation_events.run_id missing after migration")
+	}
 }
 
 // --- provider insufficient-balance ---

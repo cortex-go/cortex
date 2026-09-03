@@ -89,6 +89,11 @@ var databaseMigrations = []migration{
 		ALTER TABLE conversations ADD COLUMN current_run_id TEXT NOT NULL DEFAULT '';
 		ALTER TABLE agent_runs ADD COLUMN diagnostics TEXT NOT NULL DEFAULT '';`,
 	},
+	{
+		version: 5,
+		name:    "durable task run identity",
+		sql:     `ALTER TABLE conversation_events ADD COLUMN run_id TEXT NOT NULL DEFAULT '';`,
+	},
 }
 
 func openDatabase(dataDir string) (*sql.DB, error) {

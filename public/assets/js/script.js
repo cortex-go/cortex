@@ -8,10 +8,13 @@ function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');se
 async function api(url,opt={}){opt={...opt,headers:{...(opt.headers||{})}};const method=(opt.method||'GET').toUpperCase();if(!['GET','HEAD','OPTIONS'].includes(method)&&authState?.csrf)opt.headers['X-Cortex-CSRF']=authState.csrf;const r=await fetch(url,opt);if(!r.ok)throw Error((await r.text()).trim()||r.statusText);return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
 function sid(){return crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)}
 function sessionTitle(s){if(s.title)return s.title;if(s.workspace)return s.workspace.split('/').filter(Boolean).pop()||s.workspace;return 'New session'}
-// serverEvents returns the transcript without transient, in-memory-only fields
-// (the run identity used for live task run-scoping). The server conversation
-// endpoint uses a strict decoder that rejects unknown event fields.
-function serverEvents(s){return (s.events||[]).map(e=>{const{runID,...rest}=e;return rest})}
+// serverEvents maps a session's transcript to the exact server conversation
+// event schema: kind, text, name, createdAt and the validated run identity
+// (runId). Transient in-memory fields (the live runID alias and the terminal
+// outcome, which is derivable from the run-marker name) are never serialized,
+// so a strict decoder can never reject them and task run ownership survives
+// a reload. runId is validated server-side before persistence.
+function serverEvents(s){return (s.events||[]).map(e=>{const o={kind:e.kind,text:e.text};if(e.name!==undefined&&e.name!=='')o.name=e.name;if(e.createdAt)o.createdAt=e.createdAt;if(e.runID)o.runId=e.runID;return o})}
 function sessionSafe(s){return{id:s.id,workspace:s.workspace||'',workspaceStatus:s.workspaceStatus||'',title:s.title||'',provider:s.provider||'',model:s.model||'',openCodeSession:s.openCodeSession||'',currentRunId:s.currentRunId||'',state:s.busy?'running':(s.state||'idle'),createdAt:s.createdAt||Date.now(),updatedAt:Date.now(),archivedAt:s.archivedAt||s.closedAt||0,events:serverEvents(s),tasksCollapsed:!!s.tasksCollapsed}}
 // sessionServerSafe is the browser-local UI view minus the task-panel collapsed
 // preference, which is intentionally local-only and must not be sent to the
@@ -98,14 +101,23 @@ function active(){return sessions[activeId]}
 // and attachments are in-memory only and are never persisted to localStorage
 // or the server conversation record. The discard flag drops the leaving
 // session's composer state (used when archiving it).
+// setActiveAttachments is the single owner of the active composer attachment
+// array: it updates both the module-level attachments variable and the active
+// session's transient attachment state together, so a removal or re-render can
+// never leave the session holding a stale array that a tab click resurrects.
+function setActiveAttachments(next){
+  attachments=Array.isArray(next)?next:[];
+  const s=sessions[activeId];
+  if(s)s.attachments=attachments;
+  renderAttachments()
+}
 function setActiveSession(id,discard){
   const prev=activeId&&sessions[activeId];
   if(prev&&prev.id!==id&&!discard){prev.draft=$('#prompt').value;prev.attachments=attachments}
   activeId=id;
   const s=sessions[id];
-  attachments=s&&Array.isArray(s.attachments)?s.attachments:[];
-  $('#prompt').value=s&&typeof s.draft==='string'?s.draft:'';
-  renderAttachments()
+  setActiveAttachments(s&&Array.isArray(s.attachments)?s.attachments:[]);
+  $('#prompt').value=s&&typeof s.draft==='string'?s.draft:''
 }
 function renderTabs(){const box=$('#sessionTabs');box.innerHTML='';for(const s of Object.values(sessions)){const b=document.createElement('button');b.className='session-tab'+(s.id===activeId?' active':'');b.dataset.sessionId=s.id;const title=document.createElement('span');title.className='tab-title';title.textContent=sessionTitle(s);const spinner=document.createElement('span');spinner.className='tab-spinner'+(s.busy?'':' hidden');spinner.setAttribute('role','status');spinner.setAttribute('aria-label','Agent running');b.append(spinner,title);if(s.unread){const dot=document.createElement('span');dot.className='tab-unread';dot.textContent='●';dot.title=s.unread+' unseen events';b.append(dot)}const x=document.createElement('span');x.className='tab-close';x.textContent='×';x.onclick=e=>{e.stopPropagation();closeSession(s.id)};b.append(x);b.onclick=()=>{setActiveSession(s.id);s.unread=0;saveUiPrefs();renderAll()};box.append(b)}}
 function renderRestoreSessions(){
@@ -178,7 +190,12 @@ function renderMarkdown(row,text){
     const p=document.createElement('div');p.className='md-line';appendMarkdownInline(p,line);row.append(p)
   }
 }
-function eventKind(ev){const raw=ev?.data?.data||ev?.data||{},t=String(raw.type||'');if(ev.type==='error')return'error';if(ev.type==='warning')return'warning';if(ev.type==='done')return'done';if(ev.type==='cancelled')return'error';return t.includes('tool')?'tool':'assistant'}
+// eventData normalizes the streamed event payload: the server emits flat
+// `{type,data}` records, and nested `{data:{data:{...}}}` must resolve the same
+// way everywhere (run capture, classification and consumption), so a nested run
+// event can never lose its run association.
+function eventData(ev){return ev?.data?.data||ev?.data||{}}
+function eventKind(ev){const raw=eventData(ev),t=String(raw.type||'');if(ev.type==='error')return'error';if(ev.type==='warning')return'warning';if(ev.type==='done')return'done';if(ev.type==='cancelled')return'error';return t.includes('tool')?'tool':'assistant'}
 function eventNode(ev){const row=document.createElement('div');row.className='event '+ev.kind;row.dataset.kind=ev.kind;if(ev.kind==='tool'||(ev.kind==='assistant'&&isToolEventText(ev.text)))renderTool(row,ev.text);else if(ev.kind==='assistant')renderMarkdown(row,ev.text);else if(ev.kind==='image'){const fig=document.createElement('figure');fig.className='image-attach';const img=document.createElement('img');img.src=ev.text;img.alt=ev.name||'attached image';img.title=ev.name||'';fig.append(img);if(ev.name){const cap=document.createElement('figcaption');cap.textContent=ev.name;fig.append(cap)}row.append(fig)}else row.textContent=ev.text;const marker=decodeRunMarker(ev.name);if(marker&&(marker.outcome==='failed'||marker.outcome==='completed_with_process_error'||marker.outcome==='cancelled'||marker.outcome==='truncated'))row.append(technicalDetailsNode(marker.runID));return row}
 function decodeRunMarker(name){const m=String(name||'').match(/^run:([^:]+):([a-z_]+)$/);if(!m)return null;return{runID:m[1],outcome:m[2]}}
 function technicalDetailsNode(runID){const wrap=document.createElement('details');wrap.className='tech-details';const sum=document.createElement('summary');sum.textContent='Technical details';const body=document.createElement('div');body.className='tech-body';wrap.append(sum,body);wrap.addEventListener('toggle',async()=>{if(!wrap.open||body.dataset.loaded)return;body.dataset.loaded='1';try{const d=await api('/api/agent/run-diagnostics?runID='+encodeURIComponent(runID));const parts=[];if(d.category)parts.push('Category: '+d.category);if(d.exitCode)parts.push('Exit code: '+d.exitCode);if(d.signal)parts.push('Signal: '+d.signal);if(d.stderrTruncated)parts.push('stderr truncated');if(d.errors&&d.errors.length)parts.push('Errors:\n'+d.errors.join('\n'));if(d.warnings&&d.warnings.length)parts.push('Warnings:\n'+d.warnings.join('\n'));if(d.stderrTail)parts.push('stderr tail:\n'+d.stderrTail);body.textContent=parts.join('\n')||'No additional details.'}catch(e){body.textContent='Could not load details: '+e.message}});return wrap}
@@ -197,13 +214,13 @@ function latestTaskEvent(s){
   const events=s.events||[];
   for(let i=events.length-1;i>=0;i--){
     const e=events[i];if(e.kind!=='task')continue;
-    const r=e.runID||'';
+    const r=e.runID||e.runId||'';
     if(currentRun){if(r&&r!==currentRun)continue}else if(r){continue}
     return e
   }
   return null
 }
-function renderTaskPanel(s){const panel=$('#taskPanel');if(!panel)return;const list=$('#taskList');const btn=$('#taskButton');const latest=latestTaskEvent(s);if(!latest){list.innerHTML='';panel.hidden=true;if(btn)btn.hidden=true;return}let todos=[];try{todos=JSON.parse(latest.text||'[]')}catch{todos=null}if(!Array.isArray(todos)||!todos.length){list.innerHTML='';$('#taskProgress').textContent='0 of 0 completed';panel.hidden=true;if(btn)btn.hidden=true;return}if(s.tasksCollapsed){panel.hidden=true;if(btn){btn.hidden=false;btn.setAttribute('aria-expanded','false')}return}panel.hidden=false;if(btn){btn.hidden=false;btn.setAttribute('aria-expanded','true')}list.innerHTML='';const done=todos.filter(t=>t.status==='completed').length;const order={in_progress:0,pending:1,completed:2};const sorted=[...todos].sort((a,b)=>(order[a.status]??3)-(order[b.status]??3));for(const t of sorted){const row=document.createElement('div');row.className='task-row '+t.status;const mark=document.createElement('span');mark.className='task-mark';mark.textContent=t.status==='completed'?'✓':t.status==='in_progress'?'●':'·';mark.setAttribute('aria-hidden','true');const label=document.createElement('span');label.className='task-label';label.textContent=t.content;row.append(mark,label);list.append(row)}$('#taskProgress').textContent=`${done} of ${todos.length} completed`}
+function renderTaskPanel(s){const panel=$('#taskPanel');if(!panel)return;const list=$('#taskList');const btn=$('#taskButton');const latest=latestTaskEvent(s);if(!latest){list.innerHTML='';panel.hidden=true;if(btn)btn.hidden=true;return}let todos=[];try{todos=JSON.parse(latest.text||'[]')}catch{todos=null}if(!Array.isArray(todos)||!todos.length){list.innerHTML='';$('#taskProgress').textContent='0 of 0 completed';panel.hidden=true;if(btn)btn.hidden=true;return}if(s.tasksCollapsed){panel.hidden=true;if(btn){btn.hidden=false;btn.setAttribute('aria-expanded','false');btn.setAttribute('aria-controls','taskPanel')}return}panel.hidden=false;if(btn){btn.hidden=false;btn.setAttribute('aria-expanded','true');btn.setAttribute('aria-controls','taskPanel')}list.innerHTML='';const done=todos.filter(t=>t.status==='completed').length;const order={in_progress:0,pending:1,completed:2};const sorted=[...todos].sort((a,b)=>(order[a.status]??3)-(order[b.status]??3));for(const t of sorted){const row=document.createElement('div');row.className='task-row '+t.status;const mark=document.createElement('span');mark.className='task-mark';mark.textContent=t.status==='completed'?'✓':t.status==='in_progress'?'●':'·';mark.setAttribute('aria-hidden','true');const label=document.createElement('span');label.className='task-label';label.textContent=t.content;row.append(mark,label);list.append(row)}$('#taskProgress').textContent=`${done} of ${todos.length} completed`}
 function renderSession(){const s=active();$('#workspaceLabel').textContent=s.workspace||'Default workspace';$('#run').disabled=s.busy||workspaceUnavailable(s);$('#prompt').disabled=s.busy;$('#stop').hidden=!s.busy;$('#activity').hidden=!s.busy;$('#wsUnavailable').hidden=!workspaceUnavailable(s);$('#wsUnavailable').textContent=workspaceUnavailable(s)?('Workspace unavailable ('+s.workspaceStatus+') — choose a replacement to run.'):'';renderFeed()}
 function renderAll(){renderTabs();renderSession()}
 function addEvent(id,kind,text,name='',extra={}){const clean=String(text??'').trim();if(!clean)return;const s=sessions[id];if(!s)return;const ev={kind,text:clean,name,...extra};s.events.push(ev);if(s.events.length>500)s.events=s.events.slice(-500);saveSessionToServer(id);if(activeId===id){if(kind==='task'){renderTaskPanel(s);return}$('#feed .empty')?.remove();const wasNear=nearBottom($('#feed'));$('#feed').append(eventNode(ev));if(wasNear||s.followBottom){$('#feed').scrollTop=$('#feed').scrollHeight;s.followBottom=true;$('#newActivity').hidden=true}else{$('#newActivity').hidden=false}}else{if(kind==='task')return;s.unread=(s.unread||0)+1;renderTabs()}}
@@ -271,7 +288,7 @@ function addImage(file){
   readDataURL(file).then(dataUrl=>thumbnail(dataUrl).then(thumb=>{
     if(attachments.length>=MAX_IMAGES){toast('Limit of '+MAX_IMAGES+' images per run');return}
     attachments.push({id:sid(),name:file.name||'image',dataUrl,thumb,size:file.size});
-    renderAttachments()
+    setActiveAttachments(attachments)
   })).catch(()=>toast('Could not read image'));
   return true
 }
@@ -286,7 +303,7 @@ function renderAttachments(){
     const name=document.createElement('span');name.className='attach-name';name.textContent=a.name;name.title=a.name;
     const size=document.createElement('span');size.className='attach-size';size.textContent=fmtSize(a.size);
     const x=document.createElement('button');x.type='button';x.title='Remove image';x.textContent='×';
-    x.onclick=()=>{attachments=attachments.filter(y=>y.id!==a.id);renderAttachments()};
+    x.onclick=()=>setActiveAttachments(attachments.filter(y=>y.id!==a.id));
     meta.append(name,size);chip.append(img,meta,x);box.append(chip)
   }
   box.hidden=false
@@ -314,7 +331,7 @@ async function addGeneratedImage(id,im){
   addEvent(id,'image',url,im.name||'Generated image')
 }
 function toolText(raw){const p=raw.part||raw,st=p.state||{},tool=p.tool||raw.tool||raw.name||'tool',status=st.status||'';const input=st.input||p.input||{},lines=[`↳ ${tool}${status?' · '+status:''}`];if(tool==='bash'&&input.command)lines.push('$ '+input.command);else if(input.filePath||input.path)lines.push(input.filePath||input.path);if(st.error)lines.push('ERROR: '+clipped(typeof st.error==='string'?st.error:JSON.stringify(st.error)));else if(st.output)lines.push(clipped(st.output));return lines.join('\n')}
-function summarize(ev){const raw=ev?.data?.data||ev?.data||{},type=String(raw.type||'');if(ev.type==='error')return raw.message||'Agent failed';if(ev.type==='warning')return raw.message||'The agent completed, but the process reported a problem.';if(ev.type==='truncated')return raw.message||'Provider output was truncated.';if(ev.type==='cancelled')return raw.message||'Agent stopped.';if(ev.type==='recovered')return raw.text||'';if(ev.type==='done'){const i=raw.inputTokens||0,o=raw.outputTokens||0;return i||o?`Done · ${i} input · ${o} output tokens`:'Done'};if(ev.type==='output')return raw.text||'';if(type.includes('tool'))return toolText(raw);return raw.part?.text||raw.text||''}
+function summarize(ev){const raw=eventData(ev),type=String(raw.type||'');if(ev.type==='error')return raw.message||'Agent failed';if(ev.type==='warning')return raw.message||'The agent completed, but the process reported a problem.';if(ev.type==='truncated')return raw.message||'Provider output was truncated.';if(ev.type==='cancelled')return raw.message||'Agent stopped.';if(ev.type==='recovered')return raw.text||'';if(ev.type==='done'){const i=raw.inputTokens||0,o=raw.outputTokens||0;return i||o?`Done · ${i} input · ${o} output tokens`:'Done'};if(ev.type==='output')return raw.text||'';if(type.includes('tool'))return toolText(raw);return raw.part?.text||raw.text||''}
 // reconcileRunState polls the authoritative conversation state after a stream
 // ends without a durable terminal event (disconnect/timeout) so the running
 // spinner reflects the server, not the vanished browser request. It polls with
@@ -368,7 +385,7 @@ async function reconcileRunState(id, maxWaitMs){
     }
   }finally{reconcilePolls.delete(id)}
 }
-function consumeAgentEvent(id,s,ev,seenImages,streamRun){const text=summarize(ev),raw=ev?.data?.data||ev?.data||{};if(ev.type==='run'&&raw.runID){s.runID=raw.runID;s.currentRunId=raw.runID}if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;if(ev.type==='task'&&typeof raw.snapshot==='string')addEvent(id,'task',raw.snapshot,'',{runID:streamRun||''});const oc=raw.outcome||'';if(oc)s.state=oc;else if(ev.type==='done')s.state='completed';else if(ev.type==='warning')s.state='completed_with_process_error';else if(ev.type==='error')s.state='failed';else if(ev.type==='cancelled')s.state='cancelled';else if(ev.type==='truncated')s.state='truncated';if(ev.type==='done'||ev.type==='warning'||ev.type==='error'||ev.type==='cancelled'||ev.type==='truncated'){s.busy=false;s.abort=null};const termEvent={kind:eventKind(ev),text,name:'run:'+(raw.runID||s.runID)+':'+oc,outcome:oc,runID:raw.runID||s.runID};if(termEvent.text)addEvent(id,termEvent.kind,termEvent.text,termEvent.name,{outcome:oc,runID:termEvent.runID});if(ev.type==='recovered-images'){for(const im of (raw.images||[]))addGeneratedImage(id,im)}for(const im of extractImages(raw)){if(seenImages.has(im.url))continue;seenImages.add(im.url);addGeneratedImage(id,im)}}
+function consumeAgentEvent(id,s,ev,seenImages,streamRun){const text=summarize(ev),raw=eventData(ev);if(ev.type==='run'&&raw.runID){s.runID=raw.runID;s.currentRunId=raw.runID}if(ev.type==='done'&&raw.sessionID)s.openCodeSession=raw.sessionID;if(ev.type==='task'&&typeof raw.snapshot==='string')addEvent(id,'task',raw.snapshot,'',{runID:streamRun||''});const oc=raw.outcome||'';if(oc)s.state=oc;else if(ev.type==='done')s.state='completed';else if(ev.type==='warning')s.state='completed_with_process_error';else if(ev.type==='error')s.state='failed';else if(ev.type==='cancelled')s.state='cancelled';else if(ev.type==='truncated')s.state='truncated';if(ev.type==='done'||ev.type==='warning'||ev.type==='error'||ev.type==='cancelled'||ev.type==='truncated'){s.busy=false;s.abort=null};const termEvent={kind:eventKind(ev),text,name:'run:'+(raw.runID||s.runID)+':'+oc,outcome:oc,runID:raw.runID||s.runID};if(termEvent.text)addEvent(id,termEvent.kind,termEvent.text,termEvent.name,{outcome:oc,runID:termEvent.runID});if(ev.type==='recovered-images'){for(const im of (raw.images||[]))addGeneratedImage(id,im)}for(const im of extractImages(raw)){if(seenImages.has(im.url))continue;seenImages.add(im.url);addGeneratedImage(id,im)}}
 // resetTaskStateForNewRun clears the previous run's task snapshot when a new
 // run is accepted locally: it appends and persists an authoritative empty
 // snapshot so reload or reconciliation cannot resurrect the old tasks, hides
@@ -378,10 +395,16 @@ function consumeAgentEvent(id,s,ev,seenImages,streamRun){const text=summarize(ev
 function resetTaskStateForNewRun(id){
   const s=sessions[id];if(!s)return;
   delete uiPrefs.collapsed[id];s.tasksCollapsed=false;
+  saveUiPrefs();
   s.currentRunId='';
   addEvent(id,'task','[]','',{runID:''})
 }
-async function runAgent(prompt){const s=active();if(!s||s.busy||workspaceUnavailable(s))return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();s.runID='';s.draft='';resetTaskStateForNewRun(id);if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');const images=attachments.map(a=>({name:a.name,data:a.dataUrl}));for(const a of attachments)addEvent(id,'image',a.thumb,a.name);addEvent(id,'user',prompt);attachments=[];s.attachments=[];renderAttachments();renderAll();let streamRun='';try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id,images}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';const seenImages=new Set();for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line);if(ev.type==='run'&&ev.data?.runID)streamRun=ev.data.runID;consumeAgentEvent(id,s,ev,seenImages,streamRun);}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].abort=null;saveUiPrefs();saveSessionToServer(id);if(sessions[id]&&sessions[id].busy){reconcileRunState(id)}}if(activeId===id)renderAll();agentStatus()}}
+// canRunAgent is the single "may this session start a run?" decision shared by
+// the composer submit handler and runAgent. It must be checked before the
+// textarea, draft or attachments are cleared, so a blocked submission (e.g. an
+// unavailable explicitly selected workspace) never destroys the user's input.
+function canRunAgent(s){return !!s&&!s.busy&&!workspaceUnavailable(s)}
+async function runAgent(prompt){const s=active();if(!canRunAgent(s))return;const id=s.id,p=providers.find(x=>x.id===settings.activeProvider);s.provider=settings.activeProvider||'';s.model=p?.model||p?.defaultModel||'';s.busy=true;s.abort=new AbortController();s.runID='';s.draft='';resetTaskStateForNewRun(id);if(!s.title)s.title=prompt.split(/\s+/).slice(0,5).join(' ');const images=attachments.map(a=>({name:a.name,data:a.dataUrl}));for(const a of attachments)addEvent(id,'image',a.thumb,a.name);addEvent(id,'user',prompt);setActiveAttachments([]);renderAll();let streamRun='';try{const r=await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json','X-Cortex-CSRF':authState.csrf||''},body:JSON.stringify({workspace:s.workspace,prompt,session:s.openCodeSession||'',clientSession:id,images}),signal:s.abort.signal});if(!r.ok)throw Error((await r.text()).trim()||r.statusText);const rd=r.body.getReader(),dec=new TextDecoder();let buf='';const seenImages=new Set();for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const ev=JSON.parse(line);const raw=eventData(ev);if(ev.type==='run'&&raw.runID)streamRun=raw.runID;consumeAgentEvent(id,s,ev,seenImages,streamRun);}}}catch(e){addEvent(id,'error',e.name==='AbortError'?'Agent stopped.':e.message)}finally{if(sessions[id]){sessions[id].abort=null;saveUiPrefs();saveSessionToServer(id);if(sessions[id]&&sessions[id].busy){reconcileRunState(id)}}if(activeId===id)renderAll();agentStatus()}}
 
 // stopAgent performs a server-side, authenticated Stop for the active run and
 // surfaces the distinct outcome: terminal stop, explicit rejection, accepted-
@@ -488,7 +511,13 @@ async function syncServerConversations(){
   const collapsed=uiPrefs.collapsed||{};
   const stored=await api('/api/conversations');
   sessions={};closedSessions=[];
-  for(const s of stored){s.abort=null;s.currentRunId=s.currentRunId||'';if(s.archivedAt){s.closedAt=s.archivedAt;closedSessions.push(s)}else sessions[s.id]=s}
+  for(const s of stored){
+    s.abort=null;s.currentRunId=s.currentRunId||'';
+    // Restore the live in-memory run identity alias from the durable runId
+    // field so latestTaskEvent keeps rejecting stale task events after reload.
+    if(Array.isArray(s.events))s.events=s.events.map(e=>({...e,runID:e.runID||e.runId||''}));
+    if(s.archivedAt){s.closedAt=s.archivedAt;closedSessions.push(s)}else sessions[s.id]=s
+  }
   // Derive authoritative running state from the server, not browser-local
   // busy: a conversation whose state is still 'running' has a live server run.
   for(const s of Object.values(sessions)){s.busy=(s.state==='running');if(s.followBottom===undefined)s.followBottom=true;if(collapsed[s.id])s.tasksCollapsed=true}
@@ -501,7 +530,7 @@ async function syncServerConversations(){
 async function boot(){const st=await api('/api/status');root=st.root;loadSessions();restoreComposerHeight();await Promise.all([loadSettings(),agentStatus(),syncServerConversations()])}
 $('#newSession').onclick=e=>{e.stopPropagation();toggleSessionMenu()};$('#newSameWorkspace').onclick=newSessionSameWorkspace;$('#newWorkspace').onclick=newWorkspaceSession;$('#workspaceBtn').onclick=openWorkspacePicker;$('#closeWorkspace').onclick=$('#cancelWorkspace').onclick=()=>$('#workspaceModal').hidden=true;$('#browserUp').onclick=()=>browse(parentPath(browserPath));$('#chooseWorkspace').onclick=chooseWorkspace;
 $('#composerResize').onpointerdown=startComposerResize;$('#composerResize').ondblclick=()=>{applyComposerHeight(150);setPref(COMPOSER_STORE,'150')};document.addEventListener('click',e=>{if(!e.target.closest('.new-session-wrap'))hideSessionMenu()});window.addEventListener('resize',()=>applyComposerHeight($('#agentForm').getBoundingClientRect().height));
-$('#agentForm').onsubmit=e=>{e.preventDefault();const s=active(),p=$('#prompt').value.trim();if(!p)return;$('#prompt').value='';if(s)s.draft='';runAgent(p)};$('#prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('#agentForm').requestSubmit()}};$('#stop').onclick=()=>stopAgent();$('#copy').onclick=copySession;
+$('#agentForm').onsubmit=e=>{e.preventDefault();const s=active();if(!canRunAgent(s))return;const p=$('#prompt').value.trim();if(!p)return;$('#prompt').value='';if(s)s.draft='';runAgent(p)};$('#prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('#agentForm').requestSubmit()}};$('#stop').onclick=()=>stopAgent();$('#copy').onclick=copySession;
 $('#newActivity').onclick=()=>{const s=active();if(!s)return;const box=$('#feed');if(box){box.scrollTop=box.scrollHeight}s.followBottom=true;$('#newActivity').hidden=true};
 function setTasksCollapsed(c){const s=active();if(!s)return;s.tasksCollapsed=c;if(c)uiPrefs.collapsed[s.id]=true;else delete uiPrefs.collapsed[s.id];saveUiPrefs();renderTaskPanel(s)}$('#taskToggle').onclick=()=>setTasksCollapsed(true);$('#taskButton').onclick=()=>{const s=active();if(s)setTasksCollapsed(!s.tasksCollapsed)};
 $('#feed').addEventListener('scroll',()=>{const s=active(),box=$('#feed');if(!box||!s)return;if(box.scrollTop+box.clientHeight>=box.scrollHeight-4){s.followBottom=true;$('#newActivity').hidden=true}else{s.followBottom=false}});
