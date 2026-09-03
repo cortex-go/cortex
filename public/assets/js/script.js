@@ -1,6 +1,7 @@
 const $=s=>document.querySelector(s);
 let root='',providers=[],browserPath='',activeId='',sessions={},closedSessions=[],settings={},serverReady=false;
 const serverSaveTimers=new Map();
+const pendingDecodes=new Map(); // sessionId -> in-flight image decode reservations
 const UI_STORE='cortex.ui.v1',COMPOSER_STORE='cortex.composer.height.v1';
 const MAX_IMAGES=6,MAX_IMAGE_BYTES=10*1024*1024;
 let attachments=[],modelCatalog=[],uiPrefs={activeId:'',collapsed:{}};
@@ -290,15 +291,20 @@ function addImage(file){
   const ownerId=activeId;
   const owner=ownerId&&sessions[ownerId];
   if(!owner||owner.busy){toast('Agent is running');return false}
-  if((owner.attachments||[]).length>=MAX_IMAGES){toast('Limit of '+MAX_IMAGES+' images per run');return false}
-  readDataURL(file).then(dataUrl=>thumbnail(dataUrl).then(thumb=>{
+  // The limit counts completed attachments plus already-reserved in-flight
+  // decodes, so MAX_IMAGES is enforced before FileReader work begins. A slot is
+  // reserved synchronously and released on every completion path via finally,
+  // so a failure can never permanently consume capacity.
+  if((owner.attachments||[]).length+reservedDecodes(ownerId)>=MAX_IMAGES){toast('Limit of '+MAX_IMAGES+' images per run');return false}
+  reserveDecode(ownerId);
+  readDataURL(file).then(dataUrl=>thumbnail(dataUrl).then(thumb=>({dataUrl,thumb}))).then(({dataUrl,thumb})=>{
     const s=ownerId&&sessions[ownerId];
     // The originating session was closed while decoding: discard the completed
     // image rather than attaching it elsewhere or restoring the closed session.
     if(!s)return;
-    // The limit is re-checked against the originating session at completion
-    // because several decodes can finish concurrently.
-    if((s.attachments||[]).length>=MAX_IMAGES){toast('Limit of '+MAX_IMAGES+' images per run');return}
+    // The reserved slot converts directly into a completed attachment; the
+    // combined completed-plus-pending total is guaranteed by the reservation to
+    // never exceed MAX_IMAGES.
     const image={id:sid(),name:file.name||'image',dataUrl,thumb,size:file.size};
     s.attachments=[...(s.attachments||[]),image];
     // If this session started a run while decoding was pending, the in-flight
@@ -307,9 +313,21 @@ function addImage(file){
     // never affects the current request. The composer is updated only when the
     // originating session is still the active one.
     if(activeId===ownerId)setActiveAttachments(s.attachments)
-  })).catch(()=>toast('Could not read image'));
+  }).catch(()=>toast('Could not read image')).finally(()=>releaseDecode(ownerId));
   return true
 }
+// pendingDecodes tracks reserved in-flight image decode slots per session in
+// transient memory only: it is never written to localStorage, a SQLite field or
+// an archived-session record. reserveDecode is called synchronously before the
+// FileReader starts; releaseDecode runs on every completion path (success,
+// FileReader failure, thumbnail failure, closed originating session, or any
+// unexpected rejection) so a reservation cannot leak. Closing a session makes
+// outstanding completions harmless: the completion callback sees no live
+// session and discards the image, and releaseDecode only touches the reservation
+// map, never recreating the closed session.
+function reservedDecodes(id){return pendingDecodes.get(id)||0}
+function reserveDecode(id){pendingDecodes.set(id,reservedDecodes(id)+1)}
+function releaseDecode(id){const n=reservedDecodes(id);if(n>1)pendingDecodes.set(id,n-1);else pendingDecodes.delete(id)}
 function fmtSize(n){if(n>1<<20)return (n/(1<<20)).toFixed(1)+' MiB';if(n>1024)return Math.round(n/1024)+' KiB';return n+' B'}
 function renderAttachments(){
   const box=$('#attachments');box.innerHTML='';

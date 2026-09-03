@@ -159,6 +159,20 @@ async function failDecode(ctx) {
   await settle(0);
 }
 
+// failThumbnail resolves the next pending FileReader but rejects its created
+// Image, exercising the thumbnail failure completion path.
+async function failThumbnail(ctx, dataUrl) {
+  const reader = ctx.__readers.shift();
+  if (!reader) throw new Error('no pending FileReader to resolve');
+  reader.result = dataUrl;
+  reader.onload();
+  await settle(0);
+  const img = ctx.__images.shift();
+  if (!img) throw new Error('no pending Image after read completion');
+  img.onerror();
+  await settle(0);
+}
+
 function run(ctx, code, vars) {
   if (vars) {
     for (const k of Object.keys(vars)) ctx[k] = vars[k];
@@ -1225,18 +1239,88 @@ test('a run starting while decoding is pending does not receive the image in-fli
   if (sent.length !== 0) throw new Error('completed image affected the in-flight request');
 });
 
-test('concurrent pending decodes cannot exceed MAX_IMAGES', async () => {
+test('only MAX_IMAGES decodes start; excess additions are rejected before FileReader construction', async () => {
   const ctx = loadDecodeContext();
   run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]}};activeId='a'");
   const MAX = run(ctx, 'MAX_IMAGES');
+  let accepted = 0;
   for (let i = 0; i < MAX + 2; i++) {
-    run(ctx, `addImage({type:'image/png',name:'i'+${i}+'.png',size:10})`);
+    if (run(ctx, `addImage({type:'image/png',name:'i'+${i}+'.png',size:10})`) === true) accepted++;
   }
-  if (ctx.__readers.length !== MAX + 2) throw new Error('expected ' + (MAX + 2) + ' pending decodes, got ' + ctx.__readers.length);
-  for (let i = 0; i < MAX + 2; i++) {
+  if (accepted !== MAX) throw new Error('expected exactly MAX_IMAGES accepted additions, got ' + accepted);
+  if (ctx.__readers.length !== MAX) throw new Error('expected exactly MAX_IMAGES FileReaders, got ' + ctx.__readers.length);
+  if (run(ctx, `reservedDecodes('a')`) !== MAX) throw new Error('pending decode reservations must equal MAX_IMAGES');
+  // Completing all started decodes leaves MAX attachments and zero reservations.
+  for (let i = 0; i < MAX; i++) {
     await completeDecode(ctx, 'data:image/png;base64,AAAA');
   }
-  if (run(ctx, "sessions['a'].attachments.length") !== MAX) throw new Error('concurrent decodes exceeded MAX_IMAGES: ' + run(ctx, "sessions['a'].attachments.length"));
+  if (run(ctx, "sessions['a'].attachments.length") !== MAX) throw new Error('attachments must equal MAX_IMAGES');
+  if (run(ctx, `reservedDecodes('a')`) !== 0) throw new Error('reservations must be released after successful completions');
+});
+
+test('a failed read releases its reservation and permits another image', async () => {
+  const ctx = loadDecodeContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]}};activeId='a'");
+  const MAX = run(ctx, 'MAX_IMAGES');
+  for (let i = 0; i < MAX; i++) run(ctx, `addImage({type:'image/png',name:'i'+${i}+'.png',size:10})`);
+  if (run(ctx, `reservedDecodes('a')`) !== MAX) throw new Error('expected MAX reservations');
+  if (run(ctx, `addImage({type:'image/png',name:'extra.png',size:10})`) !== false) throw new Error('a full session must reject a new add');
+  await failDecode(ctx);
+  if (run(ctx, `reservedDecodes('a')`) !== MAX - 1) throw new Error('failed read did not release its reservation');
+  if (run(ctx, `addImage({type:'image/png',name:'again.png',size:10})`) !== true) throw new Error('released reservation must accept another image');
+  if (ctx.__readers.length !== MAX) throw new Error('reader count should return to MAX after refill');
+});
+
+test('a failed thumbnail releases its reservation', async () => {
+  const ctx = loadDecodeContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]}};activeId='a'");
+  const MAX = run(ctx, 'MAX_IMAGES');
+  for (let i = 0; i < MAX; i++) run(ctx, `addImage({type:'image/png',name:'i'+${i}+'.png',size:10})`);
+  if (run(ctx, `reservedDecodes('a')`) !== MAX) throw new Error('expected MAX reservations');
+  await failThumbnail(ctx, 'data:image/png;base64,AAAA');
+  if (run(ctx, `reservedDecodes('a')`) !== MAX - 1) throw new Error('failed thumbnail did not release its reservation');
+  if (run(ctx, `addImage({type:'image/png',name:'again.png',size:10})`) !== true) throw new Error('released reservation must accept another image');
+  if (ctx.__readers.length !== MAX) throw new Error('reader count should return to MAX after refill');
+});
+
+test('closing a session with pending reads cannot leak or recreate state', async () => {
+  const ctx = loadDecodeContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `addImage({type:'image/png',name:'a.png',size:10})`);
+  if (ctx.__readers.length !== 1) throw new Error('decode did not begin');
+  if (run(ctx, `reservedDecodes('a')`) !== 1) throw new Error('reservation not recorded');
+  await run(ctx, 'closeSession("a")');
+  await completeDecode(ctx, 'data:image/png;base64,AAAA');
+  if (run(ctx, "sessions['a']") !== undefined) throw new Error('completing a decode must not recreate the closed session');
+  if (run(ctx, "sessions['b'].attachments.length") !== 0) throw new Error('closed session decode leaked to B');
+  if (run(ctx, "attachments.length") !== 0) throw new Error('closed session decode appeared in the composer');
+  if (run(ctx, `reservedDecodes('a')`) !== 0) throw new Error('reservation leaked after session close');
+});
+
+test('switching sessions keeps pending limits independent per session', async () => {
+  const ctx = loadDecodeContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:'',attachments:[]}};activeId='a'");
+  const MAX = run(ctx, 'MAX_IMAGES');
+  for (let i = 0; i < MAX; i++) run(ctx, `addImage({type:'image/png',name:'i'+${i}+'.png',size:10})`);
+  if (run(ctx, `reservedDecodes('a')`) !== MAX) throw new Error('A should hold MAX reservations');
+  run(ctx, 'setActiveSession("b")');
+  if (run(ctx, `addImage({type:'image/png',name:'b.png',size:10})`) !== true) throw new Error('B must accept a fresh image');
+  if (run(ctx, `reservedDecodes('a')`) !== MAX) throw new Error('A reservations must stay MAX after B addition');
+  if (run(ctx, `reservedDecodes('b')`) !== 1) throw new Error('B reservation should be 1');
+  // The B reader is the last one queued; complete it specifically.
+  const bReader = ctx.__readers[ctx.__readers.length - 1];
+  bReader.result = 'data:image/png;base64,AAAA';
+  bReader.onload();
+  await settle(0);
+  const bImg = ctx.__images.shift();
+  bImg.width = 64;
+  bImg.height = 64;
+  bImg.onload();
+  await settle(0);
+  if (run(ctx, `reservedDecodes('b')`) !== 0) throw new Error('B reservation not released');
+  if (run(ctx, `reservedDecodes('a')`) !== MAX) throw new Error('A reservations must remain unaffected by B completion');
+  run(ctx, 'setActiveSession("a")');
+  if (run(ctx, `addImage({type:'image/png',name:'extra.png',size:10})`) !== false) throw new Error('A must still reject while full');
 });
 
 test('a decoding failure does not affect another session', async () => {
