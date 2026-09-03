@@ -24,7 +24,6 @@ BEGIN {
   required_inline["go test ./..."]=1
   required_inline["go test -race ./..."]=1
   required_inline["go build -trimpath -o /tmp/cortex ./cmd/cortex"]=1
-  required_inline["node --check content/assets/js/script.js"]=1
   required_inline["node --check public/assets/js/script.js"]=1
   required_inline["node tests/agent-ux.test.js"]=1
   required_inline["node tests/conversation-save.test.js"]=1
@@ -32,8 +31,6 @@ BEGIN {
   required_inline["tests/release-smoke.sh"]=1
   required_inline["git diff --check"]=1
   required_inline["scripts/workflow-contract.sh"]=1
-  required_inline["diff -q content/assets/js/script.js public/assets/js/script.js"]=1
-  required_inline["diff -q content/assets/css/style.css public/assets/css/style.css"]=1
   required_block["gofmt -l"]=1
   in_on=0; in_permissions=0; in_jobs=0
   in_push=0; in_branches=0; in_block=0

@@ -1,6 +1,6 @@
 // Frontend conversation-persistence contract tests.
 //
-// These drive the real content/assets/js/script.js in a minimal DOM/fetch
+// These drive the real public/assets/js/script.js in a minimal DOM/fetch
 // sandbox and assert the exact conversation PUT behaviour:
 //
 //   - mutating one conversation issues one PUT for that id and no fan-out;
@@ -18,7 +18,7 @@ const path = require('path');
 const vm = require('vm');
 const assert = require('assert');
 
-const SCRIPT = fs.readFileSync(path.join(__dirname, '..', 'content', 'assets', 'js', 'script.js'), 'utf8');
+const SCRIPT = fs.readFileSync(path.join(__dirname, '..', 'public', 'assets', 'js', 'script.js'), 'utf8');
 
 class El {
   constructor(tag = '') {

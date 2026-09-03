@@ -43,9 +43,7 @@ jobs:
         run: go test -race ./...
       - name: go build -trimpath
         run: go build -trimpath -o /tmp/cortex ./cmd/cortex
-      - name: node --check source JavaScript
-        run: node --check content/assets/js/script.js
-      - name: node --check generated JavaScript
+      - name: node --check canonical JavaScript
         run: node --check public/assets/js/script.js
       - name: agent UX suite
         run: node tests/agent-ux.test.js
@@ -53,10 +51,6 @@ jobs:
         run: node tests/conversation-save.test.js
       - name: markdown render smoke
         run: node tests/markdown-render-smoke.js
-      - name: generated JS byte parity
-        run: diff -q content/assets/js/script.js public/assets/js/script.js
-      - name: generated CSS byte parity
-        run: diff -q content/assets/css/style.css public/assets/css/style.css
       - name: release smoke
         run: tests/release-smoke.sh
       - name: git diff --check

@@ -1,7 +1,7 @@
 // Frontend UX contract tests for sticky-bottom scroll, the todowrite task
 // panel, and the tab running-spinner / unread indicator.
 //
-// These drive the real content/assets/js/script.js in a minimal DOM sandbox.
+// These drive the real public/assets/js/script.js in a minimal DOM sandbox.
 //
 // Run with: node tests/agent-ux.test.js
 
@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const SCRIPT = fs.readFileSync(path.join(__dirname, '..', 'content', 'assets', 'js', 'script.js'), 'utf8');
+const SCRIPT = fs.readFileSync(path.join(__dirname, '..', 'public', 'assets', 'js', 'script.js'), 'utf8');
 
 class Node {
   constructor(tag = '') {
@@ -1366,7 +1366,7 @@ test('a decoding failure does not affect another session', async () => {
 
 test('Copy session and Tasks are grouped on the left in the compose row', async () => {
   const html = require('fs').readFileSync(path.join(__dirname, '..', 'content', 'index.html'), 'utf8');
-  const css = require('fs').readFileSync(path.join(__dirname, '..', 'content', 'assets', 'css', 'style.css'), 'utf8');
+  const css = require('fs').readFileSync(path.join(__dirname, '..', 'public', 'assets', 'css', 'style.css'), 'utf8');
   const row = html.match(/<div class="compose-row">([\s\S]*?)<\/div><\/form>/);
   if (!row) throw new Error('compose-row not found in index.html');
   const actions = row[1].match(/<div class="compose-actions">([\s\S]*?)<\/div>/);

@@ -13,5 +13,5 @@ check: frontend
 	nift status
 	go test ./...
 	go vet ./...
-	node --check content/assets/js/script.js
+	node --check public/assets/js/script.js
 	node tests/markdown-render-smoke.js

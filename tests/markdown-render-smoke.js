@@ -40,7 +40,7 @@ function flatText(node){
   walk(node);
   return parts.join('');
 }
-const src=fs.readFileSync('content/assets/js/script.js','utf8');
+const src=fs.readFileSync('public/assets/js/script.js','utf8');
 const page=fs.readFileSync('content/index.html','utf8');
 if(!page.includes('<textarea id="prompt"></textarea>'))throw new Error('prompt textarea must be empty');
 if(page.includes('Implement, investigate')||page.includes('drop or paste images'))throw new Error('prompt placeholder returned');
