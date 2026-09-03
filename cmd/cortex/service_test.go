@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -458,92 +457,11 @@ func TestIsVerifyInfraFailure(t *testing.T) {
 	}
 }
 
-// TestSystemdPathRuntimeIdentity proves against a genuine systemd user manager
-// that quote, backslash, space and percent characters in a WorkingDirectory
-// and in ExecStart arguments resolve to the exact same paths and values at
-// runtime — not to a different path. A syntax-only assertion is insufficient
-// because systemd could in principle unescape a path value; this test starts a
-// real unit whose process records its working directory and argv. It is gated
-// on a usable user manager: in a headless environment with no user session it
-// skips, and the service-lifecycle CI job is the authoritative integration run.
-func TestSystemdPathRuntimeIdentity(t *testing.T) {
-	systemctl, err := exec.LookPath("systemctl")
-	if err != nil {
-		t.Skip("systemctl not installed; skipping runtime path identity check")
-	}
-	if out, err := exec.Command(systemctl, "--user", "is-system-running").CombinedOutput(); err != nil {
-		t.Skipf("no usable user systemd manager: %s", strings.TrimSpace(string(out)))
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		t.Skip("no user home; skipping runtime path identity check")
-	}
-	unitDir := filepath.Join(home, ".config", "systemd", "user")
-	if err := os.MkdirAll(unitDir, 0700); err != nil {
-		t.Skipf("cannot create user unit directory: %v", err)
-	}
-
-	base := t.TempDir()
-	// A working directory whose name contains a quote, a backslash, a space and
-	// a percent sign. The executable itself lives at a clean path because
-	// systemd rejects quote/backslash in the ExecStart executable position.
-	wd := filepath.Join(base, `weird"dir\path 100%`)
-	if err := os.MkdirAll(wd, 0755); err != nil {
-		t.Fatal(err)
-	}
-	outFile := filepath.Join(base, "result.txt")
-	script := filepath.Join(base, "emit.sh")
-	scriptBody := "#!/bin/sh\nout=\"$1\"\nshift\npwd > \"$out\"\nfor a in \"$@\"; do printf '[%s]\\n' \"$a\" >> \"$out\"; done\n"
-	if err := os.WriteFile(script, []byte(scriptBody), 0755); err != nil {
-		t.Fatal(err)
-	}
-	unitName := "cortex-rtid.service"
-	unit := fmt.Sprintf(`[Unit]
-Description=runtime path identity probe
-
-[Service]
-Type=oneshot
-ExecStart=%s %s "arg with \"quote" "back\\slash"
-WorkingDirectory=%s
-`, script, outFile, wd)
-	unitPath := filepath.Join(unitDir, unitName)
-	if err := os.WriteFile(unitPath, []byte(unit), 0644); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = exec.Command(systemctl, "--user", "stop", unitName).Run()
-		_ = os.Remove(unitPath)
-		_ = exec.Command(systemctl, "--user", "daemon-reload").Run()
-	})
-	if out, err := exec.Command(systemctl, "--user", "daemon-reload").CombinedOutput(); err != nil {
-		t.Skipf("cannot reload the user manager: %s", strings.TrimSpace(string(out)))
-	}
-	if out, err := exec.Command(systemctl, "--user", "start", unitName).CombinedOutput(); err != nil {
-		t.Fatalf("cannot start the identity probe unit: %s\nunit:\n%s", strings.TrimSpace(string(out)), unit)
-	}
-	// oneshot start returns once the job completes; read the recorded result.
-	var data []byte
-	for i := 0; i < 20; i++ {
-		data, err = os.ReadFile(outFile)
-		if err == nil {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if err != nil {
-		t.Fatalf("identity probe produced no output: %v", err)
-	}
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	want := []string{wd, `[arg with "quote]`, `[back\slash]`}
-	if len(lines) != len(want) {
-		t.Fatalf("unexpected probe output %q, want %q", lines, want)
-	}
-	for i := range want {
-		if lines[i] != want[i] {
-			t.Fatalf("probe line %d = %q, want %q", i, lines[i], want[i])
-		}
-	}
-}
+// The runtime identity of special-character WorkingDirectory and ExecStart
+// arguments is proven authoritatively in tests/service-lifecycle.sh, which
+// runs against a genuinely isolated systemd user manager in the CI lifecycle
+// job. The default Go suite must never write into, or mutate, a developer's
+// real user systemd configuration, so no such test lives here.
 
 func TestResolveExecutableRejectsUnsafeSystemdForms(t *testing.T) {
 	// Character and whitespace rejections happen before any filesystem check,
@@ -929,6 +847,70 @@ func TestInstallHealthGate(t *testing.T) {
 			t.Fatal("the install health gate never probed the live endpoint")
 		}
 	})
+}
+
+// TestHealthCheckRequiresCortexContract verifies the identity contract of the
+// install health gate: only a 2xx JSON object with ok:true is accepted, so a
+// foreign JSON-speaking process cannot impersonate Cortex on a configured port.
+func TestHealthCheckRequiresCortexContract(t *testing.T) {
+	probe := func(code int, body, ct string) error {
+		srv := jsonServer(t, code, body, ct)
+		return healthCheck(srv.URL + cortexHealthPath)
+	}
+	if err := probe(200, `{"ok":true}`, "application/json"); err != nil {
+		t.Fatalf("the real Cortex health contract must pass: %v", err)
+	}
+	if err := probe(200, `{"ok":true,"extra":1}`, "application/json"); err != nil {
+		t.Fatalf("an object containing ok:true must pass: %v", err)
+	}
+	for _, c := range []struct {
+		code     int
+		body, ct string
+	}{
+		{200, `{}`, "application/json"},
+		{200, `{"ok":false}`, "application/json"},
+		{200, `{"ok":"true"}`, "application/json"},
+		{200, `[1,2,3]`, "application/json"},
+		{200, `{"ok":true}`, "text/plain"},
+		{200, `not json at all`, "application/json"},
+		{500, `{"ok":true}`, "application/json"},
+		{404, `{"ok":true}`, "application/json"},
+	} {
+		if err := probe(c.code, c.body, c.ct); err == nil {
+			t.Fatalf("health check accepted an impostor response %d %q %q", c.code, c.body, c.ct)
+		}
+	}
+}
+
+// TestInstallIdenticalEnabledActiveUnhealthy proves the identical no-op install
+// still requires the Cortex health contract: an enabled, active but wedged (or
+// incorrectly listening) service is reported as an install failure without any
+// systemd mutation, because the no-op path made no changes and needs no
+// rollback.
+func TestInstallIdenticalEnabledActiveUnhealthy(t *testing.T) {
+	origProbe := healthProbe
+	t.Cleanup(func() { healthProbe = origProbe })
+	m, _, _ := newFakeManager(t)
+	fs := newFakeSystemd(m.unitPath)
+	m.run = fs.runner()
+	if err := m.install(testOpts("127.0.0.1:7331"), os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	fs.setState("enabled", "active")
+	fs.calls = nil
+	healthProbe = func(string) error { return errors.New("wedged: /api/health not answering") }
+	err := m.install(testOpts("127.0.0.1:7331"), os.Stderr)
+	if err == nil {
+		t.Fatal("identical enabled-active install reported success despite an unhealthy process")
+	}
+	if !strings.Contains(err.Error(), "health check failed") {
+		t.Fatalf("health failure not reported honestly: %v", err)
+	}
+	for _, forbid := range []string{"daemon-reload", "enable ", "restart ", "start "} {
+		if fs.callsContain(forbid) {
+			t.Fatalf("unhealthy identical install mutated systemd (%q)", forbid)
+		}
+	}
 }
 
 func TestValidateNoControl(t *testing.T) {

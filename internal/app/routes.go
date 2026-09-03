@@ -53,7 +53,7 @@ func (a *App) apiRoutes() []registeredRoute {
 		session("/api/agent/run-diagnostics", get, a.agentRunDiagnostics),
 		session("/api/agent/image", get, a.agentImage),
 		session("/api/agent/models", get, a.agentModels),
-		session("/api/conversations", []string{http.MethodGet, http.MethodPost}, a.conversationsAPI),
+		session("/api/conversations", []string{http.MethodGet}, a.conversationsAPI),
 		session("/api/conversation", []string{http.MethodPut, http.MethodDelete}, a.conversationAPI),
 	}
 }

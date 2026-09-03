@@ -6,7 +6,7 @@
 #   -> status (health) -> stop -> start -> restart
 #   -> special-path runtime identity (quote/backslash/space/percent args + cwd)
 #   -> injected start-limit failure -> reinstall recovery
-#   -> install-time health-gate failure (port conflict) -> retry
+#   -> install-time health-gate failure (foreign JSON server) -> retry
 #   -> uninstall -> fresh reinstall -> final uninstall
 #
 # The generated unit is additionally validated with `systemd-analyze --user
@@ -179,15 +179,33 @@ install >/dev/null
 wait_active "reinstall recovery"
 [ "$(systemctl --user is-active cortex.service)" = "active" ] || die "reinstall did not recover the service"
 
-echo "== install-time health gate failure (port conflict) then retry =="
+echo "== install-time health gate failure (foreign JSON server on port) then retry =="
 "$BIN" service uninstall >/dev/null
 if command -v python3 >/dev/null 2>&1; then
-  python3 -m http.server "$PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+  # A foreign process occupies the configured listener and answers 200 with a
+  # JSON object that is NOT the Cortex health contract. It must not be able to
+  # impersonate Cortex: the health gate rejects {"ok":false} and the cortex
+  # process cannot bind, so the install fails.
+  cat > "$ROOT/foreign.py" <<'PY'
+import http.server, json, os
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"ok": False, "service": "foreign"}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(('127.0.0.1', int(os.environ['PORT'])), H).serve_forever()
+PY
+  PORT="$PORT" python3 "$ROOT/foreign.py" &
   BLOCKER=$!
   sleep 0.6
   if "$BIN" service install --root "$ROOT" --data "$DATA" --port "$PORT" >/dev/null 2>&1; then
     kill "$BLOCKER" 2>/dev/null || true
-    die "install succeeded although its listener port was already bound (health gate must fail)"
+    die "install succeeded although a foreign JSON server occupied the listener (health gate must reject impersonation)"
   fi
   kill "$BLOCKER" 2>/dev/null || true
   wait "$BLOCKER" 2>/dev/null || true

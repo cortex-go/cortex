@@ -124,32 +124,6 @@ func (a *App) conversationsAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonOut(w, items)
-	case http.MethodPost:
-		var q struct {
-			Conversations []conversation `json:"conversations"`
-		}
-		if !decodeSized(w, r, &q, 16<<20) {
-			return
-		}
-		if len(q.Conversations) > 250 {
-			http.Error(w, "too many conversations", 400)
-			return
-		}
-		// Per-record import: each conversation is saved independently so a
-		// record whose workspace is unavailable, or which is structurally
-		// invalid, never rolls back or discards the valid records around it.
-		// The upsert makes the migration safe to retry without duplication.
-		imported := []string{}
-		rejected := []map[string]string{}
-		for i := range q.Conversations {
-			c := q.Conversations[i]
-			if err := a.saveConversation(&c); err != nil {
-				rejected = append(rejected, map[string]string{"id": c.ID, "reason": err.Error()})
-				continue
-			}
-			imported = append(imported, c.ID)
-		}
-		jsonOut(w, map[string]any{"imported": imported, "rejected": rejected})
 	default:
 		http.Error(w, "method", 405)
 	}

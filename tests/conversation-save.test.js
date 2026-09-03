@@ -127,32 +127,28 @@ function loadContext(server) {
     text: async () => JSON.stringify(body),
   });
   // Stateful conversation store shared across "browser restarts": GET returns
-  // the stored records, POST imports records not in `rejectIds` and reports
-  // imported/rejected deterministically.
+  // the stored records, and PUT /api/conversation applies single-conversation
+  // upserts so a session created or modified through the real frontend actually
+  // persists and can be restored by a fresh browser context.
   const store = server || { records: [], rejectIds: new Set() };
+  const applyUpsert = (c) => {
+    const idx = store.records.findIndex((r) => r.id === c.id);
+    if (idx >= 0) store.records[idx] = { ...store.records[idx], ...c };
+    else store.records.push(c);
+  };
+  const handleConversation = (opt) => {
+    applyUpsert(JSON.parse(opt.body || '{}'));
+    return ok({ ok: true });
+  };
   const handleConversations = (opt) => {
-    const method = (opt.method || 'GET').toUpperCase();
-    if (method === 'GET') return ok([...store.records]);
-    const batch = JSON.parse(opt.body || '{}');
-    const imported = [];
-    const rejected = [];
-    for (const c of (batch.conversations || [])) {
-      if (store.rejectIds.has(c.id)) {
-        rejected.push({ id: c.id, reason: 'rejected by fixture' });
-      } else if (!store.records.some((r) => r.id === c.id)) {
-        store.records.push(c);
-        imported.push(c.id);
-      } else {
-        imported.push(c.id); // idempotent upsert
-      }
-    }
-    return ok({ imported, rejected });
+    return ok([...store.records]);
   };
   const routes = {
     '/api/auth/state': () => ok({ configured: false, authenticated: false }),
     '/api/status': () => ok({ root: '/home/nick', settings: {} }),
     '/api/settings': () => ok({ providers: [], activeProvider: '' }),
     '/api/agent/status': () => ok({ available: false }),
+    '/api/conversation': (opt) => handleConversation(opt),
     '/api/conversations': (opt) => handleConversations(opt),
   };
   const ctx = makeContext((url, opt) => {
@@ -337,6 +333,46 @@ async function bootSimulation(ctx, localStore) {
     await settle();
     assert.strictEqual(run(ctx2, `sessions['c1'] && sessions['c1'].events.length`), 2, 'reload must restore the transcript from SQLite');
     assert.strictEqual(putCalls(ctx2).length, 0, 'restoring from the server must not PUT conversations back');
+  });
+
+  // A session created and modified through the real frontend functions is
+  // persisted by PUT to the server store and survives a fresh browser context,
+  // with no session data left in browser storage.
+  await test(async function session_created_and_modified_persists_and_survives_fresh_context(ctx) {
+    const server = { records: [], rejectIds: new Set() };
+    const ctx1 = loadContext(server);
+    await settle(10);
+    run(ctx1, `serverReady=true; sessions={}; closedSessions=[]; activeId='';`);
+    // 1. create a session through the real frontend function.
+    run(ctx1, `newSession('/home/nick/repo',false)`);
+    const sid = run(ctx1, `Object.keys(sessions)[0]`);
+    assert.ok(sid, 'a session must be created');
+    // 2. add transcript events, then archive the session.
+    run(ctx1, `addEvent('${sid}','user','hello world')`);
+    run(ctx1, `addEvent('${sid}','assistant','hi there')`);
+    run(ctx1, `sessions['${sid}'].busy=false; closeSession('${sid}')`);
+    // 3. wait for server persistence (the debounced PUTs must fire).
+    await settle(400);
+    const rec = server.records.find((r) => r.id === sid);
+    assert.ok(rec, 'session must be persisted to the server store');
+    assert.strictEqual(rec.events.length, 2, 'transcript events must be persisted');
+    assert.ok(rec.archivedAt > 0, 'archive must be persisted');
+    assert.strictEqual(rec.workspace, '/home/nick/repo', 'workspace association must be persisted');
+    // 4. a fresh browser context that knows only the resulting server state.
+    const ctx2 = loadContext(server);
+    await settle(10);
+    await runAsync(ctx2, `syncServerConversations()`);
+    await settle();
+    // 5. the exact session and transcript are restored from SQLite, and no
+    // session data exists in browser storage.
+    const restored = run(ctx2, `closedSessions.find(s=>s.id==='${sid}')`);
+    assert.ok(restored, 'archived session must be restored');
+    assert.strictEqual(restored.events.length, 2, 'exact transcript restored');
+    assert.deepStrictEqual(restored.events.map((e) => e.text).sort(), ['hello world', 'hi there'], 'transcript content restored');
+    assert.strictEqual(restored.workspace, '/home/nick/repo', 'workspace restored');
+    const ui2 = run(ctx2, `localStorage.getItem('cortex.ui.v1')`);
+    assert.ok(!ui2 || !ui2.includes('"events"'), 'no transcript in browser storage');
+    assert.strictEqual(run(ctx2, `localStorage.getItem('cortex.sessions.v1')`), null, 'legacy session payload must be absent');
   });
 
   // Clearing browser storage must never delete or lose server-side

@@ -725,7 +725,11 @@ func resolveExecutable(exe string) (string, error) {
 	return abs, nil
 }
 
-// healthCheck requires a 2xx JSON object response from the expected endpoint.
+// healthCheck requires the Cortex health contract: a 2xx response whose body
+// is a JSON object with ok:true. Any other 2xx JSON object (an empty object,
+// ok:false, an array, malformed JSON) is rejected so a foreign JSON-speaking
+// process occupying the listener cannot impersonate Cortex on the install
+// health gate.
 func healthCheck(url string) error {
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(url)
@@ -746,6 +750,9 @@ func healthCheck(url string) error {
 	var v map[string]any
 	if err := json.Unmarshal(body, &v); err != nil {
 		return fmt.Errorf("expected a JSON object response: %v", err)
+	}
+	if v["ok"] != true {
+		return fmt.Errorf("expected the Cortex health contract {\"ok\":true}, got %s", strings.TrimSpace(string(body)))
 	}
 	return nil
 }
@@ -885,8 +892,15 @@ func (m *serviceManager) install(opts serviceOptions, out io.Writer) error {
 			return fmt.Errorf("refusing to reinstall %s: prior state %s+%s cannot be restored exactly; unmask it first", m.unitName, priorEnabledWord, priorActiveWord)
 		}
 		// True no-op: a byte-identical unit that is already enabled and active
-		// needs no rewrite, reload or restart.
+		// needs no rewrite, reload or restart, but it still must pass the same
+		// bounded Cortex health verification before success is reported. An
+		// active-but-wedged process or an occupied/incorrect listener is an
+		// honest failure; because this path makes no mutation it needs no
+		// rollback.
 		if string(priorUnit) == unit && priorEnabledWord == "enabled" && priorActiveWord == "active" {
+			if err := m.waitReady(opts.listener()); err != nil {
+				return err
+			}
 			fmt.Fprintf(out, "%s is already installed, enabled and active; nothing to do.\n", m.unitName)
 			return nil
 		}
