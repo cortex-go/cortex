@@ -283,12 +283,30 @@ function thumbnail(dataUrl){return new Promise((res,rej)=>{const img=new Image()
 function addImage(file){
   if(!file.type||!file.type.startsWith('image/')){toast('Only image files can be attached');return false}
   if(file.size>MAX_IMAGE_BYTES){toast('Image too large · max 10 MiB');return false}
-  if(sessions[activeId]?.busy){toast('Agent is running');return false}
-  if(attachments.length>=MAX_IMAGES){toast('Limit of '+MAX_IMAGES+' images per run');return false}
+  // The originating session is captured when the file is accepted, so an
+  // asynchronous FileReader/thumbnail completion can never attach the image to
+  // whichever session happens to be active when decoding finishes. Ownership,
+  // the busy guard and the image limit are all evaluated against this session.
+  const ownerId=activeId;
+  const owner=ownerId&&sessions[ownerId];
+  if(!owner||owner.busy){toast('Agent is running');return false}
+  if((owner.attachments||[]).length>=MAX_IMAGES){toast('Limit of '+MAX_IMAGES+' images per run');return false}
   readDataURL(file).then(dataUrl=>thumbnail(dataUrl).then(thumb=>{
-    if(attachments.length>=MAX_IMAGES){toast('Limit of '+MAX_IMAGES+' images per run');return}
-    attachments.push({id:sid(),name:file.name||'image',dataUrl,thumb,size:file.size});
-    setActiveAttachments(attachments)
+    const s=ownerId&&sessions[ownerId];
+    // The originating session was closed while decoding: discard the completed
+    // image rather than attaching it elsewhere or restoring the closed session.
+    if(!s)return;
+    // The limit is re-checked against the originating session at completion
+    // because several decodes can finish concurrently.
+    if((s.attachments||[]).length>=MAX_IMAGES){toast('Limit of '+MAX_IMAGES+' images per run');return}
+    const image={id:sid(),name:file.name||'image',dataUrl,thumb,size:file.size};
+    s.attachments=[...(s.attachments||[]),image];
+    // If this session started a run while decoding was pending, the in-flight
+    // request already captured its own image list at submit time, so the
+    // completed image only becomes a pending attachment for the next run and
+    // never affects the current request. The composer is updated only when the
+    // originating session is still the active one.
+    if(activeId===ownerId)setActiveAttachments(s.attachments)
   })).catch(()=>toast('Could not read image'));
   return true
 }

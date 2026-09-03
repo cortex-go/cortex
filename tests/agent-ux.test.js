@@ -99,6 +99,66 @@ function loadContext(fetchImpl, preload) {
   return ctx;
 }
 
+// loadDecodeContext builds a context whose FileReader, Image and canvas are
+// controllable, so addImage's asynchronous decode can be driven deterministically:
+// each accepted file pushes a FileReader onto ctx.__readers, and each resolved
+// read creates an Image on ctx.__images, which the tests resolve by hand.
+function loadDecodeContext(fetchImpl) {
+  const ctx = makeContext(fetchImpl);
+  const readers = [];
+  const images = [];
+  ctx.FileReader = class {
+    constructor() { this.result = ''; this.error = null; readers.push(this); }
+    readAsDataURL(file) { this._file = file; }
+  };
+  ctx.Image = class {
+    constructor() { this.width = 0; this.height = 0; images.push(this); }
+    set src(v) { this._src = v; }
+    get src() { return this._src; }
+  };
+  const baseCreate = ctx.document.createElement.bind(ctx.document);
+  ctx.document.createElement = (tag) => {
+    if (tag === 'canvas') {
+      return {
+        width: 0, height: 0,
+        getContext: () => ({ fillStyle: '', fillRect() {}, drawImage() {} }),
+        toDataURL: () => 'data:image/jpeg;base64,THUMB',
+      };
+    }
+    return baseCreate(tag);
+  };
+  ctx.__readers = readers;
+  ctx.__images = images;
+  vm.createContext(ctx);
+  vm.runInContext(SCRIPT, ctx);
+  return ctx;
+}
+
+// completeDecode drives one accepted addImage decode to completion: the next
+// pending FileReader resolves to dataUrl, then its created Image loads.
+async function completeDecode(ctx, dataUrl) {
+  const reader = ctx.__readers.shift();
+  if (!reader) throw new Error('no pending FileReader to complete');
+  reader.result = dataUrl;
+  reader.onload();
+  await settle(0);
+  const img = ctx.__images.shift();
+  if (!img) throw new Error('no pending Image after read completion');
+  img.width = 64;
+  img.height = 64;
+  img.onload();
+  await settle(0);
+}
+
+// failDecode rejects the next pending FileReader without creating an Image.
+async function failDecode(ctx) {
+  const reader = ctx.__readers.shift();
+  if (!reader) throw new Error('no pending FileReader to fail');
+  reader.error = new Error('decode failed');
+  reader.onerror();
+  await settle(0);
+}
+
 function run(ctx, code, vars) {
   if (vars) {
     for (const k of Object.keys(vars)) ctx[k] = vars[k];
@@ -1112,6 +1172,82 @@ test('closing a session releases its pending attachment state', async () => {
   if (run(ctx, `$('#prompt').value`) !== '') throw new Error('closing a session left its draft in the composer');
   const archived = run(ctx, `closedSessions.find(s=>s.id==='a')`);
   if (archived && archived.attachments && archived.attachments.length) throw new Error('attachment state persisted in the archived record');
+});
+
+// --- UX: asynchronous attachment decoding stays owned by the originating
+// session, even when the user switches sessions or starts a run while the
+// FileReader/thumbnail work is still pending. ---
+
+test('decode completing after a session switch attaches to the originating session', async () => {
+  const ctx = loadDecodeContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `addImage({type:'image/png',name:'a.png',size:10})`);
+  if (ctx.__readers.length !== 1) throw new Error('decode did not begin');
+  run(ctx, 'setActiveSession("b")');
+  await completeDecode(ctx, 'data:image/png;base64,AAAA');
+  if (run(ctx, "sessions['a'].attachments.length") !== 1) throw new Error('A did not receive its decoded image');
+  if (run(ctx, "sessions['b'].attachments.length") !== 0) throw new Error('B received A\'s image');
+  if (run(ctx, "attachments.length") !== 0) throw new Error('composer shows A\'s image while B is active');
+  run(ctx, 'setActiveSession("a")');
+  if (run(ctx, "attachments.length") !== 1) throw new Error('A image not displayed after switching back');
+  if (run(ctx, "attachments[0].name") !== 'a.png') throw new Error('wrong attachment on A');
+});
+
+test('closing the originating session before decode completes discards the image', async () => {
+  const ctx = loadDecodeContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `addImage({type:'image/png',name:'a.png',size:10})`);
+  if (ctx.__readers.length !== 1) throw new Error('decode did not begin');
+  await run(ctx, 'closeSession("a")');
+  await completeDecode(ctx, 'data:image/png;base64,AAAA');
+  if (run(ctx, "sessions['b'].attachments.length") !== 0) throw new Error('discarded image leaked to B');
+  if (run(ctx, "attachments.length") !== 0) throw new Error('discarded image appeared in the composer');
+  const archived = run(ctx, `closedSessions.find(s=>s.id==='a')`);
+  if (archived && archived.attachments && archived.attachments.length) throw new Error('discarded image leaked into the archived record');
+});
+
+test('a run starting while decoding is pending does not receive the image in-flight', async () => {
+  let sent = null;
+  const ctx = loadDecodeContext((url, opt) => {
+    if (url === '/api/agent/run') {
+      sent = JSON.parse(opt.body).images || [];
+      return Promise.resolve(streamResponse(['{"type":"run","data":{"runID":"r1"}}', '{"type":"done","data":{"outcome":"completed"}}']));
+    }
+    return Promise.resolve(jsonOk({}));
+  });
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `addImage({type:'image/png',name:'a.png',size:10})`);
+  if (ctx.__readers.length !== 1) throw new Error('decode did not begin');
+  await run(ctx, 'runAgent("do it")');
+  if (sent && sent.length !== 0) throw new Error('pending decode was injected into the in-flight request');
+  await completeDecode(ctx, 'data:image/png;base64,AAAA');
+  if (run(ctx, "sessions['a'].attachments.length") !== 1) throw new Error('image not retained as a pending attachment for the next run');
+  if (sent.length !== 0) throw new Error('completed image affected the in-flight request');
+});
+
+test('concurrent pending decodes cannot exceed MAX_IMAGES', async () => {
+  const ctx = loadDecodeContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]}};activeId='a'");
+  const MAX = run(ctx, 'MAX_IMAGES');
+  for (let i = 0; i < MAX + 2; i++) {
+    run(ctx, `addImage({type:'image/png',name:'i'+${i}+'.png',size:10})`);
+  }
+  if (ctx.__readers.length !== MAX + 2) throw new Error('expected ' + (MAX + 2) + ' pending decodes, got ' + ctx.__readers.length);
+  for (let i = 0; i < MAX + 2; i++) {
+    await completeDecode(ctx, 'data:image/png;base64,AAAA');
+  }
+  if (run(ctx, "sessions['a'].attachments.length") !== MAX) throw new Error('concurrent decodes exceeded MAX_IMAGES: ' + run(ctx, "sessions['a'].attachments.length"));
+});
+
+test('a decoding failure does not affect another session', async () => {
+  const ctx = loadDecodeContext();
+  run(ctx, "sessions={a:{id:'a',workspace:'/w',events:[],createdAt:1,draft:'',attachments:[]},b:{id:'b',workspace:'/w',events:[],createdAt:2,draft:'',attachments:[]}};activeId='a'");
+  run(ctx, `addImage({type:'image/png',name:'a.png',size:10})`);
+  run(ctx, 'setActiveSession("b")');
+  await failDecode(ctx);
+  if (run(ctx, "sessions['a'].attachments.length") !== 0) throw new Error('failed decode attached to A');
+  if (run(ctx, "sessions['b'].attachments.length") !== 0) throw new Error('failed decode affected B');
+  if (run(ctx, "attachments.length") !== 0) throw new Error('failed decode affected the composer');
 });
 
 // --- UX: layout grouping of the Tasks control and immediate preference save. ---
