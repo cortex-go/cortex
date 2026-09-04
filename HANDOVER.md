@@ -1,0 +1,29 @@
+# Cortex handover
+
+## Release procedure
+
+Cortex releases are tag-driven. Do not create a GitHub Release manually before
+the tag: pushing `vX.Y.Z` runs verification, builds six archives, writes
+`checksums.txt`, attests every asset, and publishes the release.
+
+1. Confirm the application and both website repositories are clean and pushed.
+2. If `install.sh`, `download.sh`, or `update.sh` changed, deploy the website
+   first, fetch each script from `https://crtx.dev`, compare it with the
+   generated repository, and run its syntax and fixture-based checksum tests.
+3. Run formatting, `go test ./...`, `go test -race ./...`, `go vet ./...`, the
+   frontend Node tests, a native build, and six-target cross-compilation.
+4. Check `cortex version`, README/version claims, release notes, archive names,
+   and the intended tag agree. Commit and push every release preparation change.
+5. Prefer a release candidate such as `v0.1.0-rc.1` for the first rehearsal.
+   Push the tag only from the reviewed application commit.
+6. Confirm the workflow produced exactly six platform archives plus
+   `checksums.txt`, every checksum verifies, and GitHub provenance verifies
+   against this repository, workflow, tag, commit, and hosted runner.
+7. Exercise the public `download.sh`, per-user `install.sh`, `update.sh`, and
+   rollback path on a clean Linux host. Run `cortex version`, first-run setup,
+   one agent task, restart, and service install/status/restart/uninstall.
+8. Only after the release candidate evidence is accepted, create the stable tag
+   from the same approved commit and repeat the public post-release smoke test.
+
+Never overwrite an existing tag or asset, publish unverified binaries, or let a
+prerelease become the stable `latest` channel.
