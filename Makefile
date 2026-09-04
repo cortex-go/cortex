@@ -15,3 +15,4 @@ check: frontend
 	go vet ./...
 	node --check public/assets/js/script.js
 	node tests/markdown-render-smoke.js
+	node tests/session-navigation.test.js

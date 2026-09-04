@@ -4,7 +4,8 @@ const serverSaveTimers=new Map();
 const pendingDecodes=new Map(); // sessionId -> in-flight image decode reservations
 const UI_STORE='cortex.ui.v1',COMPOSER_STORE='cortex.composer.height.v1';
 const MAX_IMAGES=6,MAX_IMAGE_BYTES=10*1024*1024;
-let attachments=[],modelCatalog=[],uiPrefs={activeId:'',collapsed:{}};
+let attachments=[],modelCatalog=[],uiPrefs={activeId:'',collapsed:{}},historyItems=[],historyPage=0;
+const HISTORY_PAGE_SIZE=12;
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800)}
 async function api(url,opt={}){opt={...opt,headers:{...(opt.headers||{})}};const method=(opt.method||'GET').toUpperCase();if(!['GET','HEAD','OPTIONS'].includes(method)&&authState?.csrf)opt.headers['X-Cortex-CSRF']=authState.csrf;const r=await fetch(url,opt);if(!r.ok)throw Error((await r.text()).trim()||r.statusText);return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
 function sid(){return crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)}
@@ -131,6 +132,21 @@ function renderRestoreSessions(){
     b.append(title,meta);b.onclick=()=>restoreSession(s.id);box.append(b)
   }
 }
+async function loadSessionHistory(){
+  const stored=await api('/api/conversations');
+  historyItems=stored;historyPage=Math.min(historyPage,Math.max(0,Math.ceil(historyItems.length/HISTORY_PAGE_SIZE)-1));renderSessionHistory()
+}
+function renderSessionHistory(){
+  const box=$('#sessionsHistory');box.innerHTML='';const start=historyPage*HISTORY_PAGE_SIZE,items=historyItems.slice(start,start+HISTORY_PAGE_SIZE);
+  if(!items.length){const empty=document.createElement('div');empty.className='sessions-history-empty';empty.textContent='No previous sessions yet.';box.append(empty)}
+  for(const s of items){const row=document.createElement('article');row.className='sessions-history-item';const copy=document.createElement('div'),title=document.createElement('strong'),meta=document.createElement('span'),open=document.createElement('button');title.textContent=sessionTitle(s);meta.textContent=(s.workspace||'No workspace')+' · '+new Date(s.updatedAt||s.createdAt).toLocaleString();open.className='secondary';open.textContent=sessions[s.id]?'Open':'Restore';open.onclick=()=>restoreHistorySession(s);copy.append(title,meta);row.append(copy,open);box.append(row)}
+  const pages=Math.max(1,Math.ceil(historyItems.length/HISTORY_PAGE_SIZE));$('#sessionsPageLabel').textContent=`Page ${historyPage+1} of ${pages}`;$('#sessionsPrev').disabled=historyPage===0;$('#sessionsNext').disabled=historyPage>=pages-1
+}
+function restoreHistorySession(item){
+  if(!sessions[item.id]){const s={...item,archivedAt:0,closedAt:0,busy:item.state==='running',abort:null,followBottom:true,unread:0,draft:'',attachments:[]};s.events=(s.events||[]).map(e=>({...e,runID:e.runID||e.runId||''}));sessions[s.id]=s;closedSessions=closedSessions.filter(x=>x.id!==s.id);saveSessionToServer(s.id)}setActiveSession(item.id);showAgentPage();renderAll()
+}
+function showSessionsPage(){hideSessionMenu();$('#agentPage').hidden=true;$('#sessionsPage').hidden=false;historyPage=0;loadSessionHistory().catch(e=>toast(e.message))}
+function showAgentPage(){$('#sessionsPage').hidden=true;$('#agentPage').hidden=false}
 function toggleSessionMenu(){
   const menu=$('#newSessionMenu'),open=menu.hidden;
   if(open){renderRestoreSessions();menu.hidden=false}else menu.hidden=true
@@ -544,27 +560,16 @@ function startComposerResize(e){
 // Only the compact UI preferences (selected tab, collapsed task panels) are
 // applied locally, and loading authoritative records never PUTs them back.
 async function syncServerConversations(){
-  const collapsed=uiPrefs.collapsed||{};
-  const stored=await api('/api/conversations');
-  sessions={};closedSessions=[];
-  for(const s of stored){
-    s.abort=null;s.currentRunId=s.currentRunId||'';
-    // Restore the live in-memory run identity alias from the durable runId
-    // field so latestTaskEvent keeps rejecting stale task events after reload.
-    if(Array.isArray(s.events))s.events=s.events.map(e=>({...e,runID:e.runID||e.runId||''}));
-    if(s.archivedAt){s.closedAt=s.archivedAt;closedSessions.push(s)}else sessions[s.id]=s
-  }
-  // Derive authoritative running state from the server, not browser-local
-  // busy: a conversation whose state is still 'running' has a live server run.
-  for(const s of Object.values(sessions)){s.busy=(s.state==='running');if(s.followBottom===undefined)s.followBottom=true;if(collapsed[s.id])s.tasksCollapsed=true}
-  serverReady=true;
-  if(!Object.keys(sessions).length)newSession('',false);
-  if(!sessions[activeId])activeId=Object.keys(sessions)[0];
-  setActiveSession(activeId);
-  saveUiPrefs();renderAll()
+  const collapsed=uiPrefs.collapsed||{},stored=await api('/api/conversations');sessions={};closedSessions=[];
+  for(const s of stored){s.abort=null;s.currentRunId=s.currentRunId||'';if(Array.isArray(s.events))s.events=s.events.map(e=>({...e,runID:e.runID||e.runId||''}));if(s.archivedAt){s.closedAt=s.archivedAt;closedSessions.push(s)}else sessions[s.id]=s}
+  for(const s of Object.values(sessions)){s.busy=s.state==='running';if(s.followBottom===undefined)s.followBottom=true;if(collapsed[s.id])s.tasksCollapsed=true}
+  serverReady=true;if(!Object.keys(sessions).length)newSession('',false);if(!sessions[activeId])activeId=Object.keys(sessions)[0];setActiveSession(activeId);saveUiPrefs();renderAll()
 }
-async function boot(){const st=await api('/api/status');root=st.root;loadSessions();restoreComposerHeight();await Promise.all([loadSettings(),agentStatus(),syncServerConversations()])}
+function startFreshSession(){sessions={};closedSessions=[];activeId='';serverReady=false;newSession('',false);serverReady=true;saveUiPrefs();renderAll()}
+async function boot(){const st=await api('/api/status');root=st.root;loadSessions();restoreComposerHeight();await Promise.all([loadSettings(),agentStatus()]);startFreshSession()}
 $('#newSession').onclick=e=>{e.stopPropagation();toggleSessionMenu()};$('#newSameWorkspace').onclick=newSessionSameWorkspace;$('#newWorkspace').onclick=newWorkspaceSession;$('#workspaceBtn').onclick=openWorkspacePicker;$('#closeWorkspace').onclick=$('#cancelWorkspace').onclick=()=>$('#workspaceModal').hidden=true;$('#browserUp').onclick=()=>browse(parentPath(browserPath));$('#chooseWorkspace').onclick=chooseWorkspace;
+$('#sessionsBtn').onclick=$('#allSessions').onclick=showSessionsPage;$('#closeSessions').onclick=showAgentPage;$('#sessionsPrev').onclick=()=>{if(historyPage>0){historyPage--;renderSessionHistory()}};$('#sessionsNext').onclick=()=>{if((historyPage+1)*HISTORY_PAGE_SIZE<historyItems.length){historyPage++;renderSessionHistory()}};
+window.addEventListener('beforeunload',e=>{if(!Object.values(sessions).some(s=>s.busy))return;e.preventDefault();e.returnValue=''});
 $('#composerResize').onpointerdown=startComposerResize;$('#composerResize').ondblclick=()=>{applyComposerHeight(150);setPref(COMPOSER_STORE,'150')};document.addEventListener('click',e=>{if(!e.target.closest('.new-session-wrap'))hideSessionMenu()});window.addEventListener('resize',()=>applyComposerHeight($('#agentForm').getBoundingClientRect().height));
 $('#agentForm').onsubmit=e=>{e.preventDefault();const s=active();if(!canRunAgent(s))return;const p=$('#prompt').value.trim();if(!p)return;$('#prompt').value='';if(s)s.draft='';runAgent(p)};$('#prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('#agentForm').requestSubmit()}};$('#stop').onclick=()=>stopAgent();$('#copy').onclick=copySession;
 $('#newActivity').onclick=()=>{const s=active();if(!s)return;const box=$('#feed');if(box){box.scrollTop=box.scrollHeight}s.followBottom=true;$('#newActivity').hidden=true};
