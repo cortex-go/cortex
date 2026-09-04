@@ -235,6 +235,59 @@ test('task panel renders validated todowrite snapshot and progress', async () =>
   if (progress !== '1 of 3 completed') throw new Error('progress = ' + progress);
 });
 
+test('task panel preserves exact model order for a mixed-status snapshot', async () => {
+  const ctx = loadContext();
+  const s = { followBottom: true, events: [] };
+  run(ctx, `(function(){const s=S;s.events.push({kind:'task',text:'[{"content":"first","status":"completed"},{"content":"second","status":"in_progress"},{"content":"third","status":"pending"}]'});renderTaskPanel(s);})()`, { S: s });
+  const labels = run(ctx, `Array.from($('#taskList').children).map(r=>r.children[1].textContent)`);
+  if (labels.join('|') !== 'first|second|third') throw new Error('mixed-status order = ' + labels.join('|'));
+});
+
+test('task panel does not regroup a deliberately reverse-status snapshot', async () => {
+  const ctx = loadContext();
+  const s = { followBottom: true, events: [] };
+  // Reverse-status ordering: completed first, then in_progress, then pending.
+  run(ctx, `(function(){const s=S;s.events.push({kind:'task',text:'[{"content":"done","status":"completed"},{"content":"active","status":"in_progress"},{"content":"queued","status":"pending"}]'});renderTaskPanel(s);})()`, { S: s });
+  const labels = run(ctx, `Array.from($('#taskList').children).map(r=>r.children[1].textContent)`);
+  if (labels.join('|') !== 'done|active|queued') throw new Error('reverse-status order was regrouped: ' + labels.join('|'));
+});
+
+test('task panel uses the latest snapshot order, not a prior one', async () => {
+  const ctx = loadContext();
+  const s = { followBottom: true, events: [] };
+  run(ctx, `(function(){const s=S;s.events.push({kind:'task',text:'[{"content":"old-a","status":"pending"},{"content":"old-b","status":"completed"}]'});renderTaskPanel(s);})()`, { S: s });
+  run(ctx, `(function(){const s=S;s.events.push({kind:'task',text:'[{"content":"new-1","status":"completed"},{"content":"new-2","status":"completed"},{"content":"new-3","status":"pending"}]'});renderTaskPanel(s);})()`, { S: s });
+  const labels = run(ctx, `Array.from($('#taskList').children).map(r=>r.children[1].textContent)`);
+  if (labels.join('|') !== 'new-1|new-2|new-3') throw new Error('latest-snapshot order = ' + labels.join('|'));
+  const progress = run(ctx, `$('#taskProgress').textContent`);
+  if (progress !== '2 of 3 completed') throw new Error('latest-snapshot progress = ' + progress);
+});
+
+test('task panel preserves order for a restored session snapshot', async () => {
+  const ctx = loadContext();
+  const s = { followBottom: true, events: [{ kind: 'task', text: '[{"content":"restored-a","status":"in_progress"},{"content":"restored-b","status":"completed"},{"content":"restored-c","status":"in_progress"}]' }] };
+  run(ctx, `(function(s){renderTaskPanel(s)})(S)`, { S: s });
+  const labels = run(ctx, `Array.from($('#taskList').children).map(r=>r.children[1].textContent)`);
+  if (labels.join('|') !== 'restored-a|restored-b|restored-c') throw new Error('restored order = ' + labels.join('|'));
+  const progress = run(ctx, `$('#taskProgress').textContent`);
+  if (progress !== '1 of 3 completed') throw new Error('restored progress = ' + progress);
+});
+
+test('task panel collapsed and background-session behavior is unchanged', async () => {
+  const ctx = loadContext();
+  const s = { followBottom: true, events: [], tasksCollapsed: true };
+  run(ctx, `(function(){const s=S;s.events.push({kind:'task',text:'[{"content":"hidden-a","status":"completed"},{"content":"hidden-b","status":"pending"}]'});renderTaskPanel(s);})()`, { S: s });
+  const hidden = run(ctx, `$('#taskPanel').hidden`);
+  if (!hidden) throw new Error('collapsed panel should stay hidden');
+  // Background-session behavior: a task event arriving on a non-active session
+  // must not touch the active panel (guarded in addEvent).
+  run(ctx, `(function(){sessions={a:{id:'a',followBottom:true,tasksCollapsed:true,events:[]},b:{id:'b',followBottom:true,events:[{kind:'task',text:'[{"content":"bg-1","status":"completed"},{"content":"bg-2","status":"pending"}]'}]}};activeId='a';sessions['a'].events.push({kind:'task',text:'[{"content":"active-1","status":"completed"}]'});addEvent('b','task','[{"content":"bg-1","status":"completed"},{"content":"bg-2","status":"pending"}]');})()`);
+  const hiddenAfter = run(ctx, `$('#taskPanel').hidden`);
+  if (!hiddenAfter) throw new Error('background task event unhid the active panel');
+  const list = run(ctx, `$('#taskList').children.length`);
+  if (list !== 0) throw new Error('background task event populated the active panel');
+});
+
 test('task panel ignores malformed task text', async () => {
   const ctx = loadContext();
   const s = { followBottom: true, events: [{ kind: 'task', text: 'not-json' }] };
