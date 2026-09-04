@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cortex-go/cortex/internal/app"
+	"github.com/crtx-dev/cortex/internal/app"
 )
 
 var version = "0.1.0"

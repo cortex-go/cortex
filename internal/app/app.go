@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	cortex "github.com/cortex-go/cortex"
+	cortex "github.com/crtx-dev/cortex"
 	"io"
 	"net/http"
 	"net/url"

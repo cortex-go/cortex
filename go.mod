@@ -1,4 +1,4 @@
-module github.com/cortex-go/cortex
+module github.com/crtx-dev/cortex
 
 go 1.25.0
 

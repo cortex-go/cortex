@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cortex-go/cortex/internal/app"
+	"github.com/crtx-dev/cortex/internal/app"
 )
 
 // init configures the install-time health gate for the sandbox: installs must
